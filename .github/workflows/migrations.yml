@@ -1,0 +1,40 @@
+name: Migration checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  round-trip:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: cameras
+          POSTGRES_USER: camera_app
+          POSTGRES_PASSWORD: change-me-ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U camera_app -d cameras"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.13' }
+      - run: pip install -r migrations/requirements.txt
+      - name: Alembic upgrade/downgrade/upgrade
+        env:
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: cameras
+          POSTGRES_USER: camera_app
+          POSTGRES_PASSWORD: change-me-ci
+        run: |
+          alembic -c migrations/alembic.ini upgrade head
+          alembic -c migrations/alembic.ini downgrade base
+          alembic -c migrations/alembic.ini upgrade head

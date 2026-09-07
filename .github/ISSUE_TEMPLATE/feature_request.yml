@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a focused improvement to the camera platform.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Frontend, ASP.NET API, FastAPI, ML/inference, Azurite, PostgreSQL, DevOps]
+    validations: { required: true }
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: 'What user or operator problem does this solve?'
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes: { label: Proposal, description: Describe the smallest useful implementation. }
+    validations: { required: true }
+  - type: textarea
+    id: impact
+    attributes: { label: Data, privacy, and migration impact }
+

@@ -1,0 +1,15 @@
+.git
+.github
+.env*
+kaggle.json
+**/bin
+**/obj
+**/__pycache__
+*.pyc
+frontend/node_modules
+frontend/.next
+project/raw_data
+project/test_output
+project/output
+*.pth
+

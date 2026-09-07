@@ -1,0 +1,23 @@
+services:
+  azurite:
+    command: azurite-blob --blobHost 0.0.0.0 --location /data --disableTelemetry --skipApiVersionCheck
+
+  training:
+    build:
+      context: ./model_training
+      dockerfile: Dockerfile.dev
+    image: camera-software-training:dev
+    working_dir: /workspace
+    shm_size: 16g
+    environment:
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;}
+      AZURITE_DATA_CONTAINER: ${AZURITE_DATA_CONTAINER:-computer-vision-data}
+    volumes:
+      - ./model_training:/workspace
+      - ./kaggle.json:/root/.kaggle/kaggle.json:ro
+    depends_on:
+      azurite:
+        condition: service_healthy

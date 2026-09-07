@@ -1,0 +1,10 @@
+azure-storage-blob==12.25.1
+opencv-python-headless==4.11.0.86
+openvino==2025.3.0
+numpy==2.2.6
+fastapi==0.115.12
+psycopg[binary]==3.2.9
+python-multipart==0.0.20
+python-dotenv==1.1.0
+uvicorn[standard]==0.34.2
+

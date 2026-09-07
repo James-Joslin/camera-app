@@ -1,0 +1,10 @@
+FROM mcr.microsoft.com/dotnet/sdk:8.0
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY cameraApi.csproj .
+RUN dotnet restore
+COPY . .
+ENV ASPNETCORE_URLS=http://+:8080
+EXPOSE 8080
+CMD ["dotnet", "watch", "run", "--no-launch-profile"]
+

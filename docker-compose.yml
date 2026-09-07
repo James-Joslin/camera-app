@@ -1,0 +1,182 @@
+name: ${COMPOSE_PROJECT_NAME:-camera-software-dev}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cameras}
+      POSTGRES_USER: ${POSTGRES_USER:-camera_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev}
+    ports:
+      - "${POSTGRES_HOST_PORT:-56434}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.36.0
+    command: azurite-blob --blobHost 0.0.0.0 --location /data --disableTelemetry
+    environment:
+      AZURITE_ACCOUNTS: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}:${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+    ports:
+      - "${AZURITE_HOST_BLOB_PORT:-11000}:10000"
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('net').connect(10000, '127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+
+  migrations:
+    build:
+      context: ./migrations
+      dockerfile: Dockerfile.dev
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-cameras}
+      POSTGRES_USER: ${POSTGRES_USER:-camera_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: upgrade head
+
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.dev
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-cameras}
+      POSTGRES_USER: ${POSTGRES_USER:-camera_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev}
+      CAMERA_CREDENTIAL_KEY: ${CAMERA_CREDENTIAL_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      STREAM_ROOT: /app/streams
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;}
+    ports:
+      - "${API_PORT:-5255}:8080"
+    volumes:
+      - ./api:/src
+      - dotnet-nuget:/root/.nuget/packages
+      - camera-streams:/app/streams
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      azurite:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/status/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  fastapi:
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile.dev
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-cameras}
+      POSTGRES_USER: ${POSTGRES_USER:-camera_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev}
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;}
+      MODEL_DIR: /models
+      MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
+      OPENVINO_DEVICE: ${OPENVINO_DEVICE:-CPU}
+      OPENVINO_PERFORMANCE_HINT: ${OPENVINO_PERFORMANCE_HINT:-LATENCY}
+    ports:
+      - "${FASTAPI_PORT:-8102}:8000"
+    volumes:
+      - ./fastapi:/app
+      - ./project/optimized:/models:ro
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      azurite:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    environment:
+      CAMERA_API_URL: http://api:8080
+      INFERENCE_API_URL: http://fastapi:8000
+    ports:
+      - "${FRONTEND_PORT:-3101}:3000"
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+      - frontend-next:/app/.next
+    depends_on:
+      api:
+        condition: service_healthy
+      fastapi:
+        condition: service_healthy
+
+  ml-api:
+    profiles: ["ml"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: camera-software-ml:dev
+    shm_size: 16g
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-cameras}
+      POSTGRES_USER: ${POSTGRES_USER:-camera_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev}
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;}
+      AZURITE_DATA_CONTAINER: ${AZURITE_DATA_CONTAINER:-computer-vision-data}
+      AZURITE_MODEL_CONTAINER: ${AZURITE_MODEL_CONTAINER:-computer-vision-models}
+      USE_AZURITE: ${USE_AZURITE:-true}
+    ports:
+      - "8103:8000"
+      - "8888:8888"
+      - "6006:6006"
+    volumes:
+      - ./project:/root/project
+      - ./kaggle.json:/root/.kaggle/kaggle.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      azurite:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  azurite-data:
+  dotnet-nuget:
+  frontend-node-modules:
+  frontend-next:
+  camera-streams:
+

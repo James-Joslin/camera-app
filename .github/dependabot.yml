@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule: { interval: weekly }
+  - package-ecosystem: pip
+    directory: /fastapi
+    schedule: { interval: weekly }
+  - package-ecosystem: pip
+    directory: /migrations
+    schedule: { interval: weekly }
+  - package-ecosystem: pip
+    directory: /project/tools
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /api
+    schedule: { interval: monthly }
+  - package-ecosystem: docker
+    directory: /fastapi
+    schedule: { interval: monthly }
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule: { interval: monthly }
+  - package-ecosystem: docker
+    directory: /migrations
+    schedule: { interval: monthly }
+  - package-ecosystem: docker
+    directory: /project/tools
+    schedule: { interval: monthly }

@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/James-Joslin/camera-software/security/policy
+    about: Do not post credentials, footage, or private model artifacts in an issue.
+  - name: Support
+    url: https://github.com/James-Joslin/camera-software/blob/main/SUPPORT.md
+    about: Read the support guidance before opening a usage question.
+

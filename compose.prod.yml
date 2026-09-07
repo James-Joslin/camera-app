@@ -1,0 +1,146 @@
+name: ${COMPOSE_PROJECT_NAME:-camera-software}
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.36.0
+    restart: unless-stopped
+    command: azurite-blob --blobHost 0.0.0.0 --location /data --disableTelemetry
+    environment:
+      AZURITE_ACCOUNTS: ${AZURITE_ACCOUNT_NAME:?set AZURITE_ACCOUNT_NAME}:${AZURITE_ACCOUNT_KEY:?set AZURITE_ACCOUNT_KEY}
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('net').connect(10000, '127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))\""]
+
+
+  migrations:
+    image: ${CAMERA_IMAGE_PREFIX:-camera-software}-migrations:${CAMERA_IMAGE_TAG:-latest}
+    build:
+      context: ./migrations
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: upgrade head
+
+
+  api:
+    image: ${CAMERA_IMAGE_PREFIX:-camera-software}-api:${CAMERA_IMAGE_TAG:-latest}
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      CAMERA_CREDENTIAL_KEY: ${CAMERA_CREDENTIAL_KEY:?set CAMERA_CREDENTIAL_KEY}
+      STREAM_ROOT: /app/streams
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:?set AZURITE_ACCOUNT_NAME}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:?set AZURITE_ACCOUNT_KEY}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:?set AZURITE_CONNECTION_STRING}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      azurite:
+        condition: service_healthy
+
+    volumes:
+      - camera-streams:/app/streams
+
+  fastapi:
+    image: ${CAMERA_IMAGE_PREFIX:-camera-software}-fastapi:${CAMERA_IMAGE_TAG:-latest}
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:?set AZURITE_ACCOUNT_NAME}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:?set AZURITE_ACCOUNT_KEY}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:?set AZURITE_CONNECTION_STRING}
+      MODEL_DIR: /models
+      MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
+      OPENVINO_DEVICE: ${OPENVINO_DEVICE:-CPU}
+      OPENVINO_PERFORMANCE_HINT: ${OPENVINO_PERFORMANCE_HINT:-LATENCY}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      azurite:
+        condition: service_healthy
+
+    volumes:
+      - ./project/optimized:/models:ro
+
+  frontend:
+    image: ${CAMERA_IMAGE_PREFIX:-camera-software}-frontend:${CAMERA_IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      CAMERA_API_URL: http://api:8080
+      INFERENCE_API_URL: http://fastapi:8000
+    ports:
+      - "${APP_PORT:-3201}:3000"
+    depends_on:
+      api:
+        condition: service_started
+      fastapi:
+        condition: service_started
+
+  ml-api:
+    profiles: ["ml"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${CAMERA_IMAGE_PREFIX:-camera-software}-ml:${CAMERA_IMAGE_TAG:-latest}
+    shm_size: 16g
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:?set AZURITE_ACCOUNT_NAME}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:?set AZURITE_ACCOUNT_KEY}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:?set AZURITE_CONNECTION_STRING}
+      AZURITE_DATA_CONTAINER: ${AZURITE_DATA_CONTAINER:-computer-vision-data}
+      AZURITE_MODEL_CONTAINER: ${AZURITE_MODEL_CONTAINER:-computer-vision-models}
+      USE_AZURITE: ${USE_AZURITE:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+      azurite:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  azurite-data:
+  camera-streams:
+
