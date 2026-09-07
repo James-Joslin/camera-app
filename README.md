@@ -34,7 +34,7 @@ The lightweight FastAPI service mounts `project/optimized` read-only at `/models
 
 ## Storage and migrations
 
-Azurite is the local Azure Blob Storage emulator. The `computer-vision-data` and `computer-vision-models` containers are created by the camera storage adapter. `model_training/upload_to_azurite.py` replaces the old `mc` workflow, and `model_training/getCityPersons.sh` downloads CityPersons, converts its raw JSON annotations to YOLO labels, and uploads both trees with the blob prefixes expected by the training loader. Failed runs preserve their temporary work directory; set `CITYPERSONS_WORK_DIR` to that path when rerunning to avoid another download.
+Azurite is the local Azure Blob Storage emulator. The `computer-vision-data` and `computer-vision-models` containers are created by the camera storage adapter. `model_training/getCityPersons.sh` publishes immutable CityPersons versions below `datasets/citypersons/<version>/`, preserving pinned official source annotations and rich canonical JSON while generating standard binary-person YOLO labels. It validates every remote artifact and checksum before writing `datasets/citypersons/current.json` last. Visual previews are written to `model_training/validation_preview/<version>/contact_sheet.jpg`. Set `CITYPERSONS_RESET_CONTAINER=true` only for an intentional clean rebuild, `CITYPERSONS_DATASET_VERSION` to choose a version, and `CITYPERSONS_PREVIEW_COUNT` to change the preview count. Failed runs preserve their temporary work directory; resume by setting `CITYPERSONS_WORK_DIR` to the reported path.
 
 PostgreSQL schema changes are managed by Alembic in [`migrations/`](migrations/).
 

@@ -17,7 +17,7 @@ cleanup() {
         rm -rf "$TEMP_DIR"
     elif [[ "$REMOVE_ON_SUCCESS" == true ]]; then
         echo "Download and extracted files were preserved after the failure: $TEMP_DIR" >&2
-        echo "Resume with: CITYPERSONS_WORK_DIR=$TEMP_DIR ./getCityPersons.sh" >&2
+        echo "Resume with: CITYPERSONS_WORK_DIR=$TEMP_DIR CITYPERSONS_RESUME_UPLOAD=true ./getCityPersons.sh" >&2
     else
         echo "Keeping CityPersons work directory: $TEMP_DIR"
     fi
@@ -47,12 +47,14 @@ if [[ ! -f "$INNER_ARCHIVE" ]]; then
 fi
 
 EXTRACT_DIR="$TEMP_DIR/CityPersons-extracted"
-if find "$EXTRACT_DIR" -type d -name train -print -quit 2>/dev/null | grep -q .; then
+EXTRACT_MARKER="$EXTRACT_DIR/.extraction-complete"
+if [[ -f "$EXTRACT_MARKER" ]]; then
     echo "Using existing extracted dataset: $EXTRACT_DIR"
 else
     echo "Extracting inner archive..."
     mkdir -p "$EXTRACT_DIR"
     7z x -y "$INNER_ARCHIVE" -o"$EXTRACT_DIR"
+    touch "$EXTRACT_MARKER"
 fi
 
 find_image_tree() {
@@ -71,18 +73,6 @@ find_image_tree() {
     return 0
 }
 
-find_yolo_label_tree() {
-    local candidate
-    while IFS= read -r candidate; do
-        [[ -d "$candidate/train" ]] || continue
-        if find "$candidate/train" -type f -name '*.txt' -print -quit | grep -q .; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done < <(find "$EXTRACT_DIR" -type d -name labels)
-    return 0
-}
-
 IMAGE_DIR=$(find_image_tree)
 if [[ -z "$IMAGE_DIR" ]]; then
     echo "Could not locate a populated CityPersons image tree with a train split." >&2
@@ -90,37 +80,77 @@ if [[ -z "$IMAGE_DIR" ]]; then
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-YOLO_LABEL_DIR=$(find_yolo_label_tree)
-if [[ -n "$YOLO_LABEL_DIR" ]]; then
-    echo "Using existing YOLO labels: $YOLO_LABEL_DIR"
-else
-    ANNOTATION_DIR=$(find "$EXTRACT_DIR" -type d -name gtBboxCityPersons -print -quit)
-    if [[ -z "$ANNOTATION_DIR" ]]; then
-        echo "Could not locate YOLO labels or a gtBboxCityPersons annotation directory." >&2
-        echo "Top-level extracted directories:" >&2
-        find "$EXTRACT_DIR" -maxdepth 3 -type d | sort | head -n 80 >&2
-        exit 1
-    fi
+DATASET_VERSION="${CITYPERSONS_DATASET_VERSION:-v$(date -u +%F)}"
+if [[ ! "$DATASET_VERSION" =~ ^v[0-9]{4}-[0-9]{2}-[0-9]{2}([._-][A-Za-z0-9]+)*$ ]]; then
+    echo "Invalid CITYPERSONS_DATASET_VERSION: $DATASET_VERSION" >&2
+    exit 1
+fi
+VERSION_PREFIX="datasets/citypersons/$DATASET_VERSION"
+ANNOTATION_DIR="$TEMP_DIR/official-annotations"
+BUILD_DIR="$TEMP_DIR/version-build"
 
-    YOLO_LABEL_DIR="$TEMP_DIR/labels"
-    echo "Converting annotations from $ANNOTATION_DIR to YOLO labels..."
-    python3 "$SCRIPT_DIR/convert_citypersons_to_yolo.py" \
+echo "Downloading pinned official CityPersons annotations..."
+python3 "$SCRIPT_DIR/download_citypersons_annotations.py" --output "$ANNOTATION_DIR"
+
+echo "Building immutable dataset metadata for $VERSION_PREFIX..."
+if [[ -f "$BUILD_DIR/manifest.json" ]]; then
+    echo "Using existing version metadata: $BUILD_DIR"
+else
+    if [[ -d "$BUILD_DIR" ]]; then
+        rm -rf "$BUILD_DIR"
+    fi
+    python3 "$SCRIPT_DIR/build_citypersons_version.py" \
+        --images "$IMAGE_DIR" \
         --annotations "$ANNOTATION_DIR" \
-        --output "$YOLO_LABEL_DIR"
+        --source-archive "$OUTER_ARCHIVE" \
+        --output "$BUILD_DIR" \
+        --version "$DATASET_VERSION" \
+        --version-prefix "$VERSION_PREFIX"
 fi
 
-echo "Uploading images from $IMAGE_DIR..."
+RESET_ARGS=()
+if [[ "${CITYPERSONS_RESET_CONTAINER:-false}" == true ]]; then
+    RESET_ARGS+=(--reset-container)
+fi
+IMMUTABLE_ARGS=(--require-empty-prefix "$VERSION_PREFIX")
+if [[ "${CITYPERSONS_RESUME_UPLOAD:-false}" == true ]]; then
+    IMMUTABLE_ARGS=()
+fi
+
+echo "Uploading versioned images from $IMAGE_DIR..."
 python3 "$SCRIPT_DIR/upload_to_azurite.py" \
     --source "$IMAGE_DIR" \
     --container "$AZURITE_CONTAINER" \
-    --prefix images \
+    --prefix "$VERSION_PREFIX/images" \
+    "${IMMUTABLE_ARGS[@]}" \
+    "${RESET_ARGS[@]}" \
     --include '*.png' \
     --include '*.jpg' \
-    --include '*.jpeg'
-echo "Uploading labels from $YOLO_LABEL_DIR..."
+    --include '*.jpeg' \
+    --exclude '*(1).*'
+
+echo "Uploading canonical annotations, generated labels, and manifests..."
 python3 "$SCRIPT_DIR/upload_to_azurite.py" \
-    --source "$YOLO_LABEL_DIR" \
+    --source "$BUILD_DIR" \
     --container "$AZURITE_CONTAINER" \
-    --prefix labels \
-    --include '*.txt'
-echo "All done! Dataset uploaded successfully."
+    --prefix "$VERSION_PREFIX"
+
+PREVIEW_DIR="${CITYPERSONS_PREVIEW_DIR:-$SCRIPT_DIR/validation_preview/$DATASET_VERSION}"
+PREVIEW_COUNT="${CITYPERSONS_PREVIEW_COUNT:-12}"
+CHECKSUM_ARGS=(--verify-checksums)
+if [[ "${CITYPERSONS_VERIFY_REMOTE_CHECKSUMS:-true}" != true ]]; then
+    CHECKSUM_ARGS=(--no-verify-checksums)
+fi
+
+echo "Validating the complete uploaded version and rendering $PREVIEW_COUNT previews..."
+python3 "$SCRIPT_DIR/validate_citypersons_azurite.py" \
+    --container "$AZURITE_CONTAINER" \
+    --dataset-prefix "$VERSION_PREFIX" \
+    --preview-dir "$PREVIEW_DIR" \
+    --preview-count "$PREVIEW_COUNT" \
+    "${CHECKSUM_ARGS[@]}" \
+    --publish-current
+
+echo "All done! Immutable dataset version uploaded, validated, and published."
+echo "Current version: $VERSION_PREFIX"
+echo "Visual validation contact sheet: $PREVIEW_DIR/contact_sheet.jpg"

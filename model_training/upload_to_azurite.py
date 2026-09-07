@@ -3,6 +3,7 @@ import fnmatch
 import os
 from pathlib import Path
 
+from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
 
 
@@ -35,6 +36,23 @@ def main() -> None:
         metavar="GLOB",
         help="Only upload relative paths matching this glob; may be repeated",
     )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Skip relative paths matching this glob; may be repeated",
+    )
+    parser.add_argument(
+        "--reset-container",
+        action="store_true",
+        help="Delete and recreate the target container before uploading",
+    )
+    parser.add_argument(
+        "--require-empty-prefix",
+        metavar="PREFIX",
+        help="Refuse to upload if any blob already exists below this prefix",
+    )
     args = parser.parse_args()
 
     if not args.source.is_dir():
@@ -46,18 +64,41 @@ def main() -> None:
         if prefix_path.is_absolute() or ".." in prefix_path.parts:
             parser.error("prefix must be a relative blob path without '..'")
 
-    container = client().get_container_client(args.container)
+    service = client()
+    container = service.get_container_client(args.container)
+    if args.reset_container:
+        try:
+            container.delete_container()
+            print(f"Deleted existing container: {args.container}")
+        except ResourceNotFoundError:
+            pass
+        container = service.get_container_client(args.container)
+
     try:
         container.create_container()
     except Exception as exc:
         if "ContainerAlreadyExists" not in str(exc):
             raise
+
+    if args.require_empty_prefix:
+        guard_prefix = args.require_empty_prefix.strip("/")
+        existing = next(container.list_blobs(name_starts_with=guard_prefix), None)
+        if existing is not None:
+            parser.error(
+                f"refusing to overwrite immutable prefix {guard_prefix!r}; "
+                f"existing blob: {existing.name}"
+            )
     for path in sorted(args.source.rglob("*")):
         if path.is_file():
             relative_name = path.relative_to(args.source).as_posix()
             if args.include and not any(
                 fnmatch.fnmatch(relative_name.lower(), pattern.lower())
                 for pattern in args.include
+            ):
+                continue
+            if any(
+                fnmatch.fnmatch(relative_name.lower(), pattern.lower())
+                for pattern in args.exclude
             ):
                 continue
             blob_name = f"{prefix}/{relative_name}" if prefix else relative_name

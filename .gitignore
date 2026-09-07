@@ -21,4 +21,6 @@ project/optimized/*.xml
 
 model_training/optimized/*
 model_training/test_output/*
+model_training/validation_preview/*
+model_training/old/*
 *.pth
