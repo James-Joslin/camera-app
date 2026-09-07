@@ -1,4 +1,4 @@
-alembic==1.15.2
+alembic==1.19.2
 psycopg[binary]==3.2.9
 SQLAlchemy==2.0.40
 
