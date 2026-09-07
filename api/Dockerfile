@@ -5,7 +5,7 @@ RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Release -o /out --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
