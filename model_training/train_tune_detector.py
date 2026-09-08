@@ -1,15 +1,14 @@
 """
-Optimized SSD Person Detection Training Pipeline with NNCF Quantization
-========================================================================
+Optimized SSD Person Detection Training Pipeline
+================================================
 Features:
-- YOLO format annotations (class cx cy w h normalized)
+- Canonical CityPersons JSON annotations with full, visible, and ignore boxes
 - Azurite object storage integration
-- Hard negative mining + Focal loss
+- ATSS assignment, GIoU regression, and quality focal classification
 - Person-optimized anchor ratios
 - Mixed precision training (AMP)
-- NNCF Quantization-Aware Training (QAT) for INT8 optimization
 - Export to OpenVINO IR format
-- Benchmarking FP32 vs INT8 performance
+- Separate manifest-driven, accuracy-controlled INT8 optimization
 
 Based on OpenVINO NNCF notebook: pytorch-quantization-aware-training.ipynb
 """
@@ -17,7 +16,7 @@ Based on OpenVINO NNCF notebook: pytorch-quantization-aware-training.ipynb
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from torchvision.ops import box_iou
@@ -32,6 +31,14 @@ from dataclasses import dataclass
 from enum import Enum
 from tqdm import tqdm
 import random
+
+from dataset_layout import (
+    TRAINABLE_LABEL_STATUSES,
+    load_citypersons_split,
+    resolve_citypersons_prefix,
+    version_blob,
+)
+from canonical_dataset import CanonicalPersonDetectionDataset
 
 # Optional imports with fallbacks
 try:
@@ -77,7 +84,7 @@ class TrainingConfig:
     num_workers: int = 1
     
     # Model
-    num_classes: int = 2  # background + person
+    num_classes: int = 1  # one sigmoid localization-quality logit per anchor
     
     # Training
     num_epochs: int = 100
@@ -87,18 +94,22 @@ class TrainingConfig:
     momentum: float = 0.937
     
     # Loss
-    neg_pos_ratio: int = 3  # Hard negative mining ratio
-    use_focal_loss: bool = True  # Better for class imbalance
+    neg_pos_ratio: int = 3  # Used only when focal loss is disabled
+    use_focal_loss: bool = True
     focal_alpha: float = 0.4
     focal_gamma: float = 2.0
+    atss_topk: int = 9
+    giou_weight: float = 2.0
+    use_stratified_oversampling: bool = True
+    sampling_seed: int = 1337
     
     # Optimization
     use_amp: bool = True  # Mixed precision training
     gradient_clip: float = 10.0
     warmup_epochs: int = 3
     
-    # Quantization (NNCF)
-    enable_quantization: bool = True
+    # Legacy in-training QAT; release INT8 artifacts are built by optimize_model.py.
+    enable_quantization: bool = False
     qat_epochs: int = 10  # Quantization-aware training epochs
     qat_learning_rate: float = 1e-4  # Usually 1/10 of original
     calibration_samples: int = 1000  # Samples for calibration
@@ -378,7 +389,7 @@ def model_summary(model: nn.Module, model_type: ModelType, input1_size: tuple, i
 # DATASET
 # ============================================================================
 
-class PersonDetectionDataset(Dataset):
+class LegacyYoloPersonDetectionDataset(Dataset):
     """
     Person detection dataset with YOLO format annotations
     
@@ -419,10 +430,7 @@ class PersonDetectionDataset(Dataset):
         # Extract city folders from paths
         cities = set()
         for img_path, _ in self.samples:
-            # img_path: images/train/aachen/aachen_000000_000019_leftImg8bit.png
-            parts = img_path.split('/')
-            if len(parts) >= 4:  # images/split/city/filename
-                cities.add(parts[2])
+            cities.add(Path(img_path).parent.name)
         
         print(f"Found {len(self.samples)} images for {self.split} split")
         print(f"  Cities: {len(cities)} folders")
@@ -489,16 +497,17 @@ class PersonDetectionDataset(Dataset):
         
         print(f"  Validation: {valid}/{len(samples_to_check)} images accessible")
         if missing_labels > 0:
-            print(f"  Note: {missing_labels} labels missing (may be valid negative samples)")
+            print(f"  ✗ {missing_labels} required labels are missing")
         
-        return valid > 0
+        return valid > 0 and missing_labels == 0
     
     def _find_samples(self) -> List[Tuple[str, str]]:
         """
-        Find image-label pairs with nested city subfolder structure
+        Load image-label pairs from the published immutable split manifest.
         
         Expected Azurite structure:
             computer-vision-data/
+            └── datasets/citypersons/<version>/
             ├── images/
             │   ├── train/
             │   │   ├── aachen/
@@ -508,7 +517,7 @@ class PersonDetectionDataset(Dataset):
             │   │   └── ...
             │   ├── val/
             │   └── test/
-            └── labels/
+            └── labels/yolo-person-v1/
                 ├── train/
                 │   ├── aachen/
                 │   │   ├── aachen_000000_000019_leftImg8bit.txt
@@ -516,42 +525,19 @@ class PersonDetectionDataset(Dataset):
                 │   └── ...
                 └── val/
         """
+        bucket = self.config.azurite_data_bucket
+        read_blob = lambda name: self.azurite.get_object_bytes(bucket, name)
+        prefix = resolve_citypersons_prefix(read_blob)
+        records = load_citypersons_split(read_blob, prefix, self.split)
         samples = []
-        
-        image_prefix = f"images/{self.split}"
-        label_prefix = f"labels/{self.split}"
-        
-        # List all images recursively (includes city subfolders)
-        image_objects = self.azurite.list_objects(
-            self.config.azurite_data_bucket, 
-            image_prefix
-        )
-        
-        for img_path in image_objects:
-            # Check for valid image extension
-            if not img_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+        for record in records:
+            if record.get("labelStatus") not in TRAINABLE_LABEL_STATUSES:
                 continue
-            
-            # Extract relative path from the split folder
-            # Example: 
-            #   img_path = "images/train/aachen/aachen_000000_000019_leftImg8bit.png"
-            #   image_prefix = "images/train"
-            #   relative_path = "aachen/aachen_000000_000019_leftImg8bit.png"
-            relative_path = img_path[len(image_prefix):].lstrip('/')
-            
-            # Construct label path preserving the city subfolder structure
-            # Example:
-            #   relative_path = "aachen/aachen_000000_000019_leftImg8bit.png"
-            #   label_relative = "aachen/aachen_000000_000019_leftImg8bit.txt"
-            #   label_path = "labels/train/aachen/aachen_000000_000019_leftImg8bit.txt"
-            label_relative = str(Path(relative_path).with_suffix('.txt'))
-            label_path = f"{label_prefix}/{label_relative}"
-            
-            if '(1)' in label_path:
-                # print(label_path)
-                label_path = label_path.replace('(1)', '')
-            
-            samples.append((img_path, label_path))
+            image = record.get("image")
+            label = record.get("yoloLabel")
+            if not isinstance(image, str) or not isinstance(label, str):
+                raise RuntimeError(f"Invalid trainable record in {self.split} split")
+            samples.append((version_blob(prefix, image), version_blob(prefix, label)))
         
         # Sort for reproducibility
         samples.sort(key=lambda x: x[0])
@@ -834,13 +820,13 @@ class PersonAnchorGenerator:
             [0.64, 0.80, 0.95],     # P6: very close - ADD near-full-frame
         ]
 
-        # Add wider aspect ratios for partially-visible close-up people
+        # width / height ratios; pedestrian anchors must therefore be below 1.
         self.aspect_ratios = [
-            [2.0, 1.0, 0.5],        
-            [2.0, 1.0, 0.5],   # Taller ratios for full-body
-            [2.0, 1.0, 0.5],   # Even taller for medium
-            [2.0, 1.0, 0.5],  # Add wide for partial torsos
-            [2.0, 1.0, 0.5]   # Wide ratios for close-up partials
+            [0.15, 0.25, 0.40],
+            [0.15, 0.25, 0.40],
+            [0.20, 0.33, 0.50],
+            [0.25, 0.50, 1.00],
+            [0.25, 0.50, 1.00],
         ]
         
         self.anchors = self._generate_anchors()
@@ -993,10 +979,12 @@ class SpatialAttention(nn.Module):
         return x * attention
 
 class AttentionDetectionHead(nn.Module):
-    """Detection head - deployment friendly, no deform"""
+    """Detection head with one sigmoid quality-aware person logit per anchor."""
     
     def __init__(self, in_channels: int, num_anchors: int, num_classes: int):
         super().__init__()
+        if num_classes != 1:
+            raise ValueError("The quality-aware binary head requires num_classes=1")
         self.num_anchors = num_anchors
         self.num_classes = num_classes
         
@@ -1023,7 +1011,7 @@ class AttentionDetectionHead(nn.Module):
             # nn.SiLU(inplace=True),
         )
         
-        self.cls_conv = nn.Conv2d(in_channels, num_anchors * num_classes, 3, padding=1)
+        self.cls_conv = nn.Conv2d(in_channels, num_anchors, 3, padding=1)
         self.bbox_conv = nn.Conv2d(in_channels, num_anchors * 4, 3, padding=1)
         self.dropout = nn.Dropout2d(0.1)
         
@@ -1047,7 +1035,7 @@ class AttentionDetectionHead(nn.Module):
         batch_size = x.size(0)
         
         cls = self.cls_conv(cls_feat)
-        cls = cls.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, self.num_classes)
+        cls = cls.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 1)
         
         bbox = self.bbox_conv(bbox_feat)
         bbox = bbox.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 4)
@@ -1057,7 +1045,7 @@ class AttentionDetectionHead(nn.Module):
 class SSDPersonDetector(nn.Module):
     """Enhanced SSD with FPN and attention mechanisms"""
     
-    def __init__(self, num_classes: int = 2, input_size: int = 640, pretrained: bool = True):
+    def __init__(self, num_classes: int = 1, input_size: int = 640, pretrained: bool = True):
         super().__init__()
         self.num_classes = num_classes
         self.input_size = input_size
@@ -1129,6 +1117,51 @@ class SSDPersonDetector(nn.Module):
         
         return torch.cat(all_cls, dim=1), torch.cat(all_bbox, dim=1)
 
+
+MODEL_FORMAT_VERSION = 2
+
+
+def person_scores_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Decode current binary-quality logits and legacy two-class logits."""
+    if logits.size(-1) == 1:
+        return logits[..., 0].sigmoid()
+    if logits.size(-1) == 2:
+        return logits.softmax(dim=-1)[..., 1]
+    raise ValueError(f"Unsupported classification output shape: {tuple(logits.shape)}")
+
+
+def load_detector_state_dict(
+    model: nn.Module, state_dict: Dict[str, torch.Tensor], *, strict: bool = True
+):
+    """Load v2 weights, migrating a legacy background/person softmax head if needed."""
+    target_state = model.state_dict()
+    migrated = dict(state_dict)
+    converted = []
+    for key, target in target_state.items():
+        source = migrated.get(key)
+        if source is None or source.shape == target.shape or ".cls_conv." not in key:
+            continue
+        if source.shape[0] != target.shape[0] * 2:
+            continue
+        if key.endswith(".weight"):
+            paired = source.reshape(target.shape[0], 2, *source.shape[1:])
+            migrated[key] = paired[:, 1] - paired[:, 0]
+        elif key.endswith(".bias"):
+            paired = source.reshape(target.shape[0], 2)
+            migrated[key] = paired[:, 1] - paired[:, 0]
+        else:
+            continue
+        converted.append(key)
+    incompatible = model.load_state_dict(migrated, strict=strict)
+    if converted:
+        warnings.warn(
+            "Migrated legacy two-class logits to one binary logit via person-background "
+            f"difference ({len(converted)} tensors). Fine-tuning is recommended.",
+            stacklevel=2,
+        )
+    return incompatible
+
+
 # ============================================================================
 # LOSS FUNCTION
 # ============================================================================
@@ -1148,7 +1181,7 @@ class FocalLoss(nn.Module):
         focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
         return focal_loss
 
-class SSDLoss(nn.Module):
+class LegacySSDLoss(nn.Module):
     """SSD Loss with hard negative mining and focal loss option"""
     
     def __init__(
@@ -1183,30 +1216,49 @@ class SSDLoss(nn.Module):
         dh = torch.log(gt_h / (anchors[:, 3] + 1e-6) + 1e-6)
         
         return torch.stack([dx, dy, dw, dh], dim=1)
+
+    @staticmethod
+    def anchors_overlapping_ignore(anchor_boxes: torch.Tensor, ignore_boxes: torch.Tensor,
+                                   threshold: float = 0.5) -> torch.Tensor:
+        """Mask anchors whose area is substantially covered by an ignore region."""
+        if ignore_boxes.numel() == 0:
+            return torch.zeros(anchor_boxes.size(0), dtype=torch.bool, device=anchor_boxes.device)
+        top_left = torch.maximum(anchor_boxes[:, None, :2], ignore_boxes[None, :, :2])
+        bottom_right = torch.minimum(anchor_boxes[:, None, 2:], ignore_boxes[None, :, 2:])
+        intersection = (bottom_right - top_left).clamp(min=0).prod(dim=2)
+        anchor_area = ((anchor_boxes[:, 2] - anchor_boxes[:, 0]).clamp(min=1e-6) *
+                       (anchor_boxes[:, 3] - anchor_boxes[:, 1]).clamp(min=1e-6))
+        return (intersection / anchor_area[:, None]).amax(dim=1) >= threshold
     
     def match_anchors(
         self, 
         gt_boxes: torch.Tensor, 
         gt_labels: torch.Tensor,
         anchors: torch.Tensor,
+        ignore_boxes: Optional[torch.Tensor] = None,
         iou_threshold: float = 0.45,
         iou_threshold_neg: float = 0.35
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_anchors = anchors.size(0)
         device = anchors.device
-        
-        if gt_boxes.size(0) == 0:
-            return (
-                torch.zeros(num_anchors, 4, device=device),
-                torch.zeros(num_anchors, dtype=torch.long, device=device),
-                torch.zeros(num_anchors, dtype=torch.bool, device=device)
-            )
-        
         anchor_boxes = torch.zeros_like(anchors)
         anchor_boxes[:, 0] = (anchors[:, 0] - anchors[:, 2] / 2) * self.input_size
         anchor_boxes[:, 1] = (anchors[:, 1] - anchors[:, 3] / 2) * self.input_size
         anchor_boxes[:, 2] = (anchors[:, 0] + anchors[:, 2] / 2) * self.input_size
         anchor_boxes[:, 3] = (anchors[:, 1] + anchors[:, 3] / 2) * self.input_size
+        ignored = self.anchors_overlapping_ignore(
+            anchor_boxes,
+            ignore_boxes if ignore_boxes is not None else anchor_boxes.new_zeros((0, 4)),
+        )
+
+        if gt_boxes.size(0) == 0:
+            matched_labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
+            matched_labels[ignored] = -1
+            return (
+                torch.zeros(num_anchors, 4, device=device),
+                matched_labels,
+                torch.zeros(num_anchors, dtype=torch.bool, device=device),
+            )
         
         ious = box_iou(anchor_boxes, gt_boxes)
         
@@ -1224,6 +1276,7 @@ class SSDLoss(nn.Module):
         
         ignore_mask = (best_gt_iou >= iou_threshold_neg) & (best_gt_iou < iou_threshold)
         matched_labels[ignore_mask] = -1
+        matched_labels[ignored & (matched_labels == 0)] = -1
         
         positive_mask = matched_labels > 0
         
@@ -1271,9 +1324,10 @@ class SSDLoss(nn.Module):
         for i in range(batch_size):
             gt_boxes = targets[i]['boxes'].to(device)
             gt_labels = targets[i]['labels'].to(device)
+            ignore_boxes = targets[i].get('ignore_regions', gt_boxes.new_zeros((0, 4))).to(device)
             
             matched_boxes, matched_labels, pos_mask = self.match_anchors(
-                gt_boxes, gt_labels, anchors
+                gt_boxes, gt_labels, anchors, ignore_boxes=ignore_boxes
             )
             
             valid_mask = matched_labels >= 0
@@ -1325,6 +1379,243 @@ class SSDLoss(nn.Module):
         }
         
         return total_loss, loss_dict
+
+
+class QualityFocalLoss(nn.Module):
+    """Binary Quality Focal Loss with continuous IoU targets for positives."""
+
+    def __init__(self, alpha: float = 0.4, beta: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probabilities = logits.sigmoid()
+        modulation = (targets - probabilities).abs().pow(self.beta)
+        balance = torch.where(targets > 0, self.alpha, 1 - self.alpha)
+        return balance * modulation * nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+
+
+class SSDLoss(nn.Module):
+    """ATSS assignment, quality-aware binary classification, and GIoU regression."""
+
+    def __init__(
+        self,
+        num_classes: int = 1,
+        neg_pos_ratio: int = 3,
+        use_focal_loss: bool = True,
+        focal_alpha: float = 0.4,
+        focal_gamma: float = 2.0,
+        input_size: int = 320,
+        anchors_per_level: Optional[List[int]] = None,
+        atss_topk: int = 9,
+        giou_weight: float = 2.0,
+    ):
+        super().__init__()
+        if num_classes != 1:
+            raise ValueError("SSDLoss requires the one-logit binary detection head")
+        self.num_classes = num_classes
+        self.neg_pos_ratio = neg_pos_ratio
+        self.use_focal_loss = use_focal_loss
+        self.input_size = input_size
+        self.anchors_per_level = list(anchors_per_level or [])
+        self.atss_topk = atss_topk
+        self.giou_weight = giou_weight
+        self.cls_loss_fn = QualityFocalLoss(focal_alpha, focal_gamma)
+
+    def anchor_boxes(self, anchors: torch.Tensor) -> torch.Tensor:
+        boxes = torch.zeros_like(anchors)
+        boxes[:, 0] = (anchors[:, 0] - anchors[:, 2] / 2) * self.input_size
+        boxes[:, 1] = (anchors[:, 1] - anchors[:, 3] / 2) * self.input_size
+        boxes[:, 2] = (anchors[:, 0] + anchors[:, 2] / 2) * self.input_size
+        boxes[:, 3] = (anchors[:, 1] + anchors[:, 3] / 2) * self.input_size
+        return boxes
+
+    def decode_boxes(self, offsets: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+        centers_x = offsets[:, 0] * anchors[:, 2] + anchors[:, 0]
+        centers_y = offsets[:, 1] * anchors[:, 3] + anchors[:, 1]
+        widths = offsets[:, 2].clamp(max=10).exp() * anchors[:, 2]
+        heights = offsets[:, 3].clamp(max=10).exp() * anchors[:, 3]
+        return torch.stack([
+            (centers_x - widths / 2) * self.input_size,
+            (centers_y - heights / 2) * self.input_size,
+            (centers_x + widths / 2) * self.input_size,
+            (centers_y + heights / 2) * self.input_size,
+        ], dim=1)
+
+    @staticmethod
+    def anchors_overlapping_ignore(
+        anchor_boxes: torch.Tensor, ignore_boxes: torch.Tensor, threshold: float = 0.5
+    ) -> torch.Tensor:
+        if ignore_boxes.numel() == 0:
+            return torch.zeros(anchor_boxes.size(0), dtype=torch.bool, device=anchor_boxes.device)
+        top_left = torch.maximum(anchor_boxes[:, None, :2], ignore_boxes[None, :, :2])
+        bottom_right = torch.minimum(anchor_boxes[:, None, 2:], ignore_boxes[None, :, 2:])
+        intersection = (bottom_right - top_left).clamp(min=0).prod(dim=2)
+        anchor_area = (
+            (anchor_boxes[:, 2] - anchor_boxes[:, 0]).clamp(min=1e-6)
+            * (anchor_boxes[:, 3] - anchor_boxes[:, 1]).clamp(min=1e-6)
+        )
+        return (intersection / anchor_area[:, None]).amax(dim=1) >= threshold
+
+    def _level_counts(self, num_anchors: int) -> List[int]:
+        if not self.anchors_per_level:
+            return [num_anchors]
+        if sum(self.anchors_per_level) != num_anchors:
+            raise ValueError("anchors_per_level does not match the generated anchor tensor")
+        return self.anchors_per_level
+
+    def match_anchors(
+        self,
+        gt_boxes: torch.Tensor,
+        gt_labels: torch.Tensor,
+        anchors: torch.Tensor,
+        ignore_boxes: Optional[torch.Tensor] = None,
+        **_: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assign positives with Adaptive Training Sample Selection (ATSS)."""
+        num_anchors = anchors.size(0)
+        device = anchors.device
+        anchor_boxes = self.anchor_boxes(anchors)
+        ignored = self.anchors_overlapping_ignore(
+            anchor_boxes,
+            ignore_boxes if ignore_boxes is not None else anchor_boxes.new_zeros((0, 4)),
+        )
+        if gt_boxes.numel() == 0:
+            labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
+            labels[ignored] = -1
+            return anchor_boxes.new_zeros((num_anchors, 4)), labels, labels > 0
+
+        ious = box_iou(anchor_boxes, gt_boxes)
+        anchor_centers = (anchor_boxes[:, :2] + anchor_boxes[:, 2:]) / 2
+        gt_centers = (gt_boxes[:, :2] + gt_boxes[:, 2:]) / 2
+        distances = ((anchor_centers[:, None, :] - gt_centers[None, :, :]) ** 2).sum(dim=2)
+
+        candidate_mask = torch.zeros_like(ious, dtype=torch.bool)
+        start = 0
+        for count in self._level_counts(num_anchors):
+            level_distances = distances[start:start + count]
+            topk = min(self.atss_topk, count)
+            candidate_indices = level_distances.topk(topk, dim=0, largest=False).indices + start
+            candidate_mask[candidate_indices, torch.arange(gt_boxes.size(0), device=device)] = True
+            start += count
+
+        thresholds = torch.stack([
+            ious[candidate_mask[:, gt_index], gt_index].mean()
+            + ious[candidate_mask[:, gt_index], gt_index].std(unbiased=False)
+            for gt_index in range(gt_boxes.size(0))
+        ])
+        left = anchor_centers[:, None, 0] - gt_boxes[None, :, 0]
+        top = anchor_centers[:, None, 1] - gt_boxes[None, :, 1]
+        right = gt_boxes[None, :, 2] - anchor_centers[:, None, 0]
+        bottom = gt_boxes[None, :, 3] - anchor_centers[:, None, 1]
+        centers_inside = torch.stack([left, top, right, bottom], dim=2).amin(dim=2) > 0
+        positives = candidate_mask & centers_inside & (ious >= thresholds[None, :])
+
+        # Degenerate/tiny boxes can otherwise receive no candidate after center filtering.
+        for gt_index in range(gt_boxes.size(0)):
+            if not positives[:, gt_index].any():
+                candidates = torch.where(candidate_mask[:, gt_index])[0]
+                best = candidates[ious[candidates, gt_index].argmax()]
+                positives[best, gt_index] = True
+
+        positive_quality = torch.where(positives, ious, torch.full_like(ious, -1))
+        best_iou, best_gt_index = positive_quality.max(dim=1)
+        positive_mask = best_iou >= 0
+        matched_boxes = gt_boxes[best_gt_index]
+        matched_labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
+        matched_labels[positive_mask] = gt_labels[best_gt_index[positive_mask]]
+        matched_labels[ignored & ~positive_mask] = -1
+        return matched_boxes, matched_labels, positive_mask
+
+    @staticmethod
+    def aligned_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+        top_left = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+        bottom_right = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+        intersection = (bottom_right - top_left).clamp(min=0).prod(dim=1)
+        area1 = (boxes1[:, 2:] - boxes1[:, :2]).clamp(min=0).prod(dim=1)
+        area2 = (boxes2[:, 2:] - boxes2[:, :2]).clamp(min=0).prod(dim=1)
+        return intersection / (area1 + area2 - intersection).clamp(min=1e-6)
+
+    @classmethod
+    def aligned_giou_loss(cls, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+        intersection_top_left = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+        intersection_bottom_right = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+        intersection = (
+            intersection_bottom_right - intersection_top_left
+        ).clamp(min=0).prod(dim=1)
+        enclosing_top_left = torch.minimum(boxes1[:, :2], boxes2[:, :2])
+        enclosing_bottom_right = torch.maximum(boxes1[:, 2:], boxes2[:, 2:])
+        enclosing_area = (
+            enclosing_bottom_right - enclosing_top_left
+        ).clamp(min=0).prod(dim=1).clamp(min=1e-6)
+        area1 = (boxes1[:, 2:] - boxes1[:, :2]).clamp(min=0).prod(dim=1)
+        area2 = (boxes2[:, 2:] - boxes2[:, :2]).clamp(min=0).prod(dim=1)
+        union = (area1 + area2 - intersection).clamp(min=1e-6)
+        iou = intersection / union
+        giou = iou - (enclosing_area - union) / enclosing_area
+        return 1 - giou
+
+    def forward(
+        self,
+        pred_cls: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        targets: List[Dict],
+        anchors: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict]:
+        if pred_cls.ndim != 3 or pred_cls.size(-1) != 1:
+            raise ValueError("Quality-aware classification output must have shape [B, N, 1]")
+        device = pred_cls.device
+        anchors = anchors.to(device)
+        total_cls_loss = pred_cls.new_zeros(())
+        total_loc_loss = pred_cls.new_zeros(())
+        total_quality = pred_cls.new_zeros(())
+        total_pos = 0
+
+        for batch_index, target in enumerate(targets):
+            gt_boxes = target["boxes"].to(device)
+            gt_labels = target["labels"].to(device)
+            ignore_boxes = target.get("ignore_regions", gt_boxes.new_zeros((0, 4))).to(device)
+            matched_boxes, matched_labels, positive_mask = self.match_anchors(
+                gt_boxes, gt_labels, anchors, ignore_boxes=ignore_boxes
+            )
+            decoded = self.decode_boxes(pred_boxes[batch_index], anchors)
+            quality_targets = pred_cls.new_zeros(anchors.size(0))
+            if positive_mask.any():
+                positive_quality = self.aligned_iou(
+                    decoded[positive_mask].detach(), matched_boxes[positive_mask]
+                ).clamp(0, 1)
+                positive_quality = positive_quality.to(dtype=quality_targets.dtype)
+                quality_targets[positive_mask] = positive_quality
+                total_quality += positive_quality.float().sum()
+                total_loc_loss += self.aligned_giou_loss(
+                    decoded[positive_mask], matched_boxes[positive_mask]
+                ).sum() * self.giou_weight
+
+            valid_mask = matched_labels >= 0
+            logits = pred_cls[batch_index, :, 0]
+            losses = self.cls_loss_fn(logits, quality_targets)
+            if self.use_focal_loss:
+                total_cls_loss += losses[valid_mask].sum()
+            else:
+                selected = LegacySSDLoss.hard_negative_mining(
+                    self, losses, matched_labels, positive_mask
+                )
+                total_cls_loss += losses[selected & valid_mask].sum()
+            total_pos += int(positive_mask.sum())
+
+        normalizer = max(total_pos, 1)
+        cls_loss = total_cls_loss / normalizer
+        loc_loss = total_loc_loss / normalizer
+        total_loss = cls_loss + loc_loss
+        return total_loss, {
+            "cls_loss": cls_loss.item(),
+            "loc_loss": loc_loss.item(),
+            "mean_quality_target": (total_quality / normalizer).item(),
+            "num_pos": total_pos,
+        }
 
 # ============================================================================
 # NNCF QUANTIZATION
@@ -1725,12 +2016,10 @@ class OpenVINOExporter:
                 pred_boxes_torch = torch.from_numpy(pred_boxes)
                 
                 # Decode predictions
-                scores = torch.softmax(pred_cls_torch, dim=-1)
+                max_scores = person_scores_from_logits(pred_cls_torch)
                 boxes = decode_boxes(pred_boxes_torch, anchors_torch, input_size)
                 
-                # Get class predictions (excluding background)
-                max_scores, pred_labels = scores[:, 1:].max(dim=-1)
-                pred_labels = pred_labels + 1  # Offset for background class
+                pred_labels = torch.ones_like(max_scores, dtype=torch.long)
                 
                 # Apply NMS
                 nms_boxes, nms_scores, nms_labels = apply_nms(
@@ -2255,7 +2544,7 @@ def validate(
 # ============================================================================
 
 def main():
-    """Main training pipeline with NNCF quantization"""
+    """Train and export the FP32 detector."""
     
     # Load config from environment or use defaults
     config = TrainingConfig(
@@ -2267,12 +2556,18 @@ def main():
         azurite_model_bucket=os.getenv('AZURITE_MODEL_CONTAINER', 'computer-vision-models'),
         use_azurite=os.getenv('USE_AZURITE', 'true').lower() == 'true',
         data_root=os.getenv('DATA_ROOT', './data'),
-        enable_quantization=os.getenv('ENABLE_QUANTIZATION', 'true').lower() == 'true'
+        enable_quantization=os.getenv('ENABLE_QUANTIZATION', 'false').lower() == 'true'
     )
+    if config.enable_quantization:
+        raise RuntimeError(
+            "The legacy in-training QAT path is retired. Train FP32 with "
+            "ENABLE_QUANTIZATION=false, then run optimize_model.py for manifest-driven "
+            "accuracy-controlled INT8 calibration."
+        )
     
     print("=" * 60)
     print("SSD Person Detection Training Pipeline")
-    print("with NNCF Quantization-Aware Training")
+    print("ATSS + quality-aware binary classification")
     print("=" * 60)
     print(f"Device: {config.device}")
     print(f"Input size: {config.input_size}")
@@ -2294,28 +2589,53 @@ def main():
     
     # Check if FP32 checkpoint already exists
     checkpoint_path = 'best_model_fp32.pth'
-    skip_fp32_training = os.path.exists(checkpoint_path)
+    skip_fp32_training = False
+    if os.path.exists(checkpoint_path):
+        existing_checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        skip_fp32_training = existing_checkpoint.get("modelFormatVersion") == MODEL_FORMAT_VERSION
     
     if skip_fp32_training:
         print("\n" + "=" * 60)
-        print("Found existing FP32 checkpoint - skipping FP32 training")
+        print("Found compatible FP32 checkpoint - skipping FP32 training")
         print("=" * 60)
     
+    elif os.path.exists(checkpoint_path):
+        print("\n" + "=" * 60)
+        print("Existing checkpoint uses the legacy softmax head; retraining the quality head")
+        print("=" * 60)
     # Create datasets
     print("\nLoading datasets...")
-    train_dataset = PersonDetectionDataset(
+    train_dataset = CanonicalPersonDetectionDataset(
         azurite_client,
         split='train',
         input_size=config.input_size,
         augment=True
     )
     
-    val_dataset = PersonDetectionDataset(
+    val_dataset = CanonicalPersonDetectionDataset(
         azurite_client,
         split='val',
         input_size=config.input_size,
         augment=False
     )
+
+    if skip_fp32_training:
+        checkpoint_dataset = existing_checkpoint.get("dataset")
+        expected_dataset = train_dataset.dataset_metadata
+        provenance_keys = ("versionPrefix", "manifestSha256", "schemaVersion")
+        mismatches = {
+            key: {
+                "checkpoint": checkpoint_dataset.get(key) if isinstance(checkpoint_dataset, dict) else None,
+                "current": expected_dataset.get(key),
+            }
+            for key in provenance_keys
+            if not isinstance(checkpoint_dataset, dict)
+            or checkpoint_dataset.get(key) != expected_dataset.get(key)
+        }
+        if mismatches:
+            skip_fp32_training = False
+            print("Existing checkpoint dataset provenance differs; retraining")
+            print(f"  Mismatches: {mismatches}")
     
     # Validate dataset structure
     print("\nValidating dataset structure...")
@@ -2323,10 +2643,23 @@ def main():
     val_dataset.validate_samples(num_samples=3)
     
     # Create dataloaders
+    train_sampler = None
+    if config.use_stratified_oversampling:
+        sampling_weights = train_dataset.build_sampling_weights()
+        sampling_generator = torch.Generator().manual_seed(config.sampling_seed)
+        train_sampler = WeightedRandomSampler(
+            sampling_weights,
+            num_samples=len(train_dataset),
+            replacement=True,
+            generator=sampling_generator,
+        )
+        print(f"Using {train_dataset.dataset_metadata['samplingPolicy']['name']} sampling")
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=config.num_workers,
         collate_fn=collate_fn,
         pin_memory=True if config.device == 'cuda' else False,
@@ -2374,7 +2707,10 @@ def main():
             use_focal_loss=config.use_focal_loss,
             focal_alpha=config.focal_alpha,
             focal_gamma=config.focal_gamma,
-            input_size=config.input_size
+            input_size=config.input_size,
+            anchors_per_level=model.anchor_generator.num_anchors_per_level,
+            atss_topk=config.atss_topk,
+            giou_weight=config.giou_weight,
         )
         
         # Optimizer
@@ -2456,7 +2792,11 @@ def main():
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'best_val_loss': best_val_loss,
-                    'config': config.__dict__
+                    'config': config.__dict__,
+                    'dataset': train_dataset.dataset_metadata,
+                    'modelFormatVersion': MODEL_FORMAT_VERSION,
+                    'assignment': {'name': 'ATSS', 'topKPerLevel': config.atss_topk},
+                    'classificationHead': {'name': 'binary-quality-v1', 'target': 'predictedIoU'},
                 }
                 
                 torch.save(checkpoint, checkpoint_path)
@@ -2480,7 +2820,7 @@ def main():
     print("=" * 60)
     
     checkpoint = torch.load(checkpoint_path, map_location=config.device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    load_detector_state_dict(model, checkpoint['model_state_dict'])
     
     best_val_loss = checkpoint.get('best_val_loss', 'N/A')
     checkpoint_epoch = checkpoint.get('epoch', 'N/A')
@@ -2515,7 +2855,10 @@ def main():
             use_focal_loss=config.use_focal_loss,
             focal_alpha=config.focal_alpha,
             focal_gamma=config.focal_gamma,
-            input_size=config.input_size
+            input_size=config.input_size,
+            anchors_per_level=model.anchor_generator.num_anchors_per_level,
+            atss_topk=config.atss_topk,
+            giou_weight=config.giou_weight,
         )
         
         # Create calibration dataset
@@ -2547,7 +2890,9 @@ def main():
         int8_checkpoint_path = 'best_model_int8.pth'
         torch.save({
             'model_state_dict': quantized_model.state_dict(),
-            'config': config.__dict__
+            'config': config.__dict__,
+            'dataset': train_dataset.dataset_metadata,
+            'modelFormatVersion': MODEL_FORMAT_VERSION,
         }, int8_checkpoint_path)
         
         if config.use_azurite:

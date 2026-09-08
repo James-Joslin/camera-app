@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Any
 
 
 CANONICAL_SCHEMA_VERSION = 1
-PERSON_SOURCE_CLASS_IDS = {1, 2, 3, 4}
+PERSON_SOURCE_LABELS = {
+    1: "pedestrian",
+    2: "rider",
+    3: "sitting person",
+    4: "person (other)",
+}
 
 
 @dataclass(frozen=True)
@@ -40,8 +46,6 @@ def _xywh_to_xyxy(value: Any, field: str, width: int, height: int) -> list[float
     x, y, box_width, box_height = map(float, value)
     if box_width <= 0 or box_height <= 0:
         raise ValueError(f"{field} must have positive width and height")
-    if x < 0 or y < 0 or x + box_width > width or y + box_height > height:
-        raise ValueError(f"{field} lies outside the declared image bounds")
     return [x, y, x + box_width, y + box_height]
 
 
@@ -51,10 +55,18 @@ def parse_canonical_annotation(
     expected_image_blob: str,
     expected_image_sha256: str | None = None,
     expected_status: str | None = None,
+    expected_sidecar_sha256: str | None = None,
+    expected_person_count: int | None = None,
+    expected_ignored_count: int | None = None,
 ) -> CanonicalAnnotation:
     """Parse a sidecar and reject schema, class, image, and status mismatches."""
     if data is None:
         raise RuntimeError(f"Canonical annotation is missing for {expected_image_blob}")
+    if (expected_sidecar_sha256 is not None and
+            hashlib.sha256(data).hexdigest() != expected_sidecar_sha256):
+        raise ValueError(
+            f"Canonical annotation checksum does not match split manifest for {expected_image_blob}"
+        )
     try:
         payload = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -91,7 +103,7 @@ def parse_canonical_annotation(
         if item.get("detectionClass") != "person" or item.get("ignored") is not False:
             raise ValueError(f"{field} is not a non-ignored person target")
         source_class_id = item.get("sourceClassId")
-        if source_class_id not in PERSON_SOURCE_CLASS_IDS:
+        if source_class_id not in PERSON_SOURCE_LABELS:
             raise ValueError(f"{field} has unsupported sourceClassId {source_class_id!r}")
         object_id, source_label, attributes = (
             item.get("id"), item.get("sourceLabel"), item.get("attributes")
@@ -100,6 +112,8 @@ def parse_canonical_annotation(
             raise ValueError(f"{field} must contain string id and sourceLabel fields")
         if not isinstance(attributes, dict):
             raise ValueError(f"{field}.attributes must be an object")
+        if source_label != PERSON_SOURCE_LABELS[source_class_id]:
+            raise ValueError(f"{field} sourceLabel does not match sourceClassId")
         objects.append(
             CanonicalObject(
                 object_id=object_id,
@@ -126,6 +140,10 @@ def parse_canonical_annotation(
         raise ValueError(f"Positive split record has no person objects: {expected_image_blob}")
     if expected_status == "verified_negative" and objects:
         raise ValueError(f"Verified-negative split record has person objects: {expected_image_blob}")
+    if expected_person_count is not None and len(objects) != expected_person_count:
+        raise ValueError(f"Person count does not match split manifest for {expected_image_blob}")
+    if expected_ignored_count is not None and len(ignore_regions) != expected_ignored_count:
+        raise ValueError(f"Ignore-region count does not match split manifest for {expected_image_blob}")
 
     return CanonicalAnnotation(
         image_blob=expected_image_blob,

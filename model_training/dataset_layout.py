@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from typing import Any
@@ -43,6 +44,20 @@ def resolve_citypersons_prefix(read_blob: Callable[[str], bytes | None]) -> str:
             f"Dataset requires loader version {minimum_loader}; this loader is {LOADER_VERSION}"
         )
     return prefix
+
+
+def load_citypersons_manifest(
+    read_blob: Callable[[str], bytes | None], prefix: str
+) -> tuple[dict[str, Any], str]:
+    """Return the immutable manifest and checksum of its exact blob bytes."""
+    name = f"{prefix.rstrip('/')}/manifest.json"
+    content = read_blob(name)
+    if content is None:
+        raise RuntimeError(f"Required dataset blob is missing: {name}")
+    manifest = _load_json(read_blob, name)
+    if manifest.get("dataset") != "citypersons" or manifest.get("versionPrefix") != prefix:
+        raise RuntimeError(f"Invalid CityPersons dataset manifest: {name}")
+    return manifest, hashlib.sha256(content).hexdigest()
 
 
 def load_citypersons_split(

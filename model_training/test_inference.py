@@ -11,6 +11,7 @@ Supports:
 - INT8 NNCF PyTorch models (.pth with NNCF wrapper)
 """
 
+import json
 import torch
 import torch.nn as nn
 import cv2
@@ -22,10 +23,20 @@ from dataclasses import dataclass, field
 from torchvision.ops import nms
 from tqdm import tqdm
 
+from dataset_layout import load_citypersons_manifest, load_citypersons_split, resolve_citypersons_prefix, version_blob
+from canonical_annotations import parse_canonical_annotation
+from canonical_dataset import preprocess_rgb_image, size_slice
+from citypersons_evaluation import (
+    OfficialCityPersonsAccumulator,
+    run_official_citypersons_evaluator,
+)
+
 # Try to import from main training script
 try:
     from train_tune_detector import (
-        SSDPersonDetector
+        SSDPersonDetector,
+        load_detector_state_dict,
+        person_scores_from_logits,
     )
     IMPORTS_AVAILABLE = True
 except ImportError:
@@ -55,7 +66,7 @@ class InferenceConfig:
     # Model settings
     model_path: str = 'best_model_fp32.pth'
     input_size: int = 640
-    num_classes: int = 2  # background + person
+    num_classes: int = 1  # one sigmoid localization-quality logit
     model_type: str = 'auto'  # 'auto', 'pytorch', 'openvino', 'nncf'
     
     # Inference settings
@@ -70,8 +81,12 @@ class InferenceConfig:
     
     # mAP Evaluation settings
     evaluate_map: bool = True
-    map_iou_thresholds: List[float] = field(default_factory=lambda: [0.5])
+    map_iou_thresholds: List[float] = field(
+        default_factory=lambda: [0.5 + index * 0.05 for index in range(10)]
+    )
     map_score_threshold: float = 0.01  # Lower threshold for mAP calculation
+    recall_fppi: float = 0.1
+    official_evaluator_dir: Optional[str] = None
     
     # Azurite settings
     azurite_endpoint: str = os.getenv('AZURITE_BLOB_ENDPOINT', 'http://127.0.0.1:10000/devstoreaccount1')
@@ -171,7 +186,10 @@ class MAPCalculator:
     Collects predictions and ground truths, then computes mAP.
     """
     
-    def __init__(self, iou_thresholds: List[float] = [0.5], use_11_point: bool = False):
+    def __init__(
+        self, iou_thresholds: List[float] = [0.5], use_11_point: bool = False,
+        recall_fppi: float = 0.1,
+    ):
         """
         Args:
             iou_thresholds: IoU thresholds for matching (e.g., [0.5] for mAP@50)
@@ -179,12 +197,18 @@ class MAPCalculator:
         """
         self.iou_thresholds = iou_thresholds
         self.use_11_point = use_11_point
+        self.recall_fppi = recall_fppi
         self.reset()
     
     def reset(self):
         """Reset all collected data."""
         self.predictions = []  # List of {'image_id', 'class_id', 'score', 'box'}
         self.ground_truths = []  # List of {'image_id', 'class_id', 'box'}
+        self.ignore_regions = {}
+        self.image_ids = set()
+
+    def add_image(self, image_id: int):
+        self.image_ids.add(image_id)
     
     def add_predictions(self, image_id: int, detections: List[Dict]):
         """
@@ -194,6 +218,7 @@ class MAPCalculator:
             image_id: Unique image identifier
             detections: List of {'box': [x1,y1,x2,y2], 'score': float, 'class': int}
         """
+        self.add_image(image_id)
         for det in detections:
             self.predictions.append({
                 'image_id': image_id,
@@ -202,7 +227,10 @@ class MAPCalculator:
                 'box': np.array(det['box'], dtype=np.float32)
             })
     
-    def add_ground_truths(self, image_id: int, gt_boxes: List[List[float]], gt_classes: List[int]):
+    def add_ground_truths(
+        self, image_id: int, gt_boxes: List[List[float]], gt_classes: List[int],
+        metadata: Optional[List[Dict]] = None,
+    ):
         """
         Add ground truth annotations for an image.
         
@@ -211,13 +239,36 @@ class MAPCalculator:
             gt_boxes: List of [x1, y1, x2, y2] boxes
             gt_classes: List of class IDs
         """
-        for box, cls in zip(gt_boxes, gt_classes):
+        self.add_image(image_id)
+        metadata = metadata or [{} for _ in gt_boxes]
+        if len(metadata) != len(gt_boxes):
+            raise ValueError("Ground-truth metadata length must match boxes")
+        for box, cls, item_metadata in zip(gt_boxes, gt_classes, metadata):
             self.ground_truths.append({
                 'image_id': image_id,
                 'class_id': cls,
-                'box': np.array(box, dtype=np.float32)
+                'box': np.array(box, dtype=np.float32),
+                'metadata': dict(item_metadata),
             })
     
+    def add_ignore_regions(self, image_id: int, boxes: List[List[float]]):
+        """Register regions whose overlapping unmatched predictions are neutral."""
+        self.add_image(image_id)
+        self.ignore_regions.setdefault(image_id, []).extend(
+            np.asarray(box, dtype=np.float32) for box in boxes
+        )
+
+    def _ignored_prediction(self, image_id: int, box: np.ndarray, threshold: float = 0.5) -> bool:
+        regions = self.ignore_regions.get(image_id, [])
+        if not regions:
+            return False
+        regions = np.asarray(regions)
+        top_left = np.maximum(box[None, :2], regions[:, :2])
+        bottom_right = np.minimum(box[None, 2:], regions[:, 2:])
+        intersection = np.maximum(0, bottom_right - top_left).prod(axis=1)
+        prediction_area = max((box[2] - box[0]) * (box[3] - box[1]), 1e-10)
+        return bool(np.max(intersection / prediction_area) >= threshold)
+
     def compute_map(self, verbose: bool = True) -> Dict:
         """
         Compute mAP over all collected predictions and ground truths.
@@ -229,8 +280,11 @@ class MAPCalculator:
             Dictionary with mAP metrics
         """
         if not self.predictions or not self.ground_truths:
-            print("  No predictions or ground truths to evaluate")
-            return {f'mAP@{t:.2f}': 0.0 for t in self.iou_thresholds}
+            if verbose:
+                print("  No predictions or ground truths to evaluate")
+            empty = {f'mAP@{t:.2f}': 0.0 for t in self.iou_thresholds}
+            empty[f'Recall@FPPI={self.recall_fppi:.2f}'] = 0.0
+            return empty
         
         results = {}
         
@@ -254,13 +308,18 @@ class MAPCalculator:
                           f"(TP={stats['tp']}, FP={stats['fp']}, GT={stats['num_gt']}, "
                           f"Preds={stats['num_preds']})")
             
-            mean_ap = np.mean(aps) if aps else 0.0
+            mean_ap = float(np.mean(aps)) if aps else 0.0
             results[f'mAP@{iou_thresh:.2f}'] = mean_ap
         
         # COCO-style mAP (average over IoU thresholds)
         if len(self.iou_thresholds) > 1:
-            results['mAP@0.50:0.95'] = np.mean([results[f'mAP@{t:.2f}'] for t in self.iou_thresholds])
+            results['mAP@0.50:0.95'] = float(np.mean(
+                [results[f'mAP@{t:.2f}'] for t in self.iou_thresholds]
+            ))
         
+        if classes:
+            _, recall_stats = self._compute_ap_for_class(classes[0], 0.5)
+            results[f'Recall@FPPI={self.recall_fppi:.2f}'] = recall_stats['recall_at_fppi']
         return results
     
     def _compute_ap_for_class(self, class_id: int, iou_threshold: float) -> Tuple[float, Dict]:
@@ -273,7 +332,8 @@ class MAPCalculator:
             'num_preds': len(class_preds),
             'num_gt': len(class_gts),
             'tp': 0,
-            'fp': 0
+            'fp': 0,
+            'recall_at_fppi': 0.0,
         }
         
         if len(class_gts) == 0:
@@ -304,7 +364,8 @@ class MAPCalculator:
             pred_img_id = pred['image_id']
             
             if pred_img_id not in gt_by_image:
-                fp[pred_idx] = 1
+                if not self._ignored_prediction(pred_img_id, pred_box):
+                    fp[pred_idx] = 1
                 continue
             
             img_gt_boxes = np.array(gt_by_image[pred_img_id])
@@ -320,7 +381,8 @@ class MAPCalculator:
                 tp[pred_idx] = 1
                 gt_matched[pred_img_id][best_iou_idx] = True
             else:
-                fp[pred_idx] = 1
+                if not self._ignored_prediction(pred_img_id, pred_box):
+                    fp[pred_idx] = 1
         
         # Calculate precision and recall
         tp_cumsum = np.cumsum(tp)
@@ -337,14 +399,51 @@ class MAPCalculator:
         
         stats['tp'] = int(tp.sum())
         stats['fp'] = int(fp.sum())
+        image_count = max(len(self.image_ids), 1)
+        within_fppi = fp_cumsum / image_count <= self.recall_fppi
+        if np.any(within_fppi):
+            stats['recall_at_fppi'] = float(np.max(recalls[within_fppi]))
+
         
         return ap, stats
     
+    def compute_slices(self) -> Dict[str, Dict[str, float]]:
+        """Evaluate natural-distribution size, source-label, and visibility slices."""
+        dimensions = ("size", "sourceLabel", "visibility")
+        observed = {
+            (dimension, ground_truth["metadata"].get(dimension))
+            for ground_truth in self.ground_truths
+            for dimension in dimensions
+            if isinstance(ground_truth["metadata"].get(dimension), str)
+        }
+        results = {}
+        for dimension, value in sorted(observed):
+            calculator = MAPCalculator(
+                self.iou_thresholds,
+                use_11_point=self.use_11_point,
+                recall_fppi=self.recall_fppi,
+            )
+            calculator.image_ids = set(self.image_ids)
+            calculator.predictions = list(self.predictions)
+            for image_id, boxes in self.ignore_regions.items():
+                calculator.add_ignore_regions(image_id, boxes)
+            for ground_truth in self.ground_truths:
+                metadata = ground_truth["metadata"]
+                if metadata.get(dimension) == value:
+                    calculator.ground_truths.append(ground_truth)
+                else:
+                    calculator.add_ignore_regions(
+                        ground_truth["image_id"], [ground_truth["box"]]
+                    )
+            results[f"{dimension}/{value}"] = calculator.compute_map(verbose=False)
+        return results
+
     def get_summary(self) -> Dict:
         """Get summary statistics."""
         return {
             'num_predictions': len(self.predictions),
             'num_ground_truths': len(self.ground_truths),
+            'num_images': len(self.image_ids),
             'num_images_with_preds': len(set(p['image_id'] for p in self.predictions)),
             'num_images_with_gt': len(set(g['image_id'] for g in self.ground_truths))
         }
@@ -436,24 +535,51 @@ def parse_yolo_annotation(
     return boxes, classes
 
 
+def load_canonical_for_evaluation(data: bytes | None, record: Dict):
+    """Load and validate a complete canonical sidecar for evaluation."""
+    checksums = record.get("checksums")
+    if not isinstance(checksums, dict):
+        raise ValueError("Split record is missing checksums")
+    if (not isinstance(checksums.get("image"), str) or len(checksums["image"]) != 64 or
+            not isinstance(checksums.get("annotation"), str) or len(checksums["annotation"]) != 64 or
+            not isinstance(record.get("personCount"), int) or record["personCount"] < 0 or
+            not isinstance(record.get("ignoredCount"), int) or record["ignoredCount"] < 0):
+        raise ValueError("Split record has invalid checksums or object counts")
+
+    return parse_canonical_annotation(
+        data,
+        expected_image_blob=record["image"],
+        expected_image_sha256=checksums.get("image"),
+        expected_status=record.get("labelStatus"),
+        expected_sidecar_sha256=checksums.get("annotation"),
+        expected_person_count=record.get("personCount"),
+        expected_ignored_count=record.get("ignoredCount"),
+    )
+
+def parse_canonical_for_evaluation(data: bytes | None, record: Dict) -> Tuple[List, List, List]:
+    """Return full person boxes, SSD class IDs, and ignore boxes from a sidecar."""
+    annotation = load_canonical_for_evaluation(data, record)
+    boxes = [obj.full_box for obj in annotation.objects]
+    return boxes, [1] * len(boxes), annotation.ignore_regions
+
+
+
 def get_label_path_from_image_path(image_path: str) -> str:
     """
     Convert image path to corresponding label path.
     
     Args:
-        image_path: e.g., "images/val/city/image.png"
+        image_path: e.g., "datasets/citypersons/v2026-09-07/images/val/city/image.png"
     
     Returns:
-        Label path: e.g., "labels/val/city/image.txt"
+        Label path: e.g., "datasets/.../labels/yolo-person-v1/val/city/image.txt"
     """
-    # Replace 'images' with 'labels' and change extension to .txt
-    label_path = image_path.replace('images/', 'labels/', 1)
+    marker = "/images/"
+    if marker not in image_path:
+        raise ValueError(f"Versioned image path does not contain {marker!r}: {image_path}")
+    prefix, relative_path = image_path.split(marker, 1)
+    label_path = f"{prefix}/labels/yolo-person-v1/{relative_path}"
     label_path = str(Path(label_path).with_suffix('.txt'))
-    
-    # Handle potential duplicate marker
-    if '(1)' in label_path:
-        label_path = label_path.replace('(1)', '')
-    
     return label_path
 
 
@@ -484,13 +610,12 @@ class DetectionPredictor:
         original_size = (image.shape[0], image.shape[1])
         
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image_resized = cv2.resize(image_rgb, (self.config.input_size, self.config.input_size))
+        tensor, scale, pad_x, pad_y = preprocess_rgb_image(
+            image_rgb, self.config.input_size, add_batch=True, return_geometry=True
+        )
+        tensor = torch.from_numpy(tensor).to(self.device)
         
-        tensor = torch.from_numpy(image_resized).float().permute(2, 0, 1) / 255.0
-        tensor = tensor.unsqueeze(0).to(self.device)
-        tensor = (tensor - self.mean) / self.std
-        
-        return tensor, original_size
+        return tensor, (*original_size, scale, pad_x, pad_y)
     
     def decode_boxes(self, pred_boxes: torch.Tensor) -> torch.Tensor:
         """Decode predicted box offsets to absolute coordinates"""
@@ -530,8 +655,7 @@ class DetectionPredictor:
         pred_cls = pred_cls[0]
         pred_boxes = pred_boxes[0]
         
-        scores = torch.softmax(pred_cls, dim=1)
-        person_scores = scores[:, 1]
+        person_scores = person_scores_from_logits(pred_cls)
         
         decoded_boxes = self.decode_boxes(pred_boxes)
         
@@ -548,19 +672,17 @@ class DetectionPredictor:
         final_boxes = filtered_boxes[keep_indices]
         final_scores = filtered_scores[keep_indices]
         
-        orig_h, orig_w = original_size
-        scale_x = orig_w / self.config.input_size
-        scale_y = orig_h / self.config.input_size
+        orig_h, orig_w, scale, pad_x, pad_y = original_size
         
         detections = []
         for i in range(len(final_boxes)):
             box = final_boxes[i].cpu().numpy()
             score = final_scores[i].cpu().item()
             
-            x1 = int(max(0, min(box[0] * scale_x, orig_w)))
-            y1 = int(max(0, min(box[1] * scale_y, orig_h)))
-            x2 = int(max(0, min(box[2] * scale_x, orig_w)))
-            y2 = int(max(0, min(box[3] * scale_y, orig_h)))
+            x1 = int(max(0, min((box[0] - pad_x) / scale, orig_w)))
+            y1 = int(max(0, min((box[1] - pad_y) / scale, orig_h)))
+            x2 = int(max(0, min((box[2] - pad_x) / scale, orig_w)))
+            y2 = int(max(0, min((box[3] - pad_y) / scale, orig_h)))
             
             detections.append({
                 'box': [x1, y1, x2, y2],
@@ -612,15 +734,11 @@ class OpenVINOPredictor:
         original_size = (image.shape[0], image.shape[1])
         
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image_resized = cv2.resize(image_rgb, (self.config.input_size, self.config.input_size))
+        image_batch, scale, pad_x, pad_y = preprocess_rgb_image(
+            image_rgb, self.config.input_size, add_batch=True, return_geometry=True
+        )
         
-        image_float = image_resized.astype(np.float32) / 255.0
-        image_normalized = (image_float - self.mean) / self.std
-        
-        image_nchw = np.transpose(image_normalized, (2, 0, 1))
-        image_batch = np.expand_dims(image_nchw, axis=0)
-        
-        return image_batch, original_size
+        return image_batch, (*original_size, scale, pad_x, pad_y)
     
     def decode_boxes(self, pred_boxes: np.ndarray) -> np.ndarray:
         """Decode predicted box offsets to absolute coordinates"""
@@ -699,9 +817,15 @@ class OpenVINOPredictor:
         pred_cls = pred_cls[0]
         pred_boxes = pred_boxes[0]
         
-        scores = self.softmax(pred_cls, axis=1)
-        person_scores = scores[:, 1]
+        if pred_cls.shape[-1] == 1:
+            person_scores = 1.0 / (1.0 + np.exp(-pred_cls[:, 0]))
+        elif pred_cls.shape[-1] == 2:
+            person_scores = self.softmax(pred_cls, axis=1)[:, 1]
+        else:
         
+            raise ValueError(
+                f"Expected one quality logit or two legacy logits, got {pred_cls.shape}"
+            )
         decoded_boxes = self.decode_boxes(pred_boxes)
         
         mask = person_scores > score_threshold
@@ -717,19 +841,17 @@ class OpenVINOPredictor:
         final_boxes = filtered_boxes[keep_indices]
         final_scores = filtered_scores[keep_indices]
         
-        orig_h, orig_w = original_size
-        scale_x = orig_w / self.config.input_size
-        scale_y = orig_h / self.config.input_size
+        orig_h, orig_w, scale, pad_x, pad_y = original_size
         
         detections = []
         for i in range(len(final_boxes)):
             box = final_boxes[i]
             score = final_scores[i]
             
-            x1 = int(np.clip(box[0] * scale_x, 0, orig_w))
-            y1 = int(np.clip(box[1] * scale_y, 0, orig_h))
-            x2 = int(np.clip(box[2] * scale_x, 0, orig_w))
-            y2 = int(np.clip(box[3] * scale_y, 0, orig_h))
+            x1 = int(np.clip((box[0] - pad_x) / scale, 0, orig_w))
+            y1 = int(np.clip((box[1] - pad_y) / scale, 0, orig_h))
+            x2 = int(np.clip((box[2] - pad_x) / scale, 0, orig_w))
+            y2 = int(np.clip((box[3] - pad_y) / scale, 0, orig_h))
             
             detections.append({
                 'box': [x1, y1, x2, y2],
@@ -1022,12 +1144,12 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
             checkpoint = torch.load(config.model_path, map_location=config.device)
             
             if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
+                load_detector_state_dict(model, checkpoint['model_state_dict'])
                 print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
                 if 'best_val_loss' in checkpoint:
                     print(f"  Best validation loss: {checkpoint['best_val_loss']:.4f}")
             else:
-                model.load_state_dict(checkpoint)
+                load_detector_state_dict(model, checkpoint)
                 print("✓ Loaded model weights")
         else:
             print(f"⚠ Warning: Model file not found at {config.model_path}")
@@ -1081,11 +1203,14 @@ def run_inference(config: InferenceConfig):
     
     # Initialize mAP calculator
     map_calculator = None
+    official_accumulator = None
     if config.evaluate_map:
         map_calculator = MAPCalculator(
             iou_thresholds=config.map_iou_thresholds,
-            use_11_point=False  # Use VOC 2010+ style
+            use_11_point=False,
+            recall_fppi=config.recall_fppi,
         )
+        official_accumulator = OfficialCityPersonsAccumulator()
         print("✓ mAP calculator initialized")
     
     # Find test images
@@ -1099,12 +1224,27 @@ def run_inference(config: InferenceConfig):
         splits_to_try = ['test', 'val', 'train']
 
     image_paths = []
+    records_by_image = {}
     used_split = None
 
+    bucket = config.azurite_data_bucket
+    read_blob = lambda name: azurite_client.get_object_bytes(bucket, name)
+    dataset_prefix = resolve_citypersons_prefix(read_blob)
+
+    dataset_manifest, dataset_manifest_sha256 = load_citypersons_manifest(read_blob, dataset_prefix)
+
     for split in splits_to_try:
-        image_prefix = f"images/{split}"
-        paths = azurite_client.list_objects(config.azurite_data_bucket, image_prefix)
-        image_paths = [p for p in paths if p.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        records = load_citypersons_split(read_blob, dataset_prefix, split)
+        image_paths = [
+            version_blob(dataset_prefix, record["image"])
+            for record in records
+            if isinstance(record.get("image"), str)
+        ]
+        records_by_image = {
+            version_blob(dataset_prefix, record["image"]): record
+            for record in records
+            if isinstance(record.get("image"), str)
+        }
         
         if image_paths:
             used_split = split
@@ -1119,6 +1259,12 @@ def run_inference(config: InferenceConfig):
     
     # Process images
     num_to_process = min(len(image_paths), config.max_images)
+    if config.official_evaluator_dir and (
+        used_split != "val" or num_to_process != len(image_paths)
+    ):
+        raise RuntimeError(
+            "Official CityPersons metrics require the complete validation manifest"
+        )
     print(f"\nProcessing {num_to_process} images from '{used_split}' split...")
     
     total_detections = 0
@@ -1132,6 +1278,8 @@ def run_inference(config: InferenceConfig):
         img_data = azurite_client.get_object_bytes(config.azurite_data_bucket, img_path)
         
         if img_data is None:
+            if config.evaluate_map:
+                raise RuntimeError(f"Evaluation image is missing: {img_path}")
             continue
         
         # Decode image
@@ -1139,6 +1287,8 @@ def run_inference(config: InferenceConfig):
         image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         
         if image is None:
+            if config.evaluate_map:
+                raise RuntimeError(f"Evaluation image cannot be decoded: {img_path}")
             continue
         
         img_h, img_w = image.shape[:2]
@@ -1146,14 +1296,30 @@ def run_inference(config: InferenceConfig):
         # Load ground truth annotations (if evaluating mAP)
         gt_boxes = []
         gt_classes = []
-        
+        ignore_regions = []
+        annotation = None
+        gt_metadata = []
+
         if config.evaluate_map:
-            label_path = get_label_path_from_image_path(img_path)
-            label_data = azurite_client.get_object_bytes(config.azurite_data_bucket, label_path)
-            gt_boxes, gt_classes = parse_yolo_annotation(label_data, img_w, img_h)
+            record = records_by_image[img_path]
+            annotation_path = version_blob(dataset_prefix, record["annotation"])
+            annotation_data = azurite_client.get_object_bytes(
+                config.azurite_data_bucket, annotation_path
+            )
+            annotation = load_canonical_for_evaluation(annotation_data, record)
+            gt_boxes = [obj.full_box for obj in annotation.objects]
+            gt_classes = [1] * len(gt_boxes)
+            ignore_regions = annotation.ignore_regions
+            gt_metadata = [{
+                "size": size_slice(obj.full_box),
+                "sourceLabel": obj.source_label,
+                "visibility": obj.attributes.get("visibility", "unknown"),
+            } for obj in annotation.objects]
+            map_calculator.add_image(idx)
+            map_calculator.add_ignore_regions(idx, ignore_regions)
             
             if gt_boxes:
-                map_calculator.add_ground_truths(idx, gt_boxes, gt_classes)
+                map_calculator.add_ground_truths(idx, gt_boxes, gt_classes, gt_metadata)
                 total_ground_truths += len(gt_boxes)
                 images_with_gt += 1
         
@@ -1162,6 +1328,7 @@ def run_inference(config: InferenceConfig):
             # Get detections with low threshold for mAP
             detections_for_map = predictor.predict(image, score_threshold=config.map_score_threshold)
             map_calculator.add_predictions(idx, detections_for_map)
+            official_accumulator.add_image(idx, record["image"], annotation, detections_for_map)
             
             # Get detections with normal threshold for visualization
             detections_for_viz = [d for d in detections_for_map if d['score'] >= config.confidence_threshold]
@@ -1220,6 +1387,39 @@ def run_inference(config: InferenceConfig):
         
         print("\nComputing mAP...")
         map_results = map_calculator.compute_map(verbose=True)
+        slice_results = map_calculator.compute_slices()
+        official_gt, official_detections = official_accumulator.write(output_path)
+        official_results = {
+            "status": "inputs_generated",
+            "groundTruth": str(official_gt),
+            "detections": str(official_detections),
+        }
+        if config.official_evaluator_dir:
+            if used_split != "val":
+                raise RuntimeError("Official CityPersons metrics may only be reported on val")
+            official_results = {
+                "status": "complete",
+                **run_official_citypersons_evaluator(
+                    official_accumulator,
+                    Path(config.official_evaluator_dir),
+                    output_path,
+                ),
+            }
+        evaluation_report = {
+            "dataset": {
+                "versionPrefix": dataset_prefix,
+                "manifestSha256": dataset_manifest_sha256,
+                "schemaVersion": dataset_manifest.get("schemaVersion"),
+                "split": used_split,
+                "records": num_to_process,
+            },
+            "projectBinary": {"metrics": map_results, "slices": slice_results},
+            "officialCityPersons": official_results,
+        }
+        metrics_json = output_path / "evaluation_metrics.json"
+        metrics_json.write_text(
+            json.dumps(evaluation_report, indent=2) + "\n", encoding="utf-8"
+        )
         
         print("\n" + "-" * 40)
         print("Final Results:")
@@ -1237,6 +1437,9 @@ def run_inference(config: InferenceConfig):
             f.write(f"Images evaluated: {num_to_process}\n")
             f.write(f"Confidence threshold (viz): {config.confidence_threshold}\n")
             f.write(f"Score threshold (mAP): {config.map_score_threshold}\n")
+            f.write(f"Dataset version: {dataset_prefix}\n")
+            f.write(f"Dataset schema: {dataset_manifest.get('schemaVersion')}\n")
+            f.write(f"Manifest SHA256: {dataset_manifest_sha256}\n")
             f.write(f"NMS threshold: {config.nms_threshold}\n")
             f.write(f"IoU thresholds: {config.map_iou_thresholds}\n\n")
             f.write("Results:\n")
@@ -1245,6 +1448,7 @@ def run_inference(config: InferenceConfig):
         
         print(f"\nResults saved to: {results_file}")
     
+        print(f"Machine-readable evaluation saved to: {metrics_json}")
     print("=" * 70)
     
     return map_results if config.evaluate_map else None
@@ -1268,7 +1472,7 @@ def main():
     # Inference settings
     parser.add_argument('--confidence', type=float, default=0.5,
                         help='Confidence threshold for visualization')
-    parser.add_argument('--nms-threshold', type=float, default=0.3,
+    parser.add_argument('--nms-threshold', type=float, default=0.5,
                         help='NMS IoU threshold')
     
     # mAP evaluation settings
@@ -1276,10 +1480,16 @@ def main():
                         help='Disable mAP evaluation')
     parser.add_argument('--map-threshold', type=float, default=0.01,
                         help='Score threshold for mAP calculation (lower than viz threshold)')
-    parser.add_argument('--iou-thresholds', type=float, nargs='+', default=[0.5],
+    parser.add_argument('--iou-thresholds', type=float, nargs='+', default=None,
                         help='IoU thresholds for mAP (e.g., 0.5 0.75 or 0.5 0.55 0.6 ... 0.95)')
     parser.add_argument('--coco-map', action='store_true',
                         help='Use COCO-style mAP@0.50:0.95 (10 IoU thresholds)')
+    parser.add_argument('--recall-fppi', type=float, default=0.1,
+                        help='False positives per image used for the reported recall operating point')
+    parser.add_argument(
+        '--official-evaluator-dir',
+        default=os.getenv('CITYPERSONS_EVALUATOR_DIR'),
+        help='Path to the official evaluation/eval_script directory')
     
     # Data settings
     parser.add_argument('--output-dir', type=str, default='./test_output',
@@ -1307,7 +1517,7 @@ def main():
     
     # Handle COCO mAP
     iou_thresholds = args.iou_thresholds
-    if args.coco_map:
+    if args.coco_map or iou_thresholds is None:
         iou_thresholds = [0.5 + i * 0.05 for i in range(10)]  # 0.50 to 0.95
     
     # Create config
@@ -1320,6 +1530,8 @@ def main():
         evaluate_map=not args.no_map,
         map_iou_thresholds=iou_thresholds,
         map_score_threshold=args.map_threshold,
+        recall_fppi=args.recall_fppi,
+        official_evaluator_dir=args.official_evaluator_dir,
         output_dir=args.output_dir,
         max_images=args.max_images,
         data_root=args.data_root,
