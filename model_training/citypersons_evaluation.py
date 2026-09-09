@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from person_detection.contracts import EvaluationBackend
 
 
 OFFICIAL_EVALUATOR_COMMIT = "839c22fb05a16c150cb77f9b73a5c0e9642af21e"
@@ -195,8 +196,9 @@ def run_official_citypersons_evaluator(
                 evaluator.params.imgIds = sorted(coco_gt.getImgIds())
                 evaluator.evaluate(setup_id)
                 evaluator.accumulate()
-                evaluator.summarize(setup_id, result_stream)
-                metrics[f"MR/{setup_name}"] = _official_miss_rate(evaluator)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    evaluator.summarize(setup_id, result_stream)
+                    metrics[f"MR/{setup_name}"] = _official_miss_rate(evaluator)
     finally:
         np.linspace = old_linspace
         if old_float is None:
@@ -204,3 +206,17 @@ def run_official_citypersons_evaluator(
         else:
             setattr(np, "float", old_float)
     return {**provenance, "results": str(result_path), "metrics": metrics}
+
+
+class PinnedCityPersonsEvaluator(EvaluationBackend):
+    """Object-oriented adapter for the checksum-pinned official evaluator."""
+
+    def __init__(self, evaluator_dir: Path):
+        self.evaluator_dir = evaluator_dir
+
+    def evaluate(
+        self, accumulator: OfficialCityPersonsAccumulator, output_dir: Path
+    ) -> dict[str, Any]:
+        return run_official_citypersons_evaluator(
+            accumulator, self.evaluator_dir, output_dir
+        )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import random
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,12 @@ from dataset_layout import (
     resolve_citypersons_prefix,
     version_blob,
 )
+from person_detection.sampling import (
+    DEFAULT_HARD_CASE_POLICY,
+    GreedyStratifiedSelector,
+    HardCaseSamplingPolicy,
+)
+
 
 try:
     import albumentations as A
@@ -27,6 +32,14 @@ try:
     HAS_ALBUMENTATIONS = True
 except ImportError:
     HAS_ALBUMENTATIONS = False
+if HAS_ALBUMENTATIONS:
+    class BoxPreservingCoarseDropout(A.CoarseDropout):
+        """Add synthetic occlusion without deleting or shrinking detection targets."""
+
+        def apply_to_bboxes(self, bboxes: np.ndarray, **params) -> np.ndarray:
+            return bboxes
+
+
 
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -45,20 +58,7 @@ PRODUCTION_PREPROCESSING = {
     "dtype": "float32",
 }
 
-DEFAULT_OVERSAMPLING_POLICY = {
-    "name": "citypersons-hard-cases-v1",
-    "replacement": True,
-    "baseWeight": 1.0,
-    "maximumWeight": 4.0,
-    "multipliers": {
-        "size:small": 2.0,
-        "visibility:heavily_occluded": 2.5,
-        "sourceLabel:rider": 1.75,
-        "sourceLabel:sitting person": 2.0,
-        "sourceLabel:person (other)": 2.25,
-        "posture:unusual": 2.25,
-    },
-}
+DEFAULT_OVERSAMPLING_POLICY = DEFAULT_HARD_CASE_POLICY
 
 
 def letterbox_image(image: np.ndarray, size: int) -> tuple[np.ndarray, float, int, int]:
@@ -138,37 +138,8 @@ def annotation_strata(annotation, *, status: str, image_blob: str) -> set[str]:
 def select_stratified_indices(
     strata_by_index: list[set[str]], sample_count: int, seed: int = 1337
 ) -> list[int]:
-    """Greedily select deterministic records while balancing every declared stratum."""
-    if sample_count <= 0:
-        raise ValueError("sample_count must be positive")
-    if sample_count >= len(strata_by_index):
-        return list(range(len(strata_by_index)))
-
-    rng = random.Random(seed)
-    tie_order = list(range(len(strata_by_index)))
-    rng.shuffle(tie_order)
-    tie_rank = {index: rank for rank, index in enumerate(tie_order)}
-    available = set(range(len(strata_by_index)))
-    selected = []
-    selected_counts: Counter[str] = Counter()
-    population_counts = Counter(
-        stratum for strata in strata_by_index for stratum in set(strata)
-    )
-
-    while available and len(selected) < sample_count:
-        def score(index: int):
-            strata = strata_by_index[index]
-            gain = sum(
-                1.0 / ((selected_counts[stratum] + 1) * population_counts[stratum])
-                for stratum in strata
-            )
-            return gain, -tie_rank[index]
-
-        chosen = max(available, key=score)
-        available.remove(chosen)
-        selected.append(chosen)
-        selected_counts.update(strata_by_index[chosen])
-    return selected
+    """Compatibility wrapper around the configurable calibration strategy."""
+    return GreedyStratifiedSelector().select(strata_by_index, sample_count, seed)
 
 
 class CanonicalPersonDetectionDataset(Dataset):
@@ -241,7 +212,7 @@ class CanonicalPersonDetectionDataset(Dataset):
                      scale=(0.9, 1.1), rotate=(-5, 5), p=0.3),
         ] if self.augment else []
         appearance = [
-            A.CoarseDropout(num_holes_range=(1, 6), hole_height_range=(0.02, 0.08),
+            BoxPreservingCoarseDropout(num_holes_range=(1, 6), hole_height_range=(0.02, 0.08),
                             hole_width_range=(0.02, 0.08), fill=0, p=0.3),
             A.OneOf([
                 A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
@@ -312,18 +283,13 @@ class CanonicalPersonDetectionDataset(Dataset):
         """Build training-only weights without changing validation distribution."""
         if self.split != "train":
             raise ValueError("Oversampling is only valid for the training split")
-        policy = dict(DEFAULT_OVERSAMPLING_POLICY if policy is None else policy)
-        multipliers = policy.get("multipliers")
-        if not isinstance(multipliers, dict) or not multipliers:
-            raise ValueError("Sampling policy must define non-empty multipliers")
-        base = float(policy.get("baseWeight", 1.0))
-        maximum = float(policy.get("maximumWeight", 4.0))
-        weights = []
-        for index in range(len(self.samples)):
-            strata = self.strata_for_sample(index)
-            weight = max([base] + [float(value) for key, value in multipliers.items() if key in strata])
-            weights.append(min(weight, maximum))
-        self.dataset_metadata["samplingPolicy"] = policy
+        definition = DEFAULT_OVERSAMPLING_POLICY if policy is None else policy
+        sampling_policy = HardCaseSamplingPolicy.from_mapping(definition)
+        weights = [
+            sampling_policy.weight(self.strata_for_sample(index))
+            for index in range(len(self.samples))
+        ]
+        self.dataset_metadata["samplingPolicy"] = sampling_policy.to_mapping()
         return torch.as_tensor(weights, dtype=torch.double)
 
     def __len__(self):

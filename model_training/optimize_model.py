@@ -25,14 +25,15 @@ from torchvision.ops import nms
 from canonical_dataset import (
     PRODUCTION_PREPROCESSING,
     CanonicalPersonDetectionDataset,
+    clip_box_to_image,
     map_letterbox_box,
     preprocess_rgb_image,
     select_stratified_indices,
     size_slice,
 )
+from person_detection.contracts import ModelOptimizationPipeline
 from test_inference import MAPCalculator
 from train_tune_detector import (
-    MODEL_FORMAT_VERSION,
     AzuriteClient,
     SSDPersonDetector,
     TrainingConfig,
@@ -210,16 +211,25 @@ def map_annotation_to_canvas(record: ManifestRecord):
     resized_height = max(1, round(annotation.height * scale))
     pad_x = (size - resized_width) // 2
     pad_y = (size - resized_height) // 2
-    boxes = [map_letterbox_box(obj.full_box, scale, pad_x, pad_y) for obj in annotation.objects]
-    ignores = [map_letterbox_box(box, scale, pad_x, pad_y) for box in annotation.ignore_regions]
-    metadata = [
-        {
+    boxes = []
+    metadata = []
+    for obj in annotation.objects:
+        clipped = clip_box_to_image(
+            obj.full_box, annotation.width, annotation.height
+        )
+        if clipped is None:
+            continue
+        boxes.append(map_letterbox_box(clipped, scale, pad_x, pad_y))
+        metadata.append({
             "size": size_slice(obj.full_box),
             "sourceLabel": obj.source_label,
             "visibility": obj.attributes.get("visibility", "unknown"),
-        }
-        for obj in annotation.objects
-    ]
+        })
+    ignores = []
+    for box in annotation.ignore_regions:
+        clipped = clip_box_to_image(box, annotation.width, annotation.height)
+        if clipped is not None:
+            ignores.append(map_letterbox_box(clipped, scale, pad_x, pad_y))
     return boxes, ignores, metadata
 
 
@@ -379,215 +389,226 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    if args.max_accuracy_drop < 0:
-        raise ValueError("--max-accuracy-drop must be non-negative")
-    if args.threads <= 0 or args.benchmark_iterations <= 0:
-        raise ValueError("Thread and benchmark iteration counts must be positive")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
+    """Export, calibrate, validate, and benchmark from immutable manifests."""
 
-    checkpoint_bytes = args.checkpoint.read_bytes()
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    input_size = args.input_size or checkpoint_config.get("input_size", 480)
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
 
-    config = TrainingConfig(
-        data_root=args.data_root,
-        input_size=input_size,
-        use_azurite=not args.no_azurite,
-        azurite_endpoint=args.azurite_endpoint,
-        azurite_access_key=args.azurite_account,
-        azurite_secret_key=args.azurite_key,
-        enable_quantization=False,
-    )
-    client = AzuriteClient(config)
-    calibration_source = CanonicalPersonDetectionDataset(
-        client, split="train", input_size=input_size, augment=False
-    )
-    validation_source = CanonicalPersonDetectionDataset(
-        client, split="val", input_size=input_size, augment=False
-    )
-    try:
-        provenance = verify_checkpoint_dataset(checkpoint, calibration_source)
-    except RuntimeError as exc:
-        if not args.allow_unverified_checkpoint:
-            raise
-        provenance = {"verified": False, "warning": str(exc)}
+    def run(self) -> dict:
+        args = self.args
+        if args.max_accuracy_drop < 0:
+            raise ValueError("--max-accuracy-drop must be non-negative")
+        if args.threads <= 0 or args.benchmark_iterations <= 0:
+            raise ValueError("Thread and benchmark iteration counts must be positive")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    calibration_records = select_records(
-        calibration_source,
-        args.calibration_samples,
-        seed=args.selection_seed,
-        stratified=True,
-    )
-    validation_records = select_records(
-        validation_source,
-        args.validation_samples,
-        seed=args.selection_seed,
-        stratified=False,
-    )
-    calibration_manifest = {
-        "schemaVersion": 1,
-        "dataset": calibration_source.dataset_metadata,
-        "split": "train",
-        "selection": {
-            "name": "deterministic-greedy-stratified-v1",
-            "seed": args.selection_seed,
-            "requestedRecords": args.calibration_samples,
-            "selectedRecords": len(calibration_records),
-        },
-        "inputSize": input_size,
-        "preprocessing": PRODUCTION_PREPROCESSING,
-        "records": [record.identity() for record in calibration_records],
-    }
-    calibration_manifest_path = args.output_dir / "calibration_manifest.json"
-    write_json(calibration_manifest_path, calibration_manifest)
-    calibration_manifest_sha256 = sha256_bytes(calibration_manifest_path.read_bytes())
+        checkpoint_bytes = args.checkpoint.read_bytes()
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        input_size = args.input_size or checkpoint_config.get("input_size", 480)
 
-    model = load_checkpoint_model(checkpoint, input_size)
-    anchors = model.anchor_generator.get_anchors().numpy()
-    example = torch.zeros(1, 3, input_size, input_size)
-    ov_model = ov.convert_model(
-        model, example_input=example, input=[1, 3, input_size, input_size]
-    )
-    fp32_path = args.output_dir / "person_detector_fp32.xml"
-    fp16_path = args.output_dir / "person_detector_fp16.xml"
-    int8_path = args.output_dir / "person_detector_int8.xml"
-    ov.save_model(ov_model, fp32_path, compress_to_fp16=False)
-    ov.save_model(ov_model, fp16_path, compress_to_fp16=True)
-
-    calibration_dataset = nncf.Dataset(
-        calibration_records, lambda record: record.input_tensor()
-    )
-    validation_dataset = nncf.Dataset(
-        validation_records, lambda record: record.input_tensor()
-    )
-
-    def validation_fn(compiled_model, records):
-        result = evaluate_compiled_model(
-            compiled_model,
-            records,
-            anchors,
-            score_threshold=args.score_threshold,
-            nms_threshold=args.nms_threshold,
-            max_detections=args.max_detections,
-            include_slices=False,
+        config = TrainingConfig(
+            data_root=args.data_root,
+            input_size=input_size,
+            use_azurite=not args.no_azurite,
+            azurite_endpoint=args.azurite_endpoint,
+            azurite_access_key=args.azurite_account,
+            azurite_secret_key=args.azurite_key,
+            enable_quantization=False,
         )
-        return result["metrics"]["mAP@0.50:0.95"]
+        client = AzuriteClient(config)
+        calibration_source = CanonicalPersonDetectionDataset(
+            client, split="train", input_size=input_size, augment=False
+        )
+        validation_source = CanonicalPersonDetectionDataset(
+            client, split="val", input_size=input_size, augment=False
+        )
+        try:
+            provenance = verify_checkpoint_dataset(checkpoint, calibration_source)
+        except RuntimeError as exc:
+            if not args.allow_unverified_checkpoint:
+                raise
+            provenance = {"verified": False, "warning": str(exc)}
 
-    quantized_model = nncf.quantize_with_accuracy_control(
-        ov_model,
-        calibration_dataset,
-        validation_dataset,
-        validation_fn,
-        max_drop=args.max_accuracy_drop,
-        drop_type=nncf.DropType.ABSOLUTE,
-        preset=nncf.QuantizationPreset.MIXED,
-        target_device=nncf.TargetDevice.CPU,
-        subset_size=len(calibration_records),
-        fast_bias_correction=True,
-    )
-    ov.save_model(quantized_model, int8_path, compress_to_fp16=False)
+        calibration_records = select_records(
+            calibration_source,
+            args.calibration_samples,
+            seed=args.selection_seed,
+            stratified=True,
+        )
+        validation_records = select_records(
+            validation_source,
+            args.validation_samples,
+            seed=args.selection_seed,
+            stratified=False,
+        )
+        calibration_manifest = {
+            "schemaVersion": 1,
+            "dataset": calibration_source.dataset_metadata,
+            "split": "train",
+            "selection": {
+                "name": "deterministic-greedy-stratified-v1",
+                "seed": args.selection_seed,
+                "requestedRecords": args.calibration_samples,
+                "selectedRecords": len(calibration_records),
+            },
+            "inputSize": input_size,
+            "preprocessing": PRODUCTION_PREPROCESSING,
+            "records": [record.identity() for record in calibration_records],
+        }
+        calibration_manifest_path = args.output_dir / "calibration_manifest.json"
+        write_json(calibration_manifest_path, calibration_manifest)
+        calibration_manifest_sha256 = sha256_bytes(calibration_manifest_path.read_bytes())
 
-    variants = {}
-    representative_input = calibration_records[0].input_tensor()
-    for name, path in (("fp32", fp32_path), ("fp16", fp16_path), ("int8", int8_path)):
-        compiled = compile_for_cpu(path, args.threads)
-        variants[name] = {
-            **model_artifact(path),
-            "accuracy": evaluate_compiled_model(
-                compiled,
-                validation_records,
+        model = load_checkpoint_model(checkpoint, input_size)
+        anchors = model.anchor_generator.get_anchors().numpy()
+        example = torch.zeros(1, 3, input_size, input_size)
+        ov_model = ov.convert_model(
+            model, example_input=example, input=[1, 3, input_size, input_size]
+        )
+        fp32_path = args.output_dir / "person_detector_fp32.xml"
+        fp16_path = args.output_dir / "person_detector_fp16.xml"
+        int8_path = args.output_dir / "person_detector_int8.xml"
+        ov.save_model(ov_model, fp32_path, compress_to_fp16=False)
+        ov.save_model(ov_model, fp16_path, compress_to_fp16=True)
+
+        calibration_dataset = nncf.Dataset(
+            calibration_records, lambda record: record.input_tensor()
+        )
+        validation_dataset = nncf.Dataset(
+            validation_records, lambda record: record.input_tensor()
+        )
+
+        def validation_fn(compiled_model, records):
+            result = evaluate_compiled_model(
+                compiled_model,
+                records,
                 anchors,
                 score_threshold=args.score_threshold,
                 nms_threshold=args.nms_threshold,
                 max_detections=args.max_detections,
-                include_slices=True,
-            ),
-            "coreLatency": benchmark_core(
-                compiled, representative_input, args.benchmark_iterations
-            ),
-            "endToEndLatency": benchmark_end_to_end(
-                compiled,
-                validation_records,
-                anchors,
-                args.benchmark_iterations,
-                args.score_threshold,
-                args.nms_threshold,
-                args.max_detections,
-            ),
-        }
+                include_slices=False,
+            )
+            return result["metrics"]["mAP@0.50:0.95"]
 
-    metric_name = "mAP@0.50:0.95"
-    fp32_metric = variants["fp32"]["accuracy"]["metrics"][metric_name]
-    int8_metric = variants["int8"]["accuracy"]["metrics"][metric_name]
-    measured_drop = max(0.0, fp32_metric - int8_metric)
-    accepted = measured_drop <= args.max_accuracy_drop + 1e-12
-    report = {
-        "schemaVersion": 2,
-        "checkpoint": {
-            "path": str(args.checkpoint),
-            "sha256": sha256_bytes(checkpoint_bytes),
-            "modelFormatVersion": checkpoint.get("modelFormatVersion"),
-            **provenance,
-        },
-        "dataset": calibration_source.dataset_metadata,
-        "calibrationManifest": {
-            "path": str(calibration_manifest_path),
-            "sha256": calibration_manifest_sha256,
-        },
-        "validation": {
-            "split": "val",
-            "samplingPolicy": "natural-order-v1",
-            "records": [record.identity() for record in validation_records],
-        },
-        "preprocessing": {**PRODUCTION_PREPROCESSING, "inputSize": input_size},
-        "accuracyControl": {
-            "metric": metric_name,
-            "dropType": "absolute",
-            "maximumDrop": args.max_accuracy_drop,
-            "measuredDrop": measured_drop,
-            "accepted": accepted,
-        },
-        "benchmarkConfiguration": {
-            "device": "CPU",
-            "cpu": cpu_model_name(),
-            "threads": args.threads,
-            "streams": 1,
-            "performanceHint": "LATENCY",
-            "coreLatencyScope": "compiled model inference only",
-            "endToEndLatencyScope": "decode + RGB conversion + letterbox + normalization + inference + NMS",
-        },
-        "software": {
-            "python": sys.version.split()[0],
-            "platform": platform.platform(),
-            "torch": torch.__version__,
-            "torchvision": torchvision.__version__,
-            "numpy": np.__version__,
-            "opencv": cv2.__version__,
-            "openvino": ov.__version__,
-            "nncf": nncf.__version__,
-        },
-        "variants": variants,
-        "speedupVsFp32": {
-            name: {
-                "core": variants["fp32"]["coreLatency"]["meanMs"]
-                / values["coreLatency"]["meanMs"],
-                "endToEnd": variants["fp32"]["endToEndLatency"]["meanMs"]
-                / values["endToEndLatency"]["meanMs"],
-            }
-            for name, values in variants.items()
-        },
-    }
-    report_path = args.output_dir / "optimization_report.json"
-    write_json(report_path, report)
-    print(json.dumps(report, indent=2, sort_keys=True))
-    if not accepted:
-        raise RuntimeError(
-            f"INT8 rejected: {metric_name} drop {measured_drop:.6f} exceeds "
-            f"the {args.max_accuracy_drop:.6f} limit"
+        quantized_model = nncf.quantize_with_accuracy_control(
+            ov_model,
+            calibration_dataset,
+            validation_dataset,
+            validation_fn,
+            max_drop=args.max_accuracy_drop,
+            drop_type=nncf.DropType.ABSOLUTE,
+            preset=nncf.QuantizationPreset.MIXED,
+            target_device=nncf.TargetDevice.CPU,
+            subset_size=len(calibration_records),
+            fast_bias_correction=True,
         )
+        ov.save_model(quantized_model, int8_path, compress_to_fp16=False)
+
+        variants = {}
+        representative_input = calibration_records[0].input_tensor()
+        for name, path in (("fp32", fp32_path), ("fp16", fp16_path), ("int8", int8_path)):
+            compiled = compile_for_cpu(path, args.threads)
+            variants[name] = {
+                **model_artifact(path),
+                "accuracy": evaluate_compiled_model(
+                    compiled,
+                    validation_records,
+                    anchors,
+                    score_threshold=args.score_threshold,
+                    nms_threshold=args.nms_threshold,
+                    max_detections=args.max_detections,
+                    include_slices=True,
+                ),
+                "coreLatency": benchmark_core(
+                    compiled, representative_input, args.benchmark_iterations
+                ),
+                "endToEndLatency": benchmark_end_to_end(
+                    compiled,
+                    validation_records,
+                    anchors,
+                    args.benchmark_iterations,
+                    args.score_threshold,
+                    args.nms_threshold,
+                    args.max_detections,
+                ),
+            }
+
+        metric_name = "mAP@0.50:0.95"
+        fp32_metric = variants["fp32"]["accuracy"]["metrics"][metric_name]
+        int8_metric = variants["int8"]["accuracy"]["metrics"][metric_name]
+        measured_drop = max(0.0, fp32_metric - int8_metric)
+        accepted = measured_drop <= args.max_accuracy_drop + 1e-12
+        report = {
+            "schemaVersion": 2,
+            "checkpoint": {
+                "path": str(args.checkpoint),
+                "sha256": sha256_bytes(checkpoint_bytes),
+                "modelFormatVersion": checkpoint.get("modelFormatVersion"),
+                **provenance,
+            },
+            "dataset": calibration_source.dataset_metadata,
+            "calibrationManifest": {
+                "path": str(calibration_manifest_path),
+                "sha256": calibration_manifest_sha256,
+            },
+            "validation": {
+                "split": "val",
+                "samplingPolicy": "natural-order-v1",
+                "records": [record.identity() for record in validation_records],
+            },
+            "preprocessing": {**PRODUCTION_PREPROCESSING, "inputSize": input_size},
+            "accuracyControl": {
+                "metric": metric_name,
+                "dropType": "absolute",
+                "maximumDrop": args.max_accuracy_drop,
+                "measuredDrop": measured_drop,
+                "accepted": accepted,
+            },
+            "benchmarkConfiguration": {
+                "device": "CPU",
+                "cpu": cpu_model_name(),
+                "threads": args.threads,
+                "streams": 1,
+                "performanceHint": "LATENCY",
+                "coreLatencyScope": "compiled model inference only",
+                "endToEndLatencyScope": "decode + RGB conversion + letterbox + normalization + inference + NMS",
+            },
+            "software": {
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "torch": torch.__version__,
+                "torchvision": torchvision.__version__,
+                "numpy": np.__version__,
+                "opencv": cv2.__version__,
+                "openvino": ov.__version__,
+                "nncf": nncf.__version__,
+            },
+            "variants": variants,
+            "speedupVsFp32": {
+                name: {
+                    "core": variants["fp32"]["coreLatency"]["meanMs"]
+                    / values["coreLatency"]["meanMs"],
+                    "endToEnd": variants["fp32"]["endToEndLatency"]["meanMs"]
+                    / values["endToEndLatency"]["meanMs"],
+                }
+                for name, values in variants.items()
+            },
+        }
+        report_path = args.output_dir / "optimization_report.json"
+        write_json(report_path, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if not accepted:
+            raise RuntimeError(
+                f"INT8 rejected: {metric_name} drop {measured_drop:.6f} exceeds "
+                f"the {args.max_accuracy_drop:.6f} limit"
+            )
+        return report
+
+
+def main() -> None:
+    ManifestDrivenOpenVINOOptimizer(parse_args()).run()
 
 
 if __name__ == "__main__":
