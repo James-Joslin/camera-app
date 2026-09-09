@@ -12,7 +12,7 @@ This directory owns the CityPersons binary-person detector from immutable datase
 - Checksum-pinned official CityPersons evaluation for Reasonable, Reasonable-small, heavy-occlusion, and All miss rates.
 - Deterministic manifest-driven INT8 calibration with NNCF accuracy control, identical validation records across FP32/FP16/INT8, and core plus end-to-end latency reports.
 
-## Architecture
+## Code architecture
 
 The public executables stay compatible while replaceable behavior is separated behind small interfaces.
 
@@ -28,6 +28,58 @@ The public executables stay compatible while replaceable behavior is separated b
 | `optimize_model.py` | `ManifestDrivenOpenVINOOptimizer` release pipeline |
 
 Abstract classes are used only where implementations are genuinely interchangeable: anchor assignment, manifest selection, inference backends, evaluation backends, and optimization pipelines.
+
+## Model architecture
+
+The detector remains an SSD-style, anchor-based network with a pretrained MobileNetV3-Small backbone. The changes in this project improve the person-specific anchors, target assignment, confidence semantics, and loss; they do not replace the backbone with a larger model.
+
+```mermaid
+flowchart LR
+    A["RGB image"] --> B["Letterbox to 480 x 480<br/>ImageNet normalization"]
+    B --> C["MobileNetV3-Small<br/>three backbone features"]
+    C --> D["Two extra downsampling blocks"]
+    D --> E["Five-level FPN<br/>128 channels per level"]
+    E --> F["Per-level attention head<br/>shared separable convolution"]
+    F --> G["Quality branch<br/>1 person/IoU logit per anchor"]
+    F --> H["Box branch<br/>4 offsets per anchor"]
+    G --> I["Sigmoid score"]
+    H --> J["Decode against pedestrian anchors"]
+    I --> K["Threshold and NMS"]
+    J --> K
+    K --> L["Source-image person detections"]
+```
+
+At the default 480-pixel input, the five prediction levels are:
+
+| Level | Stride | Feature map | Relative scales | Width/height ratios | Anchors/location | Anchors |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| P2 | 8 | 60×60 | 0.02, 0.04 | 0.15, 0.25, 0.40 | 6 | 21,600 |
+| P3 | 16 | 30×30 | 0.06, 0.10 | 0.15, 0.25, 0.40 | 6 | 5,400 |
+| P4 | 32 | 15×15 | 0.16, 0.24 | 0.20, 0.33, 0.50 | 6 | 1,350 |
+| P5 | 64 | 8×8 | 0.32, 0.48, 0.56 | 0.25, 0.50, 1.00 | 9 | 576 |
+| P6 | 128 | 4×4 | 0.64, 0.80, 0.95 | 0.25, 0.50, 1.00 | 9 | 144 |
+
+This produces 29,070 anchors. Ratios are defined as width divided by height, so values below one create the tall shapes expected for pedestrians.
+
+The forward pass returns:
+
+- Classification tensor: `[batch, 29070, 1]`. Each value is a single quality-aware person logit.
+- Box tensor: `[batch, 29070, 4]`. Values are center and size offsets relative to an anchor.
+
+Each prediction head applies a depthwise-separable shared convolution, dropout, channel attention, spatial attention, and separate classification and box subnets. The single classification score is trained toward the decoded box's IoU with its assigned person. It therefore represents both “is this a person?” and “how well is the person localized?”. There is no separate quality or attribute head at deployment.
+
+Compared with the legacy checkpoint:
+
+| Legacy model | Current model |
+| --- | --- |
+| Background/person softmax with two logits per anchor | One sigmoid person-quality logit per anchor |
+| Equal negative initialization accidentally implied 50% person probability | Classification bias starts at 1% person probability |
+| Several nominally pedestrian anchors were wide | Fine-level anchors are explicitly tall |
+| Fixed IoU matching | ATSS assignment during training |
+| Smooth-L1 localization | GIoU localization |
+| Model format version 1 | Model format version 2 |
+
+ATSS, hard-case sampling, and the losses are training-only changes and add no deployment operations. The one-logit head is slightly smaller than the old two-logit head.
 
 ## Start the environment
 
@@ -78,6 +130,98 @@ Model and optimizer hyperparameters live in `TrainingConfig`. Checkpoints contai
 
 The main artifact is `best_model_fp32.pth`; the training pipeline also exports `person_detector_fp32.xml` and `.bin` when OpenVINO is available.
 
+## What the training command does
+
+The default training configuration is:
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| Input | 480×480 RGB | Letterboxed model canvas |
+| Batch size | 32 | Images per optimizer step |
+| Epochs | 100 | Complete passes through the sampled training epoch |
+| Optimizer | SGD | Updates all trainable parameters |
+| Learning rate | 0.001 | Peak/base learning rate |
+| Momentum | 0.937 | Smooths SGD updates |
+| Weight decay | 0.0001 | Parameter regularization |
+| Warm-up | 3 epochs | Ramps the learning rate to 0.001 |
+| Later schedule | Cosine decay | Decays toward 0.0001 |
+| AMP | Enabled | BF16 on CPU or mixed precision on CUDA |
+| Gradient clipping | 10.0 | Caps the total gradient norm |
+| ATSS candidates | Top 9 per level | Candidate anchors nearest each person |
+| GIoU weight | 2.0 | Scales localization loss |
+| Hard-case oversampling | Enabled | Training split only |
+
+Before the first epoch, the pipeline:
+
+1. Connects to Azurite or the configured local data root.
+2. Resolves the immutable CityPersons pointer and verifies the dataset manifest.
+3. Loads the train and validation split manifests.
+4. Fetches sample images and parses sidecars to catch missing objects, invalid sidecars, schema errors, and sidecar or provenance checksum mismatches before training.
+5. Builds training-only sampling weights. A normal record has weight 1.0; small or difficult records can receive a weight up to 4.0. Sampling uses replacement but still draws exactly one dataset-length epoch. Validation is never oversampled.
+6. Builds the MobileNetV3/FPN detector, initializes the classification prior to 1%, and generates the anchors.
+7. Creates the ATSS/Quality Focal/GIoU loss, SGD optimizer, warm-up schedule, cosine schedule, and AMP gradient scaler.
+
+For the current 2,975-record training manifest and batch size 32, `drop_last=True` produces `floor(2975 / 32) = 92` optimizer steps per epoch. Oversampling changes which records appear in those 92 batches, not the epoch length.
+
+### One optimizer step
+
+For each training batch:
+
+1. Decode the source image and verify it against the canonical sidecar.
+2. Clip boundary-crossing boxes to the observable image.
+3. Transform full boxes, visible boxes, and ignore regions through the same geometry.
+4. Apply letterboxing, normalization, and training augmentation. CoarseDropout changes pixels but deliberately does not shrink or delete target boxes.
+5. Run the model to produce one quality logit and four box offsets for every anchor.
+6. Run ATSS independently across the five levels:
+
+   - Select the nine nearest anchors per level for every ground-truth person.
+   - Calculate the candidate IoU mean plus standard deviation as that person's adaptive threshold.
+   - Require the anchor center to be inside the person box.
+   - Guarantee a fallback positive for a person with no surviving candidate.
+   - Mark anchors that overlap ignore regions as neutral unless they are valid positives.
+
+7. Decode positive boxes and calculate their aligned IoU. A detached IoU value in `[0, 1]` becomes the positive classification target; background targets zero and neutral anchors contribute no classification loss.
+8. Calculate Quality Focal Loss over valid anchors and weighted GIoU loss over positive anchors.
+9. Add the two losses, backpropagate with AMP scaling, unscale the gradients, clip their norm to 10, and take one SGD step.
+
+The implemented losses are:
+
+- `Cls`: Quality Focal Loss. It trains confidence toward localization IoU rather than a hard person/not-person target. It is summed over valid anchors and normalized by the number of positive anchors.
+- `Loc`: `2 × mean(1 − GIoU)` over positive anchors. Zero is perfect. Since GIoU lies between -1 and 1, the weighted localization term is normally between 0 and 4.
+- `Loss`: `Cls + Loc`. The printed values can differ by a very small amount because the total and components may be rounded independently under autocast.
+
+At the end of each epoch, the model is evaluated on the natural, non-augmented validation split using the same loss. Warm-up controls the first three epochs; cosine decay advances afterward. The checkpoint is replaced only when validation loss reaches a new minimum. After the final epoch, the best checkpoint—not necessarily the last epoch—is reloaded and exported to OpenVINO FP32.
+
+Training does not calculate AP during every epoch. Per-epoch validation loss chooses the checkpoint cheaply; run the separate evaluation command to measure detection quality before accepting a release.
+
+### Reading the training progress line
+
+For example:
+
+```text
+Epoch 1: 7%|...| 6/92 [01:21<18:55, 13.21s/it, Loss=2.2240, Cls=0.0299, Loc=2.1927]
+```
+
+| Field | Meaning | What to look for |
+| --- | --- | --- |
+| `Epoch 1` | Current epoch | Compare completed epochs, not only the first few batches |
+| `6/92` | Six optimizer steps completed out of 92 | Confirms data loading and updates are progressing |
+| `13.21s/it` | Seconds per batch | Performance measurement, not model quality |
+| `Loss` | Running mean of total loss | Should trend downward over multiple epochs |
+| `Cls` | Running mean Quality Focal Loss | Must remain finite; its value is not accuracy or probability |
+| `Loc` | Running mean weighted GIoU loss | Usually dominates early and should decline as boxes align |
+
+In that example, `Loc=2.1927` is plausible at the start of training. With a weight of two, it corresponds approximately to a mean GIoU near `-0.096`: the initial decoded boxes are poorly aligned but still within the expected range. `Cls=0.0299` is small because focal modulation and the 1% prior suppress easy background anchors. It does not mean 2.99% classification error.
+
+Use trends rather than a universal target:
+
+- Healthy: finite losses, localization loss decreasing, validation loss eventually decreasing, and new best checkpoints appearing.
+- Not automatically a problem: training loss temporarily exceeding validation loss, because training has augmentation and hard-case oversampling.
+- Investigate: `NaN`/`inf`, localization staying flat for several epochs, validation loss worsening persistently while training loss falls, no positive anchors, or no new best checkpoint for a long interval.
+- Do not infer deployment accuracy from loss alone. A lower loss can still produce worse AP at a particular score threshold or worse recall on small and occluded people.
+
+Estimate duration as `batches × seconds/iteration`, then add validation time. At 92 batches and 13.21 seconds per batch, training alone is roughly 20 minutes per epoch or 33 hours for 100 epochs on that CPU.
+
 ## Evaluate project and official metrics
 
 First materialize the checksum-pinned evaluator files in a persistent workspace directory:
@@ -107,6 +251,60 @@ docker compose -f docker-compose.yml -f compose.training.yml exec training \
 For a quick project-metric smoke test, omit `--official-evaluator-dir` and set a smaller `--max-images`. For an OpenVINO model, pass its `.xml` path with `--model-type openvino`.
 
 Outputs include visualizations, `map_results.txt`, `evaluation_metrics.json`, official ground-truth/detection JSON, and the official evaluator text report. `evaluation_metrics.json` records dataset provenance, project metrics and slices, and official evaluator commit/checksums.
+
+### Reading evaluation metrics
+
+Evaluation first converts each score-ranked detection into a true positive, false positive, or neutral result:
+
+- A prediction is a true positive when it is the highest-scoring unmatched detection for a ground-truth person and meets the requested IoU threshold.
+- A duplicate, poorly localized detection, or detection with no matching person is a false positive.
+- A prediction whose area overlaps an ignore region by at least 50% is neutral rather than a false positive.
+- `IoU = intersection area / union area`. Higher IoU means tighter localization.
+- `precision = TP / (TP + FP)`; `recall = TP / (TP + FN)`.
+
+Project metrics are written as decimal values from 0 to 1:
+
+| Metric | Meaning | Direction |
+| --- | --- | --- |
+| `mAP@0.50` | Area under the precision-recall curve with IoU ≥ 0.50 | Higher is better |
+| `mAP@0.75` | The same calculation with tighter IoU ≥ 0.75 | Higher is better |
+| `mAP@0.50:0.95` | Mean AP across 0.50, 0.55, …, 0.95 IoU | Higher is better; use this as the primary project AP |
+| `Recall@FPPI=0.10` | Maximum recall while cumulative false positives remain at or below 0.10 per evaluated image | Higher is better |
+| `TP`, `FP`, `GT`, `Preds` | Match counts printed for each IoU threshold | Diagnostic counts |
+
+For 500 validation images, `FPPI=0.10` allows at most approximately 50 cumulative false positives at the selected operating point. AP uses the entire score-ranked precision-recall curve, whereas Recall@FPPI describes one constrained false-positive operating region.
+
+The project metric treats pedestrian, rider, sitting person, and person (other) as the same binary person class. It also reports the same metrics by:
+
+- `size/small`, `size/medium`, and `size/large`
+- Each canonical `sourceLabel`
+- Each canonical `visibility` value
+
+When evaluating one slice, valid people outside that slice become neutral ignore regions. They are not incorrectly counted as background false positives.
+
+The official evaluator reports log-average miss rate:
+
+| Official metric | Evaluated people | Direction |
+| --- | --- | --- |
+| `MR/Reasonable` | Height ≥ 50 px and visibility ≥ 65% | Lower is better |
+| `MR/Reasonable_small` | Height 50–75 px and visibility ≥ 65% | Lower is better |
+| `MR/Reasonable_occ=heavy` | Height ≥ 50 px and visibility 20–65% | Lower is better |
+| `MR/All` | Height ≥ 20 px and visibility ≥ 20% | Lower is better |
+
+Official metrics use only source-class pedestrian as a positive; riders, sitting people, other-person labels, groups, reflections, and other ignored content remain neutral according to CityPersons semantics. This is why official miss rate and project binary-person AP answer different questions and should both be retained.
+
+Interpret common patterns as follows:
+
+- AP50 rising while AP50:95 remains low usually means the detector finds people but boxes are not yet tight.
+- Low recall across every slice suggests missed detections or scores that remain too low.
+- A much weaker small-person or heavy-occlusion slice identifies the intended hard-case bottleneck.
+- Good overall AP with poor Recall@FPPI means false positives prevent operation at a strict false-positive budget.
+- Improving project binary AP without improving official miss rate may mean gains are concentrated in riders or other non-official positive classes.
+- Compare metrics only on the same immutable manifest, preprocessing, score floor, NMS threshold, and evaluator version.
+
+`--map-threshold 0.01` is deliberately low so the evaluator receives enough detections to construct the precision-recall curve. It is not the displayed confidence threshold. `--confidence 0.5` controls visualizations, while `--nms-threshold 0.5` removes duplicate boxes before both visualization and evaluation.
+
+The training pipeline chooses `best_model_fp32.pth` by minimum validation loss. Release acceptance should additionally require improved AP50:95/Recall@FPPI, acceptable hard-case slices, and lower official miss rate. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
 
 ## Export, calibrate, validate, and benchmark INT8
 
