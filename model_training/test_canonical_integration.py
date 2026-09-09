@@ -1,11 +1,16 @@
 """Focused tests for canonical geometry and ignore-region semantics."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from canonical_dataset import letterbox_image, map_letterbox_box
+from canonical_dataset import (
+    CanonicalPersonDetectionDataset,
+    letterbox_image,
+    map_letterbox_box,
+)
 from test_inference import MAPCalculator
 from train_tune_detector import SSDLoss
 
@@ -43,6 +48,23 @@ class CanonicalIntegrationTests(unittest.TestCase):
             {"class": 1, "score": 0.8, "box": [20, 20, 40, 40]},
         ])
         self.assertAlmostEqual(calculator.compute_map(verbose=False)["mAP@0.50"], 1.0)
+
+
+    def test_validate_samples_reads_image_and_annotation(self):
+        class FakeClient:
+            @staticmethod
+            def get_object_bytes(bucket, name):
+                return b"available"
+
+        dataset = object.__new__(CanonicalPersonDetectionDataset)
+        dataset.samples = [{"image": "image.png", "annotation": "annotation.json"}]
+        dataset.config = SimpleNamespace(azurite_data_bucket="data")
+        dataset.azurite = FakeClient()
+        loaded = []
+        dataset._load_annotation = loaded.append
+
+        self.assertTrue(dataset.validate_samples(num_samples=1))
+        self.assertEqual(loaded, dataset.samples)
 
 
 if __name__ == "__main__":

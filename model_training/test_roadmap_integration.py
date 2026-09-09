@@ -1,6 +1,7 @@
 """Focused regression tests for the detector roadmap implementation."""
 
 import math
+import warnings
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from canonical_annotations import CanonicalAnnotation, CanonicalObject
+import canonical_dataset as canonical_data
 from canonical_dataset import (
     CanonicalPersonDetectionDataset,
     clip_box_to_image,
@@ -76,6 +78,39 @@ class SamplingAndSliceTests(unittest.TestCase):
         self.assertEqual(
             clip_box_to_image([-10, 20, 20, 60], 100, 80), [0.0, 20.0, 20.0, 60.0]
         )
+
+    @unittest.skipUnless(
+        canonical_data.HAS_ALBUMENTATIONS, "Albumentations is not installed"
+    )
+    def test_coarse_dropout_preserves_tiny_boxes_without_runtime_warning(self):
+        transform = canonical_data.A.Compose(
+            [
+                canonical_data.BoxPreservingCoarseDropout(
+                    num_holes_range=(1, 1),
+                    hole_height_range=(0.5, 0.5),
+                    hole_width_range=(0.5, 0.5),
+                    fill=0,
+                    p=1.0,
+                )
+            ],
+            bbox_params=canonical_data.A.BboxParams(
+                format="pascal_voc",
+                label_fields=["bbox_kinds", "bbox_indices"],
+                min_area=0.0,
+                min_visibility=0.0,
+                clip=True,
+            ),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            transformed = transform(
+                image=np.zeros((32, 32, 3), dtype=np.uint8),
+                bboxes=[[1.0, 1.0, 1.2, 2.0]],
+                bbox_kinds=[0],
+                bbox_indices=[0],
+            )
+        self.assertEqual(len(transformed["bboxes"]), 1)
+
 
     def test_metric_slices_neutralize_out_of_slice_people(self):
         calculator = MAPCalculator([0.5])
