@@ -14,20 +14,51 @@ This directory owns the CityPersons binary-person detector from immutable datase
 
 ## Code architecture
 
-The public executables stay compatible while replaceable behavior is separated behind small interfaces.
+The implementation is grouped by responsibility under `person_detection/`. Commands invoke package modules directly; no duplicate compatibility modules are retained.
 
-| Module | Responsibility |
+```text
+model_training/
+├── person_detection/
+│   ├── core/
+│   │   └── contracts.py
+│   ├── data/
+│   │   ├── annotations.py
+│   │   ├── dataset.py
+│   │   ├── layout.py
+│   │   ├── sampling.py
+│   │   └── storage.py
+│   ├── modeling/
+│   │   └── assignment.py
+│   ├── training/
+│   │   └── pipeline.py
+│   ├── evaluation/
+│   │   ├── citypersons.py
+│   │   └── inference.py
+│   └── optimization/
+│       └── pipeline.py
+├── scripts/
+│   └── data/
+├── tests/
+├── legacy/
+├── tools/
+└── getCityPersons.sh
+```
+
+| Path | Responsibility |
 | --- | --- |
-| `person_detection/contracts.py` | Abstract inference, evaluation, and optimization boundaries |
-| `person_detection/assignment.py` | `AnchorAssigner` contract and `ATSSAnchorAssigner` |
-| `person_detection/sampling.py` | Record-selection and hard-case weighting policies |
-| `canonical_dataset.py` | Immutable manifest dataset, shared preprocessing, and safe augmentation |
-| `train_tune_detector.py` | Model/loss definitions and `DetectorTrainingPipeline` |
-| `test_inference.py` | PyTorch/OpenVINO backends and `DetectionEvaluationWorkflow` |
-| `citypersons_evaluation.py` | Official payload adapter and `PinnedCityPersonsEvaluator` |
-| `optimize_model.py` | `ManifestDrivenOpenVINOOptimizer` release pipeline |
+| `person_detection/core/` | Abstract inference, evaluation, and optimization boundaries |
+| `person_detection/data/` | Canonical annotations, manifest layout, dataset/preprocessing, sampling, and storage |
+| `person_detection/modeling/` | `AnchorAssigner` contract and `ATSSAnchorAssigner` |
+| `person_detection/training/` | Model/loss definitions and `DetectorTrainingPipeline` |
+| `person_detection/evaluation/` | PyTorch/OpenVINO backends, project metrics, and official CityPersons evaluation |
+| `person_detection/optimization/` | `ManifestDrivenOpenVINOOptimizer` release pipeline |
+| `scripts/data/` | Dataset download, conversion, versioning, upload, and validation implementations |
+| `tests/` | Unit and integration regressions |
+| `legacy/` | Retained pre-canonical training implementation; it is not imported by the current pipeline |
 
 Abstract classes are used only where implementations are genuinely interchangeable: anchor assignment, manifest selection, inference backends, evaluation backends, and optimization pipelines.
+
+Place new implementation code in the responsibility-specific package and invoke it with `python -m package.module`. Checkpoints, OpenVINO outputs, reports, and validation previews remain at their existing paths and are not part of the Python package.
 
 ## Model architecture
 
@@ -116,7 +147,7 @@ Keep a work directory when an upload must be resumed. Set `CITYPERSONS_RESUME_UP
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec \
-  -e ENABLE_QUANTIZATION=false training python train_tune_detector.py
+  -e ENABLE_QUANTIZATION=false training python -m person_detection.training.pipeline
 ```
 
 `DetectorTrainingPipeline` reads the following environment variables:
@@ -156,7 +187,7 @@ Before the first epoch, the pipeline:
 1. Connects to Azurite or the configured local data root.
 2. Resolves the immutable CityPersons pointer and verifies the dataset manifest.
 3. Loads the train and validation split manifests.
-4. Fetches sample images and parses sidecars to catch missing objects, invalid sidecars, schema errors, and sidecar or provenance checksum mismatches before training.
+4. Fetches three random records from each labelled split and parses their sidecars as a fast smoke check. This catches many storage, schema, and checksum problems, but it is not an exhaustive sidecar validation.
 5. Builds training-only sampling weights. A normal record has weight 1.0; small or difficult records can receive a weight up to 4.0. Sampling uses replacement but still draws exactly one dataset-length epoch. Validation is never oversampled.
 6. Builds the MobileNetV3/FPN detector, initializes the classification prior to 1%, and generates the anchors.
 7. Creates the ATSS/Quality Focal/GIoU loss, SGD optimizer, warm-up schedule, cosine schedule, and AMP gradient scaler.
@@ -222,20 +253,56 @@ Use trends rather than a universal target:
 
 Estimate duration as `batches × seconds/iteration`, then add validation time. At 92 batches and 13.21 seconds per batch, training alone is roughly 20 minutes per epoch or 33 hours for 100 epochs on that CPU.
 
+### Troubleshooting invalid visible boxes
+
+The following failure is a canonical-data contract error, not a model, loss, AMP, or DataLoader failure:
+
+```text
+ValueError: objects[19].visibleBoxXYWH must have positive width and height
+```
+
+Training reaches this error after the epoch because the complete validation split is loaded only during the validation pass. Worker process 0 is reporting the exception raised by the dataset parser; setting `num_workers=0` may produce a shorter traceback, but it does not fix the data.
+
+A full scan of the currently published `datasets/citypersons/v2026-09-07` manifests found no invalid train objects and exactly one affected validation object:
+
+| Field | Value |
+| --- | --- |
+| Validation sample index | 140 |
+| Image | `images/val/frankfurt/frankfurt_000001_037705_leftImg8bit.png` |
+| Object index | 19 |
+| Object ID | `frankfurt_000001_037705_leftImg8bit:instance-24019-19` |
+| Source label | `pedestrian` |
+| Full box XYWH | `[1647, 359, 47, 113]` |
+| Visible box XYWH | `[1694, 452, 0, 20]` |
+
+The full detection box is valid. The source visible box has zero width, representing zero measurable visible area for a heavily occluded pedestrian. The canonical builder currently copies that source value and derives a zero visibility fraction, but the strict loader uses a common converter that requires positive dimensions for full, visible, and ignore boxes. The upload validator verifies checksums, counts, and YOLO full boxes but does not parse every canonical coordinate. Finally, the startup smoke check samples only three records per split, so it did not select validation record 140.
+
+The preferred correction is to define degenerate source-visible boxes explicitly in the canonical contract:
+
+1. Continue requiring positive full detection boxes and ignore-region boxes.
+2. Permit zero—but never negative—visible width or height.
+3. Retain the valid full person target, record visibility as zero/heavily occluded, and omit the degenerate visible box from geometry augmentation.
+4. Run the strict canonical parser across every train and validation sidecar during dataset build and remote validation.
+5. Build and publish a new immutable dataset version; do not edit `v2026-09-07` in place because its manifests and checksums identify exact blob contents.
+
+Do not fabricate a one-pixel visible box or discard the valid full pedestrian target. Validation failed before the checkpoint-save block, so this run did not save epoch 1 as a new best checkpoint.
+
+If a traceback still names `/workspace/train_tune_detector.py`, that training process began before the package reorganization. New runs should use the module command in [Train FP32](#train-fp32). The old filename is unrelated to the invalid annotation.
+
 ## Evaluate project and official metrics
 
 First materialize the checksum-pinned evaluator files in a persistent workspace directory:
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \
-  python download_citypersons_annotations.py --output /workspace/.citypersons-official
+  python -m scripts.data.download_citypersons_annotations --output /workspace/.citypersons-official
 ```
 
 Official CityPersons reporting requires the complete validation manifest, so use a maximum above the dataset size:
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \
-  python test_inference.py \
+  python -m person_detection.evaluation.inference \
     --model-path best_model_fp32.pth \
     --model-type pytorch \
     --input-size 480 \
@@ -310,7 +377,7 @@ The training pipeline chooses `best_model_fp32.pth` by minimum validation loss. 
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \
-  python optimize_model.py \
+  python -m person_detection.optimization.pipeline \
     --checkpoint best_model_fp32.pth \
     --output-dir optimized \
     --input-size 480 \
@@ -328,7 +395,7 @@ Calibration comes only from clean train-manifest records and is greedily stratif
 
 The optimizer creates FP32, FP16, and INT8 OpenVINO IR files, evaluates them on the same records, measures core and end-to-end p50/p95 latency, and rejects INT8 when the absolute AP50:95 loss exceeds `--max-accuracy-drop`. Dataset provenance is strict by default; `--allow-unverified-checkpoint` is an explicit diagnostic escape hatch and should not be used for release artifacts.
 
-Do not set `ENABLE_QUANTIZATION=true` during training. The retired in-training QAT route intentionally fails fast; `optimize_model.py` is the sole release INT8 workflow.
+Do not set `ENABLE_QUANTIZATION=true` during training. The retired in-training QAT route intentionally fails fast; `person_detection.optimization.pipeline` is the sole release INT8 workflow.
 
 ## Tests
 
@@ -336,7 +403,7 @@ Run the complete model-training suite inside the dependency-pinned container:
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \
-  python -m unittest discover -v -p 'test_*.py'
+  python -m unittest discover -v -s tests -t . -p 'test_*.py'
 ```
 
 The roadmap regressions cover sampling and slices, ATSS and ignore regions, quality targets and GIoU, legacy-head migration, official-evaluator provenance, BF16 loss/backpropagation, and the tiny-box CoarseDropout warning case.

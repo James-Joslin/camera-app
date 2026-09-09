@@ -23,18 +23,18 @@ from dataclasses import dataclass, field
 from torchvision.ops import nms
 from tqdm import tqdm
 
-from dataset_layout import load_citypersons_manifest, load_citypersons_split, resolve_citypersons_prefix, version_blob
-from canonical_annotations import parse_canonical_annotation
-from canonical_dataset import clip_box_to_image, preprocess_rgb_image, size_slice
-from citypersons_evaluation import (
+from person_detection.data.layout import load_citypersons_manifest, load_citypersons_split, resolve_citypersons_prefix, version_blob
+from person_detection.data.annotations import parse_canonical_annotation
+from person_detection.data.dataset import clip_box_to_image, preprocess_rgb_image, size_slice
+from person_detection.evaluation.citypersons import (
     OfficialCityPersonsAccumulator,
     PinnedCityPersonsEvaluator,
 )
-from person_detection.contracts import DetectionBackend
+from person_detection.core.contracts import DetectionBackend
 
 # Try to import from main training script
 try:
-    from train_tune_detector import (
+    from person_detection.training.pipeline import (
         SSDPersonDetector,
         load_detector_state_dict,
         person_scores_from_logits,
@@ -979,7 +979,7 @@ class AzuriteClientLocal:
 
         if config.use_azurite:
             try:
-                from azurite_compat import AzuriteBlobCompat
+                from person_detection.data.storage import AzuriteBlobCompat
                 self.client = AzuriteBlobCompat(
                     endpoint=str(config.azurite_endpoint),
                     access_key=config.azurite_access_key,

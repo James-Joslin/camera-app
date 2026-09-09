@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from canonical_annotations import parse_canonical_annotation
+from person_detection.data.annotations import parse_canonical_annotation
 
 
 class CanonicalAnnotationTests(unittest.TestCase):

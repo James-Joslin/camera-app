@@ -1,0 +1,1 @@
+"""Person-detector training pipeline."""

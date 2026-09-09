@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from person_detection.contracts import EvaluationBackend
+from person_detection.core.contracts import EvaluationBackend
 
 
 OFFICIAL_EVALUATOR_COMMIT = "839c22fb05a16c150cb77f9b73a5c0e9642af21e"

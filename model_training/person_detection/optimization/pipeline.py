@@ -22,7 +22,7 @@ import torch
 import torchvision
 from torchvision.ops import nms
 
-from canonical_dataset import (
+from person_detection.data.dataset import (
     PRODUCTION_PREPROCESSING,
     CanonicalPersonDetectionDataset,
     clip_box_to_image,
@@ -31,9 +31,9 @@ from canonical_dataset import (
     select_stratified_indices,
     size_slice,
 )
-from person_detection.contracts import ModelOptimizationPipeline
-from test_inference import MAPCalculator
-from train_tune_detector import (
+from person_detection.core.contracts import ModelOptimizationPipeline
+from person_detection.evaluation.inference import MAPCalculator
+from person_detection.training.pipeline import (
     AzuriteClient,
     SSDPersonDetector,
     TrainingConfig,

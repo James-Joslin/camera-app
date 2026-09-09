@@ -11,15 +11,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from canonical_annotations import parse_canonical_annotation
-from dataset_layout import (
+from person_detection.data.annotations import parse_canonical_annotation
+from person_detection.data.layout import (
     TRAINABLE_LABEL_STATUSES,
     load_citypersons_manifest,
     load_citypersons_split,
     resolve_citypersons_prefix,
     version_blob,
 )
-from person_detection.sampling import (
+from person_detection.data.sampling import (
     DEFAULT_HARD_CASE_POLICY,
     GreedyStratifiedSelector,
     HardCaseSamplingPolicy,

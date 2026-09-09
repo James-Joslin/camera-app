@@ -342,7 +342,7 @@ def main() -> None:
     parser.add_argument(
         "--preview-dir",
         type=Path,
-        default=Path(__file__).resolve().parent / "validation_preview",
+        default=Path(__file__).resolve().parents[2] / "validation_preview",
     )
     parser.add_argument("--preview-count", type=int, default=12)
     parser.add_argument("--seed", type=int, default=42)

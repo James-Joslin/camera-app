@@ -1,8 +1,8 @@
 """Reusable contracts and strategies for the person-detection workflows."""
 
-from .assignment import ATSSAnchorAssigner, AnchorAssigner, AssignmentResult
-from .contracts import DetectionBackend, EvaluationBackend, ModelOptimizationPipeline
-from .sampling import (
+from .modeling.assignment import ATSSAnchorAssigner, AnchorAssigner, AssignmentResult
+from .core.contracts import DetectionBackend, EvaluationBackend, ModelOptimizationPipeline
+from .data.sampling import (
     DEFAULT_HARD_CASE_POLICY,
     GreedyStratifiedSelector,
     HardCaseSamplingPolicy,

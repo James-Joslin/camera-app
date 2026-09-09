@@ -6,13 +6,13 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from canonical_dataset import (
+from person_detection.data.dataset import (
     CanonicalPersonDetectionDataset,
     letterbox_image,
     map_letterbox_box,
 )
-from test_inference import MAPCalculator
-from train_tune_detector import SSDLoss
+from person_detection.evaluation.inference import MAPCalculator
+from person_detection.training.pipeline import SSDLoss
 
 
 class CanonicalIntegrationTests(unittest.TestCase):

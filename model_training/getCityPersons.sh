@@ -90,7 +90,7 @@ ANNOTATION_DIR="$TEMP_DIR/official-annotations"
 BUILD_DIR="$TEMP_DIR/version-build"
 
 echo "Downloading pinned official CityPersons annotations..."
-python3 "$SCRIPT_DIR/download_citypersons_annotations.py" --output "$ANNOTATION_DIR"
+python3 "$SCRIPT_DIR/scripts/data/download_citypersons_annotations.py" --output "$ANNOTATION_DIR"
 
 echo "Building immutable dataset metadata for $VERSION_PREFIX..."
 if [[ -f "$BUILD_DIR/manifest.json" ]]; then
@@ -99,7 +99,7 @@ else
     if [[ -d "$BUILD_DIR" ]]; then
         rm -rf "$BUILD_DIR"
     fi
-    python3 "$SCRIPT_DIR/build_citypersons_version.py" \
+    python3 "$SCRIPT_DIR/scripts/data/build_citypersons_version.py" \
         --images "$IMAGE_DIR" \
         --annotations "$ANNOTATION_DIR" \
         --source-archive "$OUTER_ARCHIVE" \
@@ -118,7 +118,7 @@ if [[ "${CITYPERSONS_RESUME_UPLOAD:-false}" == true ]]; then
 fi
 
 echo "Uploading versioned images from $IMAGE_DIR..."
-python3 "$SCRIPT_DIR/upload_to_azurite.py" \
+python3 "$SCRIPT_DIR/scripts/data/upload_to_azurite.py" \
     --source "$IMAGE_DIR" \
     --container "$AZURITE_CONTAINER" \
     --prefix "$VERSION_PREFIX/images" \
@@ -130,7 +130,7 @@ python3 "$SCRIPT_DIR/upload_to_azurite.py" \
     --exclude '*(1).*'
 
 echo "Uploading canonical annotations, generated labels, and manifests..."
-python3 "$SCRIPT_DIR/upload_to_azurite.py" \
+python3 "$SCRIPT_DIR/scripts/data/upload_to_azurite.py" \
     --source "$BUILD_DIR" \
     --container "$AZURITE_CONTAINER" \
     --prefix "$VERSION_PREFIX"
@@ -143,7 +143,7 @@ if [[ "${CITYPERSONS_VERIFY_REMOTE_CHECKSUMS:-true}" != true ]]; then
 fi
 
 echo "Validating the complete uploaded version and rendering $PREVIEW_COUNT previews..."
-python3 "$SCRIPT_DIR/validate_citypersons_azurite.py" \
+python3 "$SCRIPT_DIR/scripts/data/validate_citypersons_azurite.py" \
     --container "$AZURITE_CONTAINER" \
     --dataset-prefix "$VERSION_PREFIX" \
     --preview-dir "$PREVIEW_DIR" \

@@ -31,14 +31,14 @@ from enum import Enum
 from tqdm import tqdm
 import random
 
-from dataset_layout import (
+from person_detection.data.layout import (
     TRAINABLE_LABEL_STATUSES,
     load_citypersons_split,
     resolve_citypersons_prefix,
     version_blob,
 )
-from canonical_dataset import CanonicalPersonDetectionDataset
-from person_detection.assignment import ATSSAnchorAssigner
+from person_detection.data.dataset import CanonicalPersonDetectionDataset
+from person_detection.modeling.assignment import ATSSAnchorAssigner
 
 # Optional imports with fallbacks
 try:
@@ -50,7 +50,7 @@ except ImportError:
     print("Warning: albumentations not installed. Using basic transforms.")
 
 try:
-    from azurite_compat import AzuriteBlobCompat
+    from person_detection.data.storage import AzuriteBlobCompat
     HAS_AZURITE = True
 except ImportError:
     HAS_AZURITE = False
@@ -102,7 +102,7 @@ class TrainingConfig:
     gradient_clip: float = 10.0
     warmup_epochs: int = 3
 
-    # Legacy in-training QAT; release INT8 artifacts are built by optimize_model.py.
+    # Legacy in-training QAT; release INT8 artifacts are built by the optimization pipeline.
     enable_quantization: bool = False
     qat_epochs: int = 10  # Quantization-aware training epochs
     qat_learning_rate: float = 1e-4  # Usually 1/10 of original
@@ -2333,7 +2333,7 @@ class DetectorTrainingPipeline:
         if config.enable_quantization:
             raise RuntimeError(
                 "The legacy in-training QAT path is retired. Train FP32 with "
-                "ENABLE_QUANTIZATION=false, then run optimize_model.py for manifest-driven "
+                "ENABLE_QUANTIZATION=false, then run python -m person_detection.optimization.pipeline for manifest-driven "
                 "accuracy-controlled INT8 calibration."
             )
 

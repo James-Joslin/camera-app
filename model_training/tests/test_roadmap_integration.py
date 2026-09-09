@@ -10,20 +10,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from canonical_annotations import CanonicalAnnotation, CanonicalObject
-import canonical_dataset as canonical_data
-from canonical_dataset import (
+from person_detection.data.annotations import CanonicalAnnotation, CanonicalObject
+import person_detection.data.dataset as canonical_data
+from person_detection.data.dataset import (
     CanonicalPersonDetectionDataset,
     clip_box_to_image,
     preprocess_rgb_image,
     select_stratified_indices,
 )
-from citypersons_evaluation import (
+from person_detection.evaluation.citypersons import (
     OfficialCityPersonsAccumulator,
     run_official_citypersons_evaluator,
 )
-from test_inference import MAPCalculator
-from train_tune_detector import (
+from person_detection.evaluation.inference import MAPCalculator
+from person_detection.training.pipeline import (
     AttentionDetectionHead,
     PersonAnchorGenerator,
     QualityFocalLoss,
