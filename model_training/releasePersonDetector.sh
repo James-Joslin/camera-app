@@ -15,6 +15,11 @@ BENCHMARK_ITERATIONS=100
 THREADS=1
 MODEL_CONTAINER="${AZURITE_MODEL_CONTAINER:-computer-vision-models}"
 REMOTE_ROOT="person_detector_ssd/releases"
+CURRENT_POINTER="${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/current.json}"
+RELEASE_ROOT="${PERSON_DETECTOR_RELEASE_ROOT:-$SCRIPT_DIR/releases}"
+EVALUATION_ROOT="${PERSON_DETECTOR_EVALUATION_ROOT:-$SCRIPT_DIR/release_evaluations}"
+ACTIVE_MODEL_DIR="${PERSON_DETECTOR_ACTIVE_MODEL_DIR:-$SCRIPT_DIR/optimized}"
+OFFICIAL_DIR="${CITYPERSONS_OFFICIAL_DIR:-$SCRIPT_DIR/.citypersons-official}"
 
 usage() {
     cat <<'EOF'
@@ -34,6 +39,7 @@ Options:
   --threads COUNT              OpenVINO inference threads (default: 1)
   --model-container NAME       Azurite container (default: computer-vision-models)
   --remote-root PREFIX         Blob prefix before the release ID
+  --current-pointer BLOB       Mutable pointer published after verification
   -h, --help                   Show this help
 EOF
 }
@@ -98,6 +104,11 @@ while [[ $# -gt 0 ]]; do
             REMOTE_ROOT="$2"
             shift 2
             ;;
+        --current-pointer)
+            require_value "$@"
+            CURRENT_POINTER="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -119,12 +130,11 @@ if [[ ! -f "$CHECKPOINT" ]]; then
     exit 2
 fi
 
-RELEASE_DIR="$SCRIPT_DIR/releases/$RELEASE_ID"
+RELEASE_DIR="${RELEASE_ROOT%/}/$RELEASE_ID"
 MODELS_DIR="$RELEASE_DIR/models"
-EVALUATION_DIR="$SCRIPT_DIR/release_evaluations/$RELEASE_ID/fp32"
+EVALUATION_DIR="${EVALUATION_ROOT%/}/$RELEASE_ID/fp32"
 EVALUATION_REPORT_DIR="$RELEASE_DIR/evaluation/fp32"
 REMOTE_PREFIX="${REMOTE_ROOT%/}/$RELEASE_ID"
-OFFICIAL_DIR="$SCRIPT_DIR/.citypersons-official"
 
 if [[ -e "$RELEASE_DIR" ]]; then
     echo "Local release already exists: $RELEASE_DIR" >&2
@@ -182,19 +192,21 @@ python -m scripts.models.publish_release \
     --release-dir "$RELEASE_DIR" \
     --release-id "$RELEASE_ID" \
     --container "$MODEL_CONTAINER" \
-    --prefix "$REMOTE_PREFIX"
+    --prefix "$REMOTE_PREFIX" \
+    --current-pointer "$CURRENT_POINTER"
 
-mkdir -p "$SCRIPT_DIR/optimized"
-cp "$MODELS_DIR"/person_detector_*.xml "$SCRIPT_DIR/optimized/"
-cp "$MODELS_DIR"/person_detector_*.bin "$SCRIPT_DIR/optimized/"
-cp "$MODELS_DIR/calibration_manifest.json" "$SCRIPT_DIR/optimized/"
-cp "$MODELS_DIR/optimization_report.json" "$SCRIPT_DIR/optimized/"
-cp "$RELEASE_DIR/release_manifest.json" "$SCRIPT_DIR/optimized/"
+mkdir -p "$ACTIVE_MODEL_DIR"
+cp "$MODELS_DIR"/person_detector_*.xml "$ACTIVE_MODEL_DIR/"
+cp "$MODELS_DIR"/person_detector_*.bin "$ACTIVE_MODEL_DIR/"
+cp "$MODELS_DIR/calibration_manifest.json" "$ACTIVE_MODEL_DIR/"
+cp "$MODELS_DIR/optimization_report.json" "$ACTIVE_MODEL_DIR/"
+cp "$RELEASE_DIR/release_manifest.json" "$ACTIVE_MODEL_DIR/"
 
 echo
 echo "Release complete."
 echo "  Local release: $RELEASE_DIR"
 echo "  Evaluation previews: $EVALUATION_DIR"
-echo "  Active local models: $SCRIPT_DIR/optimized"
+echo "  Active local models: $ACTIVE_MODEL_DIR"
 echo "  Azurite release: $MODEL_CONTAINER/$REMOTE_PREFIX"
+echo "  Current release pointer: $MODEL_CONTAINER/$CURRENT_POINTER"
 echo "  Active XML after FastAPI restart: /models/person_detector_int8.xml"

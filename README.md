@@ -47,6 +47,16 @@ docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate
 
 Benchmark again on deployment hardware and validate the recorded accuracy report before promoting a model outside this environment. The large training/notebook image remains available through the optional `ml` Compose profile and may use `/dev/dri/renderD128`.
 
+## Production model training
+
+Run the complete, self-contained training job with:
+
+```bash
+TRAINING_EPOCHS=100 ./scripts/run-production-training.sh
+```
+
+It fully validates CityPersons in Azurite, runs `getCityPersons.sh` when a complete published dataset is unavailable, trains and exports FP32, exports/evaluates FP16 and INT8 with an accuracy gate, runs the official evaluation, and publishes only a successful checksum-verified release. The immutable model files are saved in the `computer-vision-models` container at `person_detector_ssd/releases/<release-id>/`; `person_detector_ssd/current.json` points the rest of the application to the latest complete FP32, FP16, and INT8 XML/BIN pairs. Persistent logs and local release files live in the Compose `training-state` volume. See [the production training documentation](model_training/README.md#production-one-shot-training-container) for settings and recovery behavior.
+
 ## Storage and migrations
 
 Azurite is the local Azure Blob Storage emulator. The `computer-vision-data` and `computer-vision-models` containers are created by the camera storage adapter. `model_training/getCityPersons.sh` publishes immutable CityPersons versions below `datasets/citypersons/<version>/`, preserving pinned official source annotations and rich canonical JSON while generating standard binary-person YOLO labels. It validates every remote artifact and checksum before writing `datasets/citypersons/current.json` last. Visual previews are written to `model_training/validation_preview/<version>/contact_sheet.jpg`. Set `CITYPERSONS_RESET_CONTAINER=true` only for an intentional clean rebuild, `CITYPERSONS_DATASET_VERSION` to choose a version, and `CITYPERSONS_PREVIEW_COUNT` to change the preview count. Failed runs preserve their temporary work directory; resume by setting `CITYPERSONS_WORK_DIR` to the reported path.

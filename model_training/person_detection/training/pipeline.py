@@ -2316,7 +2316,7 @@ class DetectorTrainingPipeline:
 
     @classmethod
     def from_environment(cls) -> "DetectorTrainingPipeline":
-        return cls(TrainingConfig(
+        config = TrainingConfig(
             azurite_endpoint=os.getenv("AZURITE_BLOB_ENDPOINT", "http://127.0.0.1:10000/devstoreaccount1"),
             azurite_access_key=os.getenv("AZURITE_ACCOUNT_NAME", "devstoreaccount1"),
             azurite_secret_key=os.getenv("AZURITE_ACCOUNT_KEY", ""),
@@ -2326,7 +2326,20 @@ class DetectorTrainingPipeline:
             use_azurite=os.getenv("USE_AZURITE", "true").lower() == "true",
             data_root=os.getenv("DATA_ROOT", "./data"),
             enable_quantization=os.getenv("ENABLE_QUANTIZATION", "false").lower() == "true",
-        ))
+            input_size=int(os.getenv("TRAINING_INPUT_SIZE", "480")),
+            batch_size=int(os.getenv("TRAINING_BATCH_SIZE", "32")),
+            num_workers=int(os.getenv("TRAINING_NUM_WORKERS", "1")),
+            num_epochs=int(os.getenv("TRAINING_EPOCHS", "100")),
+        )
+        if config.num_epochs < 1:
+            raise ValueError("TRAINING_EPOCHS must be at least 1")
+        if config.input_size < 32:
+            raise ValueError("TRAINING_INPUT_SIZE must be at least 32")
+        if config.batch_size < 1:
+            raise ValueError("TRAINING_BATCH_SIZE must be at least 1")
+        if config.num_workers < 0:
+            raise ValueError("TRAINING_NUM_WORKERS cannot be negative")
+        return cls(config)
 
     def run(self) -> None:
         config = self.config

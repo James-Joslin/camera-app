@@ -156,10 +156,72 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
 - `AZURITE_DATA_CONTAINER` and `AZURITE_MODEL_CONTAINER`
 - `USE_AZURITE` (`true` by default) and `DATA_ROOT` for local fallback
 - `ENABLE_QUANTIZATION`, which must remain `false`
+- `TRAINING_EPOCHS` (default `100`), `TRAINING_BATCH_SIZE` (default `32`),
+  `TRAINING_NUM_WORKERS` (default `1`), and `TRAINING_INPUT_SIZE` (default `480`)
 
 Model and optimizer hyperparameters live in `TrainingConfig`. Checkpoints contain `modelFormatVersion`, dataset version/checksum/schema provenance, sampling policy, ATSS settings, and head semantics. A compatible checkpoint is reused only when its immutable dataset identity also matches.
 
 The main artifact is `best_model_fp32.pth`; the training pipeline also exports `person_detector_fp32.xml` and `.bin` when OpenVINO is available.
+
+For example, to train for 25 epochs in the development training container:
+
+```bash
+docker compose -f docker-compose.yml -f compose.training.yml exec \
+  -e TRAINING_EPOCHS=25 training python -m person_detection.training.pipeline
+```
+
+## Production one-shot training container
+
+From the repository root, start the self-contained production job with:
+
+```bash
+./scripts/run-production-training.sh
+```
+
+The image contains the training source and has no source-code bind mount. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and runs a disposable `training-job` container. A separate persistent `training-state` volume retains downloads, checkpoints, reports, and logs between container runs.
+
+The entrypoint performs these gated stages in order:
+
+1. It validates the published CityPersons manifest, exact artifact set, sizes, SHA-256 checksums, split counts, canonical annotations, YOLO labels, and a rendered sample.
+2. If that check fails, it runs `getCityPersons.sh` to download, build, upload, validate, and publish a new immutable dataset version, then validates it again.
+3. It trains the detector and exports the FP32 OpenVINO XML/BIN pair.
+4. It exports FP16, calibrates INT8, evaluates FP32/FP16/INT8 on the same records, and rejects INT8 when its AP50:95 drop exceeds `MAX_ACCURACY_DROP`.
+5. It runs the complete FP32 project and pinned official CityPersons evaluation.
+6. Only after every gate passes, it uploads and reads back every release artifact, verifies every SHA-256, and updates the current-model pointer.
+
+If any stage fails, the container exits non-zero and the current-model pointer is not changed. The Kaggle credential file defaults to `./kaggle.json`; set `KAGGLE_JSON_PATH` if it lives elsewhere. It is used when the CityPersons bootstrap is required.
+
+Production settings are ordinary environment variables, for example:
+
+```bash
+TRAINING_EPOCHS=50 \
+TRAINING_BATCH_SIZE=16 \
+CALIBRATION_SAMPLES=300 \
+VALIDATION_SAMPLES=500 \
+MAX_ACCURACY_DROP=0.01 \
+  ./scripts/run-production-training.sh
+```
+
+Each invocation gets a timestamped run and release ID. Set `TRAINING_RUN_ID` to reuse a persisted compatible checkpoint after an interrupted run, or `MODEL_RELEASE_ID` to choose an explicit immutable model release name. A partially uploaded dataset bootstrap can be resumed with the same `CITYPERSONS_DATASET_VERSION` and `CITYPERSONS_RESUME_UPLOAD=true`.
+
+Inside the Compose `training-state` volume, job output is retained at:
+
+```text
+/state/runs/<run-id>/
+/state/releases/<release-id>/
+/state/release-evaluations/<release-id>/
+/state/active-models/
+```
+
+The successful model release is stored in Azurite at:
+
+```text
+Container: computer-vision-models
+Immutable release: person_detector_ssd/releases/<release-id>/
+Current pointer: person_detector_ssd/current.json
+```
+
+`current.json` names the release manifest and the exact XML/BIN blob for FP32, FP16, and INT8. This is the stable blob that an application model-loader should read before downloading a matching model pair.
 
 ## What the training command does
 
@@ -396,7 +458,7 @@ The release script:
 4. Runs the complete FP32 project and pinned official CityPersons evaluation.
 5. Builds a release containing the checkpoint, three OpenVINO model pairs, calibration manifest, optimization report, and evaluation reports.
 6. Uploads the release to an empty Azurite prefix and reads every blob back to verify its SHA-256.
-7. Copies the accepted model pairs and reports to `model_training/optimized/`, which FastAPI mounts read-only at `/models`.
+7. Updates `person_detector_ssd/current.json` only after verification, then copies the accepted model pairs and reports to `model_training/optimized/`, which FastAPI mounts read-only at `/models`.
 
 The default release ID is a UTC timestamp. Supplying `--release-id` is recommended for a named release. Reusing an existing local or remote release ID fails instead of overwriting it.
 
@@ -448,9 +510,10 @@ The release is stored remotely at:
 ```text
 Azurite container: computer-vision-models
 Blob prefix: person_detector_ssd/releases/v2026-09-10.release1/
+Current pointer: person_detector_ssd/current.json
 ```
 
-Set `AZURITE_MODEL_CONTAINER` or pass `--model-container` to use a different container. Pass `--remote-root` to change `person_detector_ssd/releases`. The XML contains the OpenVINO graph and references its matching BIN weights; always retain and deploy both files with the same basename.
+Set `AZURITE_MODEL_CONTAINER` or pass `--model-container` to use a different container. Pass `--remote-root` to change `person_detector_ssd/releases`, and `--current-pointer` to change the discovery blob. The XML contains the OpenVINO graph and references its matching BIN weights; always retain and deploy both files with the same basename.
 
 After a successful release, recreate FastAPI to load `model_training/optimized/person_detector_int8.xml`:
 

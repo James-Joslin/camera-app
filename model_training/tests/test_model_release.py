@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.models.publish_release import REQUIRED_ARTIFACTS, build_release_manifest
+from scripts.models.publish_release import (
+    REQUIRED_ARTIFACTS,
+    build_current_pointer,
+    build_release_manifest,
+    publish_release,
+)
 
 
 class ModelReleaseTests(unittest.TestCase):
@@ -59,6 +64,42 @@ class ModelReleaseTests(unittest.TestCase):
                     container_name="models",
                     prefix="person_detector_ssd/releases/v1",
                 )
+
+    def test_current_pointer_names_every_openvino_model_pair(self):
+        pointer = build_current_pointer(
+            {
+                "releaseId": "v1",
+                "storage": {
+                    "container": "models",
+                    "prefix": "person_detector_ssd/releases/v1",
+                },
+            },
+            current_pointer="person_detector_ssd/current.json",
+        )
+
+        self.assertEqual(pointer["releaseId"], "v1")
+        self.assertEqual(
+            pointer["storage"]["releaseManifest"],
+            "person_detector_ssd/releases/v1/release_manifest.json",
+        )
+        for precision in ("fp32", "fp16", "int8"):
+            self.assertEqual(
+                pointer["models"][precision],
+                {
+                    "xml": f"person_detector_ssd/releases/v1/models/person_detector_{precision}.xml",
+                    "bin": f"person_detector_ssd/releases/v1/models/person_detector_{precision}.bin",
+                },
+            )
+
+    def test_current_pointer_cannot_overlap_immutable_release(self):
+        with self.assertRaisesRegex(ValueError, "immutable release prefix"):
+            publish_release(
+                Path("."),
+                release_id="v1",
+                container_name="models",
+                prefix="person_detector_ssd/releases/v1",
+                current_pointer="person_detector_ssd/releases/v1/current.json",
+            )
 
 
 if __name__ == "__main__":

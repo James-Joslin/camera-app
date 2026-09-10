@@ -92,16 +92,57 @@ def remote_sha256(container, blob_name: str) -> str:
     return digest.hexdigest()
 
 
+def build_current_pointer(
+    manifest: dict[str, Any], *, current_pointer: str
+) -> dict[str, Any]:
+    prefix = manifest["storage"]["prefix"].rstrip("/")
+    container_name = manifest["storage"]["container"]
+    model_paths = {
+        precision: {
+            "xml": f"{prefix}/models/person_detector_{precision}.xml",
+            "bin": f"{prefix}/models/person_detector_{precision}.bin",
+        }
+        for precision in ("fp32", "fp16", "int8")
+    }
+    return {
+        "schemaVersion": 1,
+        "model": "person_detector_ssd",
+        "releaseId": manifest["releaseId"],
+        "publishedAt": datetime.now(timezone.utc).isoformat(),
+        "storage": {
+            "container": container_name,
+            "releasePrefix": prefix,
+            "releaseManifest": f"{prefix}/release_manifest.json",
+            "currentPointer": current_pointer,
+        },
+        "models": model_paths,
+    }
+
+
 def publish_release(
     release_dir: Path,
     *,
     release_id: str,
     container_name: str,
     prefix: str,
+    current_pointer: str | None = None,
 ) -> None:
     prefix_path = PurePosixPath(prefix)
     if prefix_path.is_absolute() or ".." in prefix_path.parts:
         raise ValueError("prefix must be a relative blob path without '..'")
+    if current_pointer is not None:
+        current_pointer_path = PurePosixPath(current_pointer)
+        if (
+            not current_pointer
+            or current_pointer_path.is_absolute()
+            or ".." in current_pointer_path.parts
+        ):
+            raise ValueError("current pointer must be a relative blob path without '..'")
+        normalized_prefix = prefix.rstrip("/")
+        if current_pointer == normalized_prefix or current_pointer.startswith(
+            f"{normalized_prefix}/"
+        ):
+            raise ValueError("current pointer cannot overwrite the immutable release prefix")
 
     manifest = build_release_manifest(
         release_dir,
@@ -149,6 +190,27 @@ def publish_release(
     print(f"Verified {len(uploaded)} uploaded release artifacts")
     print(f"Azurite release: {container_name}/{prefix.rstrip('/')}")
 
+    if current_pointer is not None:
+        pointer = build_current_pointer(manifest, current_pointer=current_pointer)
+        pointer_bytes = (
+            json.dumps(pointer, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        container.upload_blob(
+            name=current_pointer,
+            data=pointer_bytes,
+            overwrite=True,
+        )
+        expected = hashlib.sha256(pointer_bytes).hexdigest()
+        actual = remote_sha256(container, current_pointer)
+        if actual != expected:
+            raise RuntimeError(
+                f"Remote checksum mismatch for {container_name}/{current_pointer}"
+            )
+        print(
+            f"Published current release pointer: "
+            f"{container_name}/{current_pointer} -> {prefix.rstrip('/')}"
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -156,6 +218,10 @@ def main() -> None:
     parser.add_argument("--release-id", required=True)
     parser.add_argument("--container", default="computer-vision-models")
     parser.add_argument("--prefix", required=True)
+    parser.add_argument(
+        "--current-pointer",
+        help="Blob to overwrite only after the immutable release is checksum-verified",
+    )
     args = parser.parse_args()
 
     if not args.release_dir.is_dir():
@@ -165,6 +231,7 @@ def main() -> None:
         release_id=args.release_id,
         container_name=args.container,
         prefix=args.prefix.strip("/"),
+        current_pointer=args.current_pointer.strip("/") if args.current_pointer else None,
     )
 
 
