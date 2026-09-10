@@ -178,7 +178,17 @@ From the repository root, start the self-contained production job with:
 ./scripts/run-production-training.sh
 ```
 
-The image contains the training source and has no source-code bind mount. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and runs a disposable `training-job` container. A separate persistent `training-state` volume retains downloads, checkpoints, reports, and logs between container runs.
+The image contains the training source and has no source-code bind mount. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` container in detached mode. The command returns after startup, and the stopped container remains available for status and log inspection. A separate persistent `training-state` volume retains downloads, checkpoints, reports, and logs between container runs.
+
+Check the detached job with:
+
+```bash
+docker compose -f docker-compose.yml -f compose.training.yml \
+  -f compose.training.prod.yml ps -a training-job
+
+docker compose -f docker-compose.yml -f compose.training.yml \
+  -f compose.training.prod.yml logs -f training-job
+```
 
 The entrypoint performs these gated stages in order:
 
