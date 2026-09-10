@@ -120,7 +120,7 @@ Run commands from the `camera-software` repository root:
 docker compose -f docker-compose.yml -f compose.training.yml up -d azurite training
 ```
 
-The training image mounts `model_training/` at `/workspace`. It contains the pinned PyTorch, torchvision, OpenVINO, NNCF, Albumentations, Azure, and Kaggle dependencies.
+The training image mounts `model_training/` at `/workspace`. It contains the compatibility-pinned PyTorch 2.8.0, torchvision 0.23.0, OpenVINO 2025.3.0, NNCF 2.18.0, Albumentations, Azure, and Kaggle dependencies.
 
 ## Build and publish the canonical dataset
 
@@ -178,7 +178,7 @@ From the repository root, start the self-contained production job with:
 ./scripts/run-production-training.sh
 ```
 
-The image contains the training source and has no source-code bind mount. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` container in detached mode. The command returns after startup, and the stopped container remains available for status and log inspection. A separate persistent `training-state` volume retains downloads, checkpoints, reports, and logs between container runs.
+The image contains the training source and has no source-code bind mount. It uses the NNCF-compatible PyTorch 2.8.0/torchvision 0.23.0 pair and includes the C++ compiler required by TorchInductor. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` container in detached mode. The command returns after startup, and the stopped container remains available for status and log inspection. A separate persistent `training-state` volume retains downloads, checkpoints, reports, compiler artifacts, and logs between container runs.
 
 Check the detached job with:
 
