@@ -9,6 +9,7 @@ import json
 import math
 import shutil
 import struct
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,13 @@ from typing import Any
 
 import numpy as np
 from scipy.io import loadmat
+
+
+MODEL_TRAINING_ROOT = Path(__file__).resolve().parents[2]
+if str(MODEL_TRAINING_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODEL_TRAINING_ROOT))
+
+from person_detection.data.annotations import parse_canonical_annotation
 
 
 SCHEMA_VERSION = 1
@@ -326,13 +334,23 @@ def main() -> None:
                 "objects": objects,
                 "ignoreRegions": ignore_regions,
             }
-            write_json(annotation_path, canonical)
+            status = "positive" if objects else "verified_negative"
+            annotation_data = json_bytes(canonical)
+            parse_canonical_annotation(
+                annotation_data,
+                expected_image_blob=image_blob,
+                expected_image_sha256=image_sha256,
+                expected_status=status,
+                expected_person_count=len(objects),
+                expected_ignored_count=len(ignore_regions),
+            )
+            annotation_path.parent.mkdir(parents=True, exist_ok=True)
+            annotation_path.write_bytes(annotation_data)
             annotation_sha256 = sha256_file(annotation_path)
             artifacts.append(
                 artifact(annotation_path, annotation_relative.as_posix(), "canonical_annotation")
             )
 
-            status = "positive" if objects else "verified_negative"
             status_counts[status] += 1
             records.append(
                 {

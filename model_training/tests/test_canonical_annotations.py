@@ -38,6 +38,34 @@ class CanonicalAnnotationTests(unittest.TestCase):
         self.assertEqual(parsed.objects[0].visible_box, [12.0, 24.0, 27.0, 54.0])
         self.assertEqual(parsed.ignore_regions, [[60.0, 10.0, 80.0, 40.0]])
 
+    def test_allows_zero_sized_visible_box(self):
+        value = self.annotation()
+        value["objects"][0]["visibleBoxXYWH"] = [27, 54, 0, 20]
+        parsed = parse_canonical_annotation(
+            json.dumps(value).encode(), expected_image_blob="images/train/a/a.png",
+            expected_image_sha256="a" * 64, expected_status="positive",
+        )
+        self.assertEqual(parsed.objects[0].visible_box, [27.0, 54.0, 27.0, 74.0])
+
+    def test_rejects_negative_visible_box_dimensions(self):
+        for visible_box in ([27, 54, -1, 20], [27, 54, 1, -20]):
+            with self.subTest(visible_box=visible_box):
+                value = self.annotation()
+                value["objects"][0]["visibleBoxXYWH"] = visible_box
+                with self.assertRaisesRegex(ValueError, "must not have negative"):
+                    parse_canonical_annotation(
+                        json.dumps(value).encode(),
+                        expected_image_blob="images/train/a/a.png",
+                    )
+
+    def test_rejects_zero_sized_full_box(self):
+        value = self.annotation()
+        value["objects"][0]["fullBoxXYWH"] = [10, 20, 0, 40]
+        with self.assertRaisesRegex(ValueError, "must have positive"):
+            parse_canonical_annotation(
+                json.dumps(value).encode(), expected_image_blob="images/train/a/a.png"
+            )
+
     def test_rejects_non_person_objects(self):
         value = self.annotation()
         value["objects"][0]["detectionClass"] = "car"

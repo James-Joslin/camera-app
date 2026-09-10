@@ -8,6 +8,7 @@ import torch
 
 from person_detection.data.dataset import (
     CanonicalPersonDetectionDataset,
+    clip_box_to_image,
     letterbox_image,
     map_letterbox_box,
 )
@@ -23,6 +24,9 @@ class CanonicalIntegrationTests(unittest.TestCase):
         self.assertEqual((scale, pad_x, pad_y), (0.5, 0, 25))
         self.assertEqual(map_letterbox_box([20, 10, 100, 90], scale, pad_x, pad_y),
                          [10.0, 30.0, 50.0, 70.0])
+
+    def test_degenerate_visible_box_is_omitted_from_transform_geometry(self):
+        self.assertIsNone(clip_box_to_image([27, 54, 27, 74], 100, 80))
 
     def test_ignore_regions_neutralize_background_anchors(self):
         loss = SSDLoss(input_size=100)

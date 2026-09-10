@@ -38,13 +38,22 @@ class CanonicalAnnotation:
     ignore_regions: list[list[float]]
 
 
-def _xywh_to_xyxy(value: Any, field: str, width: int, height: int) -> list[float]:
+def _xywh_to_xyxy(
+    value: Any,
+    field: str,
+    width: int,
+    height: int,
+    *,
+    allow_zero_size: bool = False,
+) -> list[float]:
     if not isinstance(value, list) or len(value) != 4:
         raise ValueError(f"{field} must be a four-element XYWH array")
     if any(not isinstance(item, (int, float)) or not math.isfinite(item) for item in value):
         raise ValueError(f"{field} contains a non-finite or non-numeric coordinate")
     x, y, box_width, box_height = map(float, value)
-    if box_width <= 0 or box_height <= 0:
+    if box_width < 0 or box_height < 0:
+        raise ValueError(f"{field} must not have negative width or height")
+    if not allow_zero_size and (box_width == 0 or box_height == 0):
         raise ValueError(f"{field} must have positive width and height")
     return [x, y, x + box_width, y + box_height]
 
@@ -119,7 +128,8 @@ def parse_canonical_annotation(
                 object_id=object_id,
                 full_box=_xywh_to_xyxy(item.get("fullBoxXYWH"), f"{field}.fullBoxXYWH", width, height),
                 visible_box=_xywh_to_xyxy(
-                    item.get("visibleBoxXYWH"), f"{field}.visibleBoxXYWH", width, height
+                    item.get("visibleBoxXYWH"), f"{field}.visibleBoxXYWH", width, height,
+                    allow_zero_size=True,
                 ),
                 source_class_id=source_class_id,
                 source_label=source_label,

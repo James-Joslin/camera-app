@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -18,6 +19,13 @@ from typing import Any
 import cv2
 import numpy as np
 from azure.storage.blob import BlobServiceClient, ContainerClient
+
+
+MODEL_TRAINING_ROOT = Path(__file__).resolve().parents[2]
+if str(MODEL_TRAINING_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODEL_TRAINING_ROOT))
+
+from person_detection.data.annotations import parse_canonical_annotation
 
 
 LOADER_VERSION = 1
@@ -211,17 +219,31 @@ def validate_records(
             boxes = parse_yolo_label(full_label_name, blob_bytes(container, full_label_name))
             boxes_by_label[label] = boxes
             canonical_name = version_blob(prefix, annotation)
-            canonical = load_json_blob(container, canonical_name)
-            canonical_image = canonical.get("image", {})
-            if canonical.get("schemaVersion") != 1 or canonical_image.get("blob") != image:
-                raise ValueError(f"Canonical sidecar does not match {image}: {canonical_name}")
-            if canonical_image.get("sha256") != record.get("checksums", {}).get("image"):
-                raise ValueError(f"Image checksum differs between manifests for {image}")
-            if len(canonical.get("objects", [])) != record.get("personCount"):
-                raise ValueError(f"personCount differs from canonical sidecar for {image}")
-            if len(canonical.get("ignoreRegions", [])) != record.get("ignoredCount"):
-                raise ValueError(f"ignoredCount differs from canonical sidecar for {image}")
-            if len(boxes) != record.get("personCount"):
+            checksums = record.get("checksums")
+            if not isinstance(checksums, dict):
+                raise ValueError(f"Missing checksums for {image}")
+            image_sha256 = checksums.get("image")
+            annotation_sha256 = checksums.get("annotation")
+            if not isinstance(image_sha256, str) or len(image_sha256) != 64:
+                raise ValueError(f"Invalid image checksum for {image}")
+            if not isinstance(annotation_sha256, str) or len(annotation_sha256) != 64:
+                raise ValueError(f"Invalid annotation checksum for {image}")
+            person_count = record.get("personCount")
+            ignored_count = record.get("ignoredCount")
+            if not isinstance(person_count, int) or person_count < 0:
+                raise ValueError(f"Invalid personCount for {image}")
+            if not isinstance(ignored_count, int) or ignored_count < 0:
+                raise ValueError(f"Invalid ignoredCount for {image}")
+            parse_canonical_annotation(
+                blob_bytes(container, canonical_name),
+                expected_image_blob=image,
+                expected_image_sha256=image_sha256,
+                expected_status=status,
+                expected_sidecar_sha256=annotation_sha256,
+                expected_person_count=person_count,
+                expected_ignored_count=ignored_count,
+            )
+            if len(boxes) != person_count:
                 raise ValueError(f"YOLO box count differs from canonical sidecar for {image}")
             if status == "positive" and not boxes:
                 raise ValueError(f"Positive record has an empty YOLO label: {image}")
