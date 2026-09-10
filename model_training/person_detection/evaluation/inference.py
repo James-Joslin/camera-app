@@ -284,6 +284,8 @@ class MAPCalculator:
             if verbose:
                 print("  No predictions or ground truths to evaluate")
             empty = {f'mAP@{t:.2f}': 0.0 for t in self.iou_thresholds}
+            if len(self.iou_thresholds) > 1:
+                empty['mAP@0.50:0.95'] = 0.0
             empty[f'Recall@FPPI={self.recall_fppi:.2f}'] = 0.0
             return empty
 

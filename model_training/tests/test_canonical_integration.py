@@ -53,6 +53,15 @@ class CanonicalIntegrationTests(unittest.TestCase):
         ])
         self.assertAlmostEqual(calculator.compute_map(verbose=False)["mAP@0.50"], 1.0)
 
+    def test_empty_record_preserves_coco_metric_schema(self):
+        calculator = MAPCalculator([0.5 + index * 0.05 for index in range(10)])
+        calculator.add_image(0)
+
+        metrics = calculator.compute_map(verbose=False)
+
+        self.assertEqual(metrics["mAP@0.50:0.95"], 0.0)
+        self.assertEqual(metrics["Recall@FPPI=0.10"], 0.0)
+
 
     def test_validate_samples_reads_image_and_annotation(self):
         class FakeClient:
