@@ -95,7 +95,7 @@ services:
         condition: service_healthy
 
     volumes:
-      - ./project/optimized:/models:ro
+      - ./model_training/optimized:/models:ro
 
   frontend:
     image: ${CAMERA_IMAGE_PREFIX:-camera-software}-frontend:${CAMERA_IMAGE_TAG:-latest}
@@ -143,4 +143,3 @@ volumes:
   postgres-data:
   azurite-data:
   camera-streams:
-

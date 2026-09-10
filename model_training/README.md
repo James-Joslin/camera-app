@@ -373,7 +373,92 @@ Interpret common patterns as follows:
 
 The training pipeline chooses `best_model_fp32.pth` by minimum validation loss. Release acceptance should additionally require improved AP50:95/Recall@FPPI, acceptable hard-case slices, and lower official miss rate. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
 
-## Export, calibrate, validate, and benchmark INT8
+## Automated model release
+
+Run the complete post-training workflow from the repository root:
+
+```bash
+./scripts/optimize-model.sh --release-id v2026-09-10.release1
+```
+
+Alternatively, invoke it in the existing training container:
+
+```bash
+docker compose -f docker-compose.yml -f compose.training.yml exec training \
+  ./releasePersonDetector.sh --release-id v2026-09-10.release1
+```
+
+The release script:
+
+1. Loads `best_model_fp32.pth` and verifies its immutable dataset provenance.
+2. Exports matching OpenVINO FP32 and FP16 XML/BIN pairs.
+3. Calibrates INT8, measures all three variants on the same validation records, and rejects the release if the configured AP50:95 drop is exceeded.
+4. Runs the complete FP32 project and pinned official CityPersons evaluation.
+5. Builds a release containing the checkpoint, three OpenVINO model pairs, calibration manifest, optimization report, and evaluation reports.
+6. Uploads the release to an empty Azurite prefix and reads every blob back to verify its SHA-256.
+7. Copies the accepted model pairs and reports to `model_training/optimized/`, which FastAPI mounts read-only at `/models`.
+
+The default release ID is a UTC timestamp. Supplying `--release-id` is recommended for a named release. Reusing an existing local or remote release ID fails instead of overwriting it.
+
+Useful overrides include:
+
+```bash
+./scripts/optimize-model.sh \
+  --release-id v2026-09-10.release1 \
+  --checkpoint best_model_fp32.pth \
+  --input-size 480 \
+  --calibration-samples 300 \
+  --validation-samples 500 \
+  --max-accuracy-drop 0.01 \
+  --benchmark-iterations 100 \
+  --threads 1
+```
+
+### Release locations
+
+For release ID `v2026-09-10.release1`, local artifacts are written to:
+
+```text
+model_training/releases/v2026-09-10.release1/
+├── checkpoint/best_model_fp32.pth
+├── models/
+│   ├── person_detector_fp32.xml
+│   ├── person_detector_fp32.bin
+│   ├── person_detector_fp16.xml
+│   ├── person_detector_fp16.bin
+│   ├── person_detector_int8.xml
+│   ├── person_detector_int8.bin
+│   ├── calibration_manifest.json
+│   └── optimization_report.json
+├── evaluation/fp32/
+│   ├── evaluation_metrics.json
+│   ├── map_results.txt
+│   └── citypersons_official_*
+└── release_manifest.json
+```
+
+Rendered evaluation images remain local at:
+
+```text
+model_training/release_evaluations/v2026-09-10.release1/fp32/
+```
+
+The release is stored remotely at:
+
+```text
+Azurite container: computer-vision-models
+Blob prefix: person_detector_ssd/releases/v2026-09-10.release1/
+```
+
+Set `AZURITE_MODEL_CONTAINER` or pass `--model-container` to use a different container. Pass `--remote-root` to change `person_detector_ssd/releases`. The XML contains the OpenVINO graph and references its matching BIN weights; always retain and deploy both files with the same basename.
+
+After a successful release, recreate FastAPI to load `model_training/optimized/person_detector_int8.xml`:
+
+```bash
+docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate fastapi
+```
+
+## Manual export, calibration, validation, and benchmarking
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \

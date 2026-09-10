@@ -27,3 +27,6 @@ model_training/old/*
 *.bin
 *.xml
 /model_training/fp32_evaluation/*
+/model_training/.citypersons-official/
+/model_training/releases/
+/model_training/release_evaluations/

@@ -26,11 +26,26 @@ The development stack starts PostgreSQL, Azurite, the Alembic migration runner, 
 
 ## Model optimization
 
-`./scripts/optimize-model.sh` converts `project/best_model_fp32.pth` to OpenVINO FP16 and INT8, calibrates INT8 from `project/test_output`, and writes artifacts plus `project/optimized/benchmark.json`. Override defaults by passing optimizer arguments, for example `./scripts/optimize-model.sh --calibration-samples 256 --benchmark-iterations 200`.
+`./scripts/optimize-model.sh` is the complete post-training release workflow. It starts the Azurite and training services, creates and accuracy-checks FP32, FP16, and INT8 OpenVINO variants from `model_training/best_model_fp32.pth`, runs the full FP32 project and official CityPersons evaluation, uploads an immutable checksum-verified release to Azurite, and refreshes `model_training/optimized/` for the FastAPI service.
 
-The checked run used 128 calibration images at 480 × 480. On this host, FP16 averaged **8.29 ms (120.6 FPS)** and INT8 averaged **4.69 ms (213.3 FPS)** over 100 runs: a **1.77× latency speedup**. These are single-request CPU numbers; benchmark again on deployment hardware and validate accuracy before promoting a model.
+Choose a meaningful immutable release ID when preparing a release:
 
-The lightweight FastAPI service mounts `project/optimized` read-only at `/models`. The large training/notebook image remains available through the optional `ml` Compose profile and may use `/dev/dri/renderD128`.
+```bash
+./scripts/optimize-model.sh \
+  --release-id v2026-09-10.release1 \
+  --calibration-samples 300 \
+  --validation-samples 500
+```
+
+The complete local release is stored at `model_training/releases/<release-id>/`. Evaluation previews remain at `model_training/release_evaluations/<release-id>/fp32/`. The immutable remote release is stored in the `computer-vision-models` container below `person_detector_ssd/releases/<release-id>/`; every uploaded file is read back and SHA-256 verified. See [the model-training release documentation](model_training/README.md#automated-model-release) for the exact layout and all overrides.
+
+The lightweight FastAPI service mounts `model_training/optimized` read-only at `/models` and selects `person_detector_int8.xml` by default. Recreate the FastAPI service after a successful release so it loads the newly promoted model:
+
+```bash
+docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate fastapi
+```
+
+Benchmark again on deployment hardware and validate the recorded accuracy report before promoting a model outside this environment. The large training/notebook image remains available through the optional `ml` Compose profile and may use `/dev/dri/renderD128`.
 
 ## Storage and migrations
 
