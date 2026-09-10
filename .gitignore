@@ -24,3 +24,6 @@ model_training/test_output/*
 model_training/validation_preview/*
 model_training/old/*
 *.pth
+*.bin
+*.xml
+/model_training/fp32_evaluation/*
