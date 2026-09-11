@@ -28,7 +28,6 @@ from person_detection.data.sampling import (
 
 try:
     import albumentations as A
-    from albumentations.pytorch import ToTensorV2
     HAS_ALBUMENTATIONS = True
 except ImportError:
     HAS_ALBUMENTATIONS = False
@@ -61,16 +60,18 @@ PRODUCTION_PREPROCESSING = {
 DEFAULT_OVERSAMPLING_POLICY = DEFAULT_HARD_CASE_POLICY
 
 
-def letterbox_image(image: np.ndarray, size: int) -> tuple[np.ndarray, float, int, int]:
-    """Aspect-preserving resize and symmetric padding to a square canvas."""
+def letterbox_image(
+    image: np.ndarray, input_height: int, input_width: int
+) -> tuple[np.ndarray, float, int, int]:
+    """Aspect-preserving resize and symmetric padding to a rectangular canvas."""
     height, width = image.shape[:2]
-    scale = min(size / width, size / height)
+    scale = min(input_width / width, input_height / height)
     resized_width = max(1, round(width * scale))
     resized_height = max(1, round(height * scale))
     resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-    pad_x = (size - resized_width) // 2
-    pad_y = (size - resized_height) // 2
-    canvas = np.zeros((size, size, image.shape[2]), dtype=image.dtype)
+    pad_x = (input_width - resized_width) // 2
+    pad_y = (input_height - resized_height) // 2
+    canvas = np.zeros((input_height, input_width, image.shape[2]), dtype=image.dtype)
     canvas[pad_y:pad_y + resized_height, pad_x:pad_x + resized_width] = resized
     return canvas, scale, pad_x, pad_y
 
@@ -94,13 +95,14 @@ def clip_box_to_image(box: list[float], width: int, height: int) -> list[float] 
 
 def preprocess_rgb_image(
     image: np.ndarray,
-    size: int,
+    input_height: int,
+    input_width: int,
     *,
     add_batch: bool = False,
     return_geometry: bool = False,
 ):
     """Apply the production letterbox/normalization contract to an RGB image."""
-    image, scale, pad_x, pad_y = letterbox_image(image, size)
+    image, scale, pad_x, pad_y = letterbox_image(image, input_height, input_width)
     image = image.astype(np.float32) / PRODUCTION_PREPROCESSING["normalization"]["scale"]
     image = (image - IMAGENET_MEAN) / IMAGENET_STD
     tensor = np.transpose(image, (2, 0, 1)).astype(np.float32, copy=False)
@@ -145,12 +147,19 @@ def select_stratified_indices(
 class CanonicalPersonDetectionDataset(Dataset):
     """Read image names and separate canonical JSON annotations from a split manifest."""
 
-    def __init__(self, azurite_client: Any, split: str = "train", input_size: int = 320,
-                 augment: bool = True):
+    def __init__(
+        self,
+        azurite_client: Any,
+        split: str = "train",
+        input_height: int = 360,
+        input_width: int = 640,
+        augment: bool = True,
+    ):
         self.azurite = azurite_client
         self.config = azurite_client.config
         self.split = split
-        self.input_size = input_size
+        self.input_height = input_height
+        self.input_width = input_width
         self.augment = augment and split == "train"
         self._annotation_cache = {}
         self._strata_cache = {}
@@ -203,7 +212,8 @@ class CanonicalPersonDetectionDataset(Dataset):
 
     def _setup_transform(self):
         if not HAS_ALBUMENTATIONS:
-            self.transform = None
+            self.geometry_transform = None
+            self.appearance_transform = None
             return
         geometry = [
             A.HorizontalFlip(p=0.5),
@@ -225,18 +235,12 @@ class CanonicalPersonDetectionDataset(Dataset):
                 A.ImageCompression(quality_range=(65, 95)),
             ], p=0.2),
         ] if self.augment else []
-        self.transform = A.Compose(
-            geometry + [
-                A.LongestMaxSize(max_size=self.input_size),
-                A.PadIfNeeded(min_height=self.input_size, min_width=self.input_size,
-                              border_mode=cv2.BORDER_CONSTANT, fill=0),
-            ] + appearance + [
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ],
+        self.geometry_transform = A.Compose(
+            geometry,
             bbox_params=A.BboxParams(format="pascal_voc", label_fields=["bbox_kinds", "bbox_indices"],
                                      min_area=1.0, min_visibility=0.0, clip=True),
-        )
+        ) if geometry else None
+        self.appearance_transform = A.Compose(appearance) if appearance else None
 
     def _report(self):
         cities = {Path(sample["image"]).parent.name for sample in self.samples}
@@ -334,17 +338,27 @@ class CanonicalPersonDetectionDataset(Dataset):
                 kinds.append(2)
                 indices.append(item_index)
 
-        if self.transform is not None:
-            transformed = self.transform(image=image, bboxes=boxes, bbox_kinds=kinds, bbox_indices=indices)
+        if self.geometry_transform is not None:
+            transformed = self.geometry_transform(
+                image=image, bboxes=boxes, bbox_kinds=kinds, bbox_indices=indices
+            )
             image = transformed["image"]
-            transformed_items = zip(transformed["bboxes"], transformed["bbox_kinds"], transformed["bbox_indices"])
-        else:
-            image, scale, pad_x, pad_y = letterbox_image(image, self.input_size)
-            transformed_items = ((map_letterbox_box(box, scale, pad_x, pad_y), kind, item_index)
-                                 for box, kind, item_index in zip(boxes, kinds, indices))
-            image = torch.from_numpy(
-                ((image.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD)
-            ).permute(2, 0, 1).float()
+            boxes = list(transformed["bboxes"])
+            kinds = list(transformed["bbox_kinds"])
+            indices = list(transformed["bbox_indices"])
+
+        image, scale, pad_x, pad_y = letterbox_image(
+            image, self.input_height, self.input_width
+        )
+        transformed_items = [
+            (map_letterbox_box(box, scale, pad_x, pad_y), kind, item_index)
+            for box, kind, item_index in zip(boxes, kinds, indices)
+        ]
+        if self.appearance_transform is not None:
+            image = self.appearance_transform(image=image)["image"]
+        image = torch.from_numpy(
+            ((image.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD)
+        ).permute(2, 0, 1).float()
 
         full_by_index, visible_by_index, ignore_boxes = {}, {}, []
         for box, kind, item_index in transformed_items:

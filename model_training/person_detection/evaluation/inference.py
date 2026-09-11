@@ -25,7 +25,12 @@ from tqdm import tqdm
 
 from person_detection.data.layout import load_citypersons_manifest, load_citypersons_split, resolve_citypersons_prefix, version_blob
 from person_detection.data.annotations import parse_canonical_annotation
-from person_detection.data.dataset import clip_box_to_image, preprocess_rgb_image, size_slice
+from person_detection.data.dataset import (
+    PRODUCTION_PREPROCESSING,
+    clip_box_to_image,
+    preprocess_rgb_image,
+    size_slice,
+)
 from person_detection.evaluation.citypersons import (
     OfficialCityPersonsAccumulator,
     PinnedCityPersonsEvaluator,
@@ -36,6 +41,7 @@ from person_detection.core.contracts import DetectionBackend
 try:
     from person_detection.training.pipeline import (
         SSDPersonDetector,
+        MODEL_FORMAT_VERSION,
         load_detector_state_dict,
         person_scores_from_logits,
     )
@@ -66,7 +72,8 @@ class InferenceConfig:
     """Configuration for inference"""
     # Model settings
     model_path: str = 'best_model_fp32.pth'
-    input_size: int = 480
+    input_height: int = 360
+    input_width: int = 640
     num_classes: int = 1  # one sigmoid localization-quality logit
     model_type: str = 'auto'  # 'auto', 'pytorch', 'openvino', 'nncf'
 
@@ -74,6 +81,7 @@ class InferenceConfig:
     confidence_threshold: float = 0.5
     nms_threshold: float = 0.5
     max_detections: int = 100
+    pre_nms_topk: int = 1000
 
     # Data settings
     data_root: str = './data'
@@ -614,18 +622,22 @@ class DetectionPredictor(DetectionBackend):
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         tensor, scale, pad_x, pad_y = preprocess_rgb_image(
-            image_rgb, self.config.input_size, add_batch=True, return_geometry=True
+            image_rgb, self.config.input_height, self.config.input_width,
+            add_batch=True, return_geometry=True
         )
         tensor = torch.from_numpy(tensor).to(self.device)
 
         return tensor, (*original_size, scale, pad_x, pad_y)
 
-    def decode_boxes(self, pred_boxes: torch.Tensor) -> torch.Tensor:
+    def decode_boxes(
+        self, pred_boxes: torch.Tensor, anchors: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Decode predicted box offsets to absolute coordinates"""
-        anchor_cx = self.anchors[:, 0]
-        anchor_cy = self.anchors[:, 1]
-        anchor_w = self.anchors[:, 2]
-        anchor_h = self.anchors[:, 3]
+        anchors = self.anchors if anchors is None else anchors
+        anchor_cx = anchors[:, 0]
+        anchor_cy = anchors[:, 1]
+        anchor_w = anchors[:, 2]
+        anchor_h = anchors[:, 3]
 
         dx, dy, dw, dh = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
 
@@ -637,10 +649,10 @@ class DetectionPredictor(DetectionBackend):
         pred_w = torch.exp(dw) * anchor_w
         pred_h = torch.exp(dh) * anchor_h
 
-        x1 = (pred_cx - pred_w / 2) * self.config.input_size
-        y1 = (pred_cy - pred_h / 2) * self.config.input_size
-        x2 = (pred_cx + pred_w / 2) * self.config.input_size
-        y2 = (pred_cy + pred_h / 2) * self.config.input_size
+        x1 = (pred_cx - pred_w / 2) * self.config.input_width
+        y1 = (pred_cy - pred_h / 2) * self.config.input_height
+        x2 = (pred_cx + pred_w / 2) * self.config.input_width
+        y2 = (pred_cy + pred_h / 2) * self.config.input_height
 
         return torch.stack([x1, y1, x2, y2], dim=1)
 
@@ -660,14 +672,17 @@ class DetectionPredictor(DetectionBackend):
 
         person_scores = person_scores_from_logits(pred_cls)
 
-        decoded_boxes = self.decode_boxes(pred_boxes)
-
         mask = person_scores > score_threshold
         filtered_scores = person_scores[mask]
-        filtered_boxes = decoded_boxes[mask]
-
+        filtered_offsets = pred_boxes[mask]
+        filtered_anchors = self.anchors[mask]
         if len(filtered_scores) == 0:
             return []
+        if len(filtered_scores) > self.config.pre_nms_topk:
+            filtered_scores, top_indices = filtered_scores.topk(self.config.pre_nms_topk)
+            filtered_offsets = filtered_offsets[top_indices]
+            filtered_anchors = filtered_anchors[top_indices]
+        filtered_boxes = self.decode_boxes(filtered_offsets, filtered_anchors)
 
         keep_indices = nms(filtered_boxes, filtered_scores, self.config.nms_threshold)
         keep_indices = keep_indices[:self.config.max_detections]
@@ -727,6 +742,16 @@ class OpenVINOPredictor(DetectionBackend):
 
         self.input_layer = self.compiled_model.input(0)
         self.output_layers = self.compiled_model.outputs
+        input_shape = tuple(int(value) for value in self.input_layer.shape)
+        expected_shape = (1, 3, config.input_height, config.input_width)
+        if input_shape != expected_shape:
+            raise ValueError(f"OpenVINO input shape {input_shape} does not match {expected_shape}")
+        self.cls_output = next(
+            output for output in self.output_layers if int(output.shape[-1]) in (1, 2)
+        )
+        self.box_output = next(
+            output for output in self.output_layers if int(output.shape[-1]) == 4
+        )
 
         print("✓ OpenVINO model loaded")
         print(f"  Input shape: {self.input_layer.shape}")
@@ -738,17 +763,21 @@ class OpenVINOPredictor(DetectionBackend):
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_batch, scale, pad_x, pad_y = preprocess_rgb_image(
-            image_rgb, self.config.input_size, add_batch=True, return_geometry=True
+            image_rgb, self.config.input_height, self.config.input_width,
+            add_batch=True, return_geometry=True
         )
 
         return image_batch, (*original_size, scale, pad_x, pad_y)
 
-    def decode_boxes(self, pred_boxes: np.ndarray) -> np.ndarray:
+    def decode_boxes(
+        self, pred_boxes: np.ndarray, anchors: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """Decode predicted box offsets to absolute coordinates"""
-        anchor_cx = self.anchors[:, 0]
-        anchor_cy = self.anchors[:, 1]
-        anchor_w = self.anchors[:, 2]
-        anchor_h = self.anchors[:, 3]
+        anchors = self.anchors if anchors is None else anchors
+        anchor_cx = anchors[:, 0]
+        anchor_cy = anchors[:, 1]
+        anchor_w = anchors[:, 2]
+        anchor_h = anchors[:, 3]
 
         dx, dy, dw, dh = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
 
@@ -760,10 +789,10 @@ class OpenVINOPredictor(DetectionBackend):
         pred_w = np.exp(dw) * anchor_w
         pred_h = np.exp(dh) * anchor_h
 
-        x1 = (pred_cx - pred_w / 2) * self.config.input_size
-        y1 = (pred_cy - pred_h / 2) * self.config.input_size
-        x2 = (pred_cx + pred_w / 2) * self.config.input_size
-        y2 = (pred_cy + pred_h / 2) * self.config.input_size
+        x1 = (pred_cx - pred_w / 2) * self.config.input_width
+        y1 = (pred_cy - pred_h / 2) * self.config.input_height
+        x2 = (pred_cx + pred_w / 2) * self.config.input_width
+        y2 = (pred_cy + pred_h / 2) * self.config.input_height
 
         return np.stack([x1, y1, x2, y2], axis=1)
 
@@ -829,14 +858,20 @@ class OpenVINOPredictor(DetectionBackend):
             raise ValueError(
                 f"Expected one quality logit or two legacy logits, got {pred_cls.shape}"
             )
-        decoded_boxes = self.decode_boxes(pred_boxes)
-
         mask = person_scores > score_threshold
         filtered_scores = person_scores[mask]
-        filtered_boxes = decoded_boxes[mask]
-
+        filtered_offsets = pred_boxes[mask]
+        filtered_anchors = self.anchors[mask]
         if len(filtered_scores) == 0:
             return []
+        if len(filtered_scores) > self.config.pre_nms_topk:
+            top_indices = np.argpartition(
+                filtered_scores, -self.config.pre_nms_topk
+            )[-self.config.pre_nms_topk:]
+            filtered_scores = filtered_scores[top_indices]
+            filtered_offsets = filtered_offsets[top_indices]
+            filtered_anchors = filtered_anchors[top_indices]
+        filtered_boxes = self.decode_boxes(filtered_offsets, filtered_anchors)
 
         keep_indices = self.nms_numpy(filtered_boxes, filtered_scores, self.config.nms_threshold)
         keep_indices = keep_indices[:self.config.max_detections]
@@ -869,8 +904,8 @@ class OpenVINOPredictor(DetectionBackend):
         input_tensor, original_size = self.preprocess(image)
         results = self.compiled_model([input_tensor])
 
-        pred_cls = results[0]
-        pred_boxes = results[1]
+        pred_cls = results[self.cls_output]
+        pred_boxes = results[self.box_output]
 
         detections = self.postprocess(pred_cls, pred_boxes, original_size, score_threshold)
 
@@ -1049,7 +1084,7 @@ def detect_model_type(model_path: str) -> str:
         return 'openvino'
     elif model_path.endswith('.pth') or model_path.endswith('.pt'):
         if os.path.exists(model_path):
-            checkpoint = torch.load(model_path, map_location='cpu')
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
             state_dict = checkpoint.get('model_state_dict', checkpoint)
 
             for key in state_dict.keys():
@@ -1059,6 +1094,30 @@ def detect_model_type(model_path: str) -> str:
         return 'pytorch'
     else:
         return 'pytorch'
+
+
+def validate_checkpoint_contract(
+    checkpoint: dict, config: InferenceConfig, model: nn.Module
+) -> None:
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise RuntimeError("Checkpoint lacks the rectangular model contract")
+    if checkpoint.get("modelFormatVersion") != MODEL_FORMAT_VERSION:
+        raise RuntimeError(
+            f"Checkpoint format {checkpoint.get('modelFormatVersion')} is incompatible with "
+            f"rectangular model format {MODEL_FORMAT_VERSION}"
+        )
+    checkpoint_config = checkpoint.get("config", {})
+    expected = (config.input_height, config.input_width)
+    actual = (
+        checkpoint_config.get("input_height"),
+        checkpoint_config.get("input_width"),
+    )
+    if actual != expected:
+        raise RuntimeError(
+            f"Checkpoint input contract {actual} does not match requested {expected}"
+        )
+    if checkpoint.get("anchors") != model.anchor_generator.specification():
+        raise RuntimeError("Checkpoint anchors do not match the evaluation model")
 
 
 def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredictor'], torch.Tensor, str]:
@@ -1078,7 +1137,8 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
     base_model = SSDPersonDetector(
         num_classes=config.num_classes,
         pretrained=False,
-        input_size=config.input_size
+        input_height=config.input_height,
+        input_width=config.input_width,
     )
     anchors = base_model.anchor_generator.get_anchors()
 
@@ -1108,22 +1168,21 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
 
         print("Loading NNCF quantized model...")
 
-        checkpoint = torch.load(config.model_path, map_location=config.device)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        checkpoint = torch.load(config.model_path, map_location=config.device, weights_only=True)
+        validate_checkpoint_contract(checkpoint, config, base_model)
+        state_dict = checkpoint["model_state_dict"]
 
         class DummyDataset:
-            def __init__(self, input_size):
-                self.input_size = input_size
             def __iter__(self):
                 for _ in range(1):
-                    yield torch.randn(1, 3, self.input_size, self.input_size)
+                    yield torch.randn(1, 3, config.input_height, config.input_width)
             def __len__(self):
                 return 1
 
         def transform_fn(x):
             return x
 
-        dummy_dataset = nncf.Dataset(DummyDataset(config.input_size), transform_fn)
+        dummy_dataset = nncf.Dataset(DummyDataset(), transform_fn)
 
         base_model = base_model.cpu()
         quantized_model = nncf.quantize(
@@ -1144,16 +1203,12 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
         model = base_model
 
         if os.path.exists(config.model_path):
-            checkpoint = torch.load(config.model_path, map_location=config.device)
-
-            if 'model_state_dict' in checkpoint:
-                load_detector_state_dict(model, checkpoint['model_state_dict'])
-                print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-                if 'best_val_loss' in checkpoint:
-                    print(f"  Best validation loss: {checkpoint['best_val_loss']:.4f}")
-            else:
-                load_detector_state_dict(model, checkpoint)
-                print("✓ Loaded model weights")
+            checkpoint = torch.load(config.model_path, map_location=config.device, weights_only=True)
+            validate_checkpoint_contract(checkpoint, config, model)
+            load_detector_state_dict(model, checkpoint["model_state_dict"])
+            print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            if "best_val_loss" in checkpoint:
+                print(f"  Best validation loss: {checkpoint['best_val_loss']:.4f}")
         else:
             print(f"⚠ Warning: Model file not found at {config.model_path}")
             print("  Using randomly initialized model (for testing pipeline only)")
@@ -1434,6 +1489,17 @@ class DetectionEvaluationWorkflow:
                     "split": used_split,
                     "records": num_to_process,
                 },
+                "preprocessing": {
+                    **PRODUCTION_PREPROCESSING,
+                    "inputHeight": config.input_height,
+                    "inputWidth": config.input_width,
+                },
+                "postprocessing": {
+                    "evaluationScoreThreshold": config.map_score_threshold,
+                    "nmsThreshold": config.nms_threshold,
+                    "preNmsTopK": config.pre_nms_topk,
+                    "maxDetections": config.max_detections,
+                },
                 "projectBinary": {"metrics": map_results, "slices": slice_results},
                 "officialCityPersons": official_results,
             }
@@ -1457,7 +1523,9 @@ class DetectionEvaluationWorkflow:
                 f.write(f"Split: {used_split}\n")
                 f.write(f"Images evaluated: {num_to_process}\n")
                 f.write(f"Confidence threshold (viz): {config.confidence_threshold}\n")
+                f.write(f"Input canvas (H x W): {config.input_height} x {config.input_width}\n")
                 f.write(f"Score threshold (mAP): {config.map_score_threshold}\n")
+                f.write(f"Pre-NMS top-K: {config.pre_nms_topk}\n")
                 f.write(f"Dataset version: {dataset_prefix}\n")
                 f.write(f"Dataset schema: {dataset_manifest.get('schemaVersion')}\n")
                 f.write(f"Manifest SHA256: {dataset_manifest_sha256}\n")
@@ -1492,14 +1560,18 @@ def main():
     parser.add_argument('--model-type', type=str, default='auto',
                         choices=['auto', 'pytorch', 'openvino', 'nncf'],
                         help='Model type: auto (detect), pytorch, openvino, or nncf')
-    parser.add_argument('--input-size', type=int, default=480,
-                        help='Model input size')
+    parser.add_argument('--input-height', type=int, default=360,
+                        help='Model input canvas height')
+    parser.add_argument('--input-width', type=int, default=640,
+                        help='Model input canvas width (must exceed height)')
 
     # Inference settings
     parser.add_argument('--confidence', type=float, default=0.5,
                         help='Confidence threshold for visualization')
     parser.add_argument('--nms-threshold', type=float, default=0.5,
                         help='NMS IoU threshold')
+    parser.add_argument('--pre-nms-topk', type=int, default=1000,
+                        help='Maximum scored candidates decoded and passed to NMS')
 
     # mAP evaluation settings
     parser.add_argument('--no-map', action='store_true',
@@ -1546,13 +1618,20 @@ def main():
     if args.coco_map or iou_thresholds is None:
         iou_thresholds = [0.5 + i * 0.05 for i in range(10)]  # 0.50 to 0.95
 
+    if args.input_width <= args.input_height:
+        parser.error("--input-width must be greater than --input-height")
+    if args.pre_nms_topk < 1:
+        parser.error("--pre-nms-topk must be at least 1")
+
     # Create config
     config = InferenceConfig(
         model_path=args.model_path,
         model_type=args.model_type,
-        input_size=args.input_size,
+        input_height=args.input_height,
+        input_width=args.input_width,
         confidence_threshold=args.confidence,
         nms_threshold=args.nms_threshold,
+        pre_nms_topk=args.pre_nms_topk,
         evaluate_map=not args.no_map,
         map_iou_thresholds=iou_thresholds,
         map_score_threshold=args.map_threshold,

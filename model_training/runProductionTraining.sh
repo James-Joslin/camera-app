@@ -13,7 +13,15 @@ MODEL_CURRENT_POINTER="${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/curr
 EPOCHS="${TRAINING_EPOCHS:-100}"
 BATCH_SIZE="${TRAINING_BATCH_SIZE:-32}"
 NUM_WORKERS="${TRAINING_NUM_WORKERS:-1}"
-INPUT_SIZE="${TRAINING_INPUT_SIZE:-480}"
+INPUT_HEIGHT="${TRAINING_INPUT_HEIGHT:-360}"
+INPUT_WIDTH="${TRAINING_INPUT_WIDTH:-640}"
+RELEASE_STATUS="${MODEL_RELEASE_STATUS:-experimental}"
+MIN_MAP_50="${MIN_MAP_50:-0.25}"
+MIN_MAP_50_95="${MIN_MAP_50_95:-0.10}"
+MIN_RECALL_FPPI="${MIN_RECALL_FPPI:-0.20}"
+CAMERA_METRICS="${CAMERA_DOMAIN_METRICS:-}"
+BENCHMARK_SCORE_THRESHOLD="${BENCHMARK_SCORE_THRESHOLD:-0.5}"
+PRE_NMS_TOPK="${PRE_NMS_TOPK:-1000}"
 CALIBRATION_SAMPLES="${CALIBRATION_SAMPLES:-300}"
 VALIDATION_SAMPLES="${VALIDATION_SAMPLES:-500}"
 MAX_ACCURACY_DROP="${MAX_ACCURACY_DROP:-0.01}"
@@ -37,12 +45,20 @@ Configuration is supplied through environment variables. Common settings:
   TRAINING_EPOCHS             Training epochs (default: 100)
   TRAINING_BATCH_SIZE         Batch size (default: 32)
   TRAINING_NUM_WORKERS        DataLoader workers (default: 1)
-  TRAINING_INPUT_SIZE         Square model input (default: 480)
-  TRAINING_RUN_ID             Persistent run directory name
+  TRAINING_INPUT_HEIGHT       Model canvas height (default: 360)
+  TRAINING_INPUT_WIDTH        Model canvas width (default: 640)
+  TRAINING_RUN_ID             Persistent run directory name; reuse it to resume
   MODEL_RELEASE_ID            Immutable model release ID
   CALIBRATION_SAMPLES         INT8 calibration records (default: 300)
   VALIDATION_SAMPLES          Optimization validation records (default: 500)
   MAX_ACCURACY_DROP           Maximum absolute INT8 AP drop (default: 0.01)
+  MODEL_RELEASE_STATUS        experimental or production (default: experimental)
+  MIN_MAP_50                  Production minimum mAP@0.50 (default: 0.25)
+  MIN_MAP_50_95               Production minimum mAP@0.50:0.95 (default: 0.10)
+  MIN_RECALL_FPPI             Production recall at FPPI 0.10 (default: 0.20)
+  CAMERA_DOMAIN_METRICS       Required camera metrics JSON for production release
+  BENCHMARK_SCORE_THRESHOLD   Production-like benchmark threshold (default: 0.5)
+  PRE_NMS_TOPK                Candidates retained before NMS (default: 1000)
 EOF
 }
 
@@ -62,7 +78,7 @@ for identifier in "$RUN_ID" "$RELEASE_ID"; do
         exit 2
     fi
 done
-for setting in "$EPOCHS" "$BATCH_SIZE" "$INPUT_SIZE" "$CALIBRATION_SAMPLES" "$VALIDATION_SAMPLES" \
+for setting in "$EPOCHS" "$BATCH_SIZE" "$INPUT_HEIGHT" "$INPUT_WIDTH" "$CALIBRATION_SAMPLES" "$VALIDATION_SAMPLES" "$PRE_NMS_TOPK" \
     "$BENCHMARK_ITERATIONS" "$OPENVINO_THREADS" "$PREVIEW_COUNT"; do
     if [[ ! "$setting" =~ ^[1-9][0-9]*$ ]]; then
         echo "Expected a positive integer setting, got: $setting" >&2
@@ -73,9 +89,23 @@ if [[ ! "$NUM_WORKERS" =~ ^[0-9]+$ ]]; then
     echo "TRAINING_NUM_WORKERS must be zero or a positive integer" >&2
     exit 2
 fi
+if (( INPUT_WIDTH <= INPUT_HEIGHT )); then
+    echo "TRAINING_INPUT_WIDTH must be greater than TRAINING_INPUT_HEIGHT" >&2
+    exit 2
+fi
+if [[ "$RELEASE_STATUS" != "experimental" && "$RELEASE_STATUS" != "production" ]]; then
+    echo "MODEL_RELEASE_STATUS must be experimental or production" >&2
+    exit 2
+fi
+if [[ "$RELEASE_STATUS" == "production" && -z "$CAMERA_METRICS" ]]; then
+    echo "Production release requires CAMERA_DOMAIN_METRICS" >&2
+    exit 2
+fi
 
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export ENABLE_QUANTIZATION=false
+export TRAINING_INPUT_HEIGHT="$INPUT_HEIGHT"
+export TRAINING_INPUT_WIDTH="$INPUT_WIDTH"
 
 RUN_DIR="${STATE_ROOT%/}/runs/$RUN_ID"
 DATASET_VALIDATION_DIR="${STATE_ROOT%/}/dataset-validation/$RUN_ID"
@@ -134,22 +164,34 @@ for artifact in best_model_fp32.pth person_detector_fp32.xml person_detector_fp3
 done
 
 echo "Starting optimization, evaluation, release verification, and publication..."
+RELEASE_ARGS=(
+    --release-id "$RELEASE_ID"
+    --checkpoint "$RUN_DIR/best_model_fp32.pth"
+    --input-height "$INPUT_HEIGHT"
+    --input-width "$INPUT_WIDTH"
+    --release-status "$RELEASE_STATUS"
+    --min-map-50 "$MIN_MAP_50"
+    --min-map-50-95 "$MIN_MAP_50_95"
+    --min-recall-fppi "$MIN_RECALL_FPPI"
+    --benchmark-threshold "$BENCHMARK_SCORE_THRESHOLD"
+    --pre-nms-topk "$PRE_NMS_TOPK"
+    --calibration-samples "$CALIBRATION_SAMPLES"
+    --validation-samples "$VALIDATION_SAMPLES"
+    --max-accuracy-drop "$MAX_ACCURACY_DROP"
+    --benchmark-iterations "$BENCHMARK_ITERATIONS"
+    --threads "$OPENVINO_THREADS"
+    --model-container "$MODEL_CONTAINER"
+    --remote-root "$MODEL_REMOTE_ROOT"
+    --current-pointer "$MODEL_CURRENT_POINTER"
+)
+if [[ -n "$CAMERA_METRICS" ]]; then
+    RELEASE_ARGS+=(--camera-metrics "$CAMERA_METRICS")
+fi
 PERSON_DETECTOR_RELEASE_ROOT="$RELEASE_ROOT" \
 PERSON_DETECTOR_EVALUATION_ROOT="$RELEASE_EVALUATION_ROOT" \
 PERSON_DETECTOR_ACTIVE_MODEL_DIR="$ACTIVE_MODEL_DIR" \
 CITYPERSONS_OFFICIAL_DIR="$OFFICIAL_DIR" \
-    "$SCRIPT_DIR/releasePersonDetector.sh" \
-        --release-id "$RELEASE_ID" \
-        --checkpoint "$RUN_DIR/best_model_fp32.pth" \
-        --input-size "$INPUT_SIZE" \
-        --calibration-samples "$CALIBRATION_SAMPLES" \
-        --validation-samples "$VALIDATION_SAMPLES" \
-        --max-accuracy-drop "$MAX_ACCURACY_DROP" \
-        --benchmark-iterations "$BENCHMARK_ITERATIONS" \
-        --threads "$OPENVINO_THREADS" \
-        --model-container "$MODEL_CONTAINER" \
-        --remote-root "$MODEL_REMOTE_ROOT" \
-        --current-pointer "$MODEL_CURRENT_POINTER" \
+    "$SCRIPT_DIR/releasePersonDetector.sh" "${RELEASE_ARGS[@]}" \
         2>&1 | tee "$RUN_DIR/release.log"
 
 echo "============================================================"

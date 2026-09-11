@@ -66,7 +66,7 @@ The detector remains an SSD-style, anchor-based network with a pretrained Mobile
 
 ```mermaid
 flowchart LR
-    A["RGB image"] --> B["Letterbox to 480 x 480<br/>ImageNet normalization"]
+    A["RGB image"] --> B["Letterbox to 360 x 640 (H x W)<br/>ImageNet normalization"]
     B --> C["MobileNetV3-Small<br/>three backbone features"]
     C --> D["Two extra downsampling blocks"]
     D --> E["Five-level FPN<br/>128 channels per level"]
@@ -80,22 +80,22 @@ flowchart LR
     K --> L["Source-image person detections"]
 ```
 
-At the default 480-pixel input, the five prediction levels are:
+At the default 360×640 landscape input, the five prediction levels are derived from the model's actual feature tensors:
 
-| Level | Stride | Feature map | Relative scales | Width/height ratios | Anchors/location | Anchors |
+| Level | Stride | Feature map (H×W) | Relative scales | Pixel width/height ratios | Anchors/location | Anchors |
 | --- | ---: | ---: | --- | --- | ---: | ---: |
-| P2 | 8 | 60×60 | 0.02, 0.04 | 0.15, 0.25, 0.40 | 6 | 21,600 |
-| P3 | 16 | 30×30 | 0.06, 0.10 | 0.15, 0.25, 0.40 | 6 | 5,400 |
-| P4 | 32 | 15×15 | 0.16, 0.24 | 0.20, 0.33, 0.50 | 6 | 1,350 |
-| P5 | 64 | 8×8 | 0.32, 0.48, 0.56 | 0.25, 0.50, 1.00 | 9 | 576 |
-| P6 | 128 | 4×4 | 0.64, 0.80, 0.95 | 0.25, 0.50, 1.00 | 9 | 144 |
+| P2 | 8 | 45×80 | 0.02, 0.04 | 0.15, 0.25, 0.40 | 6 | 21,600 |
+| P3 | 16 | 23×40 | 0.06, 0.10 | 0.15, 0.25, 0.40 | 6 | 5,520 |
+| P4 | 32 | 12×20 | 0.16, 0.24 | 0.20, 0.33, 0.50 | 6 | 1,440 |
+| P5 | 64 | 6×10 | 0.32, 0.48, 0.56 | 0.25, 0.50, 1.00 | 9 | 540 |
+| P6 | 128 | 3×5 | 0.64, 0.80, 0.95 | 0.25, 0.50, 1.00 | 9 | 135 |
 
-This produces 29,070 anchors. Ratios are defined as width divided by height, so values below one create the tall shapes expected for pedestrians.
+This produces 29,235 anchors. Anchor dimensions are created in pixel space using the square root of canvas area as the scale reference, then x/width and y/height are normalized separately. Consequently the listed physical width/height ratios remain unchanged on the rectangular canvas. A 2048×1024 CityPersons frame becomes 640×320 content with 20-pixel padding above and below, instead of wasting half of a square tensor.
 
 The forward pass returns:
 
-- Classification tensor: `[batch, 29070, 1]`. Each value is a single quality-aware person logit.
-- Box tensor: `[batch, 29070, 4]`. Values are center and size offsets relative to an anchor.
+- Classification tensor: `[batch, 29235, 1]`. Each value is a single quality-aware person logit.
+- Box tensor: `[batch, 29235, 4]`. Values are center and size offsets relative to an anchor.
 
 Each prediction head applies a depthwise-separable shared convolution, dropout, channel attention, spatial attention, and separate classification and box subnets. The single classification score is trained toward the decoded box's IoU with its assigned person. It therefore represents both “is this a person?” and “how well is the person localized?”. There is no separate quality or attribute head at deployment.
 
@@ -157,11 +157,12 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
 - `USE_AZURITE` (`true` by default) and `DATA_ROOT` for local fallback
 - `ENABLE_QUANTIZATION`, which must remain `false`
 - `TRAINING_EPOCHS` (default `100`), `TRAINING_BATCH_SIZE` (default `32`),
-  `TRAINING_NUM_WORKERS` (default `1`), and `TRAINING_INPUT_SIZE` (default `480`)
+  `TRAINING_NUM_WORKERS` (default `1`), `TRAINING_INPUT_HEIGHT` (default `360`),
+  and `TRAINING_INPUT_WIDTH` (default `640`, which must exceed the height)
 
-Model and optimizer hyperparameters live in `TrainingConfig`. Checkpoints contain `modelFormatVersion`, dataset version/checksum/schema provenance, sampling policy, ATSS settings, and head semantics. A compatible checkpoint is reused only when its immutable dataset identity also matches.
+Model and optimizer hyperparameters live in `TrainingConfig`. `last_training_checkpoint.pth` is atomically replaced after every epoch and contains model, optimizer, scheduler, AMP scaler, completed epoch, best loss, sampler state, and RNG state. A run resumes only when model format, rectangular input, anchors, and immutable dataset provenance match. Training is skipped only when `trainingComplete` is true and `completedEpochs` covers the requested epoch count. `best_model_fp32.pth` remains the export source.
 
-The main artifact is `best_model_fp32.pth`; the training pipeline also exports `person_detector_fp32.xml` and `.bin` when OpenVINO is available.
+The training pipeline also exports `person_detector_fp32.xml` and `.bin` when OpenVINO is available.
 
 For example, to train for 25 epochs in the development training container:
 
@@ -196,8 +197,10 @@ The entrypoint performs these gated stages in order:
 2. If that check fails, it runs `getCityPersons.sh` to download, build, upload, validate, and publish a new immutable dataset version, then validates it again.
 3. It trains the detector and exports the FP32 OpenVINO XML/BIN pair.
 4. It exports FP16, calibrates INT8, evaluates FP32/FP16/INT8 on the same records, and rejects INT8 when its AP50:95 drop exceeds `MAX_ACCURACY_DROP`.
-5. It runs the complete FP32 project and pinned official CityPersons evaluation.
-6. Only after every gate passes, it uploads and reads back every release artifact, verifies every SHA-256, and updates the current-model pointer.
+5. It validates that the pre-NMS top-K cap does not materially reduce mAP or recall and records candidate counts entering NMS.
+6. A `production` release additionally requires FP32 and INT8 minimum mAP/recall values plus representative camera-domain metrics; incomplete models can be explicitly published as `experimental`.
+7. It runs the complete FP32 project and pinned official CityPersons evaluation.
+8. Only after every applicable gate passes, it uploads and reads back every release artifact, verifies every SHA-256, and updates the current-model pointer with the release status.
 
 If any stage fails, the container exits non-zero and the current-model pointer is not changed. The Kaggle credential file defaults to `./kaggle.json`; set `KAGGLE_JSON_PATH` if it lives elsewhere. It is used when the CityPersons bootstrap is required.
 
@@ -206,6 +209,9 @@ Production settings are ordinary environment variables, for example:
 ```bash
 TRAINING_EPOCHS=50 \
 TRAINING_BATCH_SIZE=16 \
+TRAINING_INPUT_HEIGHT=360 \
+TRAINING_INPUT_WIDTH=640 \
+MODEL_RELEASE_STATUS=experimental \
 CALIBRATION_SAMPLES=300 \
 VALIDATION_SAMPLES=500 \
 MAX_ACCURACY_DROP=0.01 \
@@ -239,7 +245,7 @@ The default training configuration is:
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| Input | 480×480 RGB | Letterboxed model canvas |
+| Input | 360×640 RGB (H×W) | Landscape letterboxed model canvas |
 | Batch size | 32 | Images per optimizer step |
 | Epochs | 100 | Complete passes through the sampled training epoch |
 | Optimizer | SGD | Updates all trainable parameters |
@@ -377,7 +383,9 @@ docker compose -f docker-compose.yml -f compose.training.yml exec training \
   python -m person_detection.evaluation.inference \
     --model-path best_model_fp32.pth \
     --model-type pytorch \
-    --input-size 480 \
+    --input-height 360 \
+    --input-width 640 \
+    --pre-nms-topk 1000 \
     --coco-map \
     --map-threshold 0.01 \
     --nms-threshold 0.5 \
@@ -478,7 +486,11 @@ Useful overrides include:
 ./scripts/optimize-model.sh \
   --release-id v2026-09-10.release1 \
   --checkpoint best_model_fp32.pth \
-  --input-size 480 \
+  --input-height 360 \
+  --input-width 640 \
+  --release-status experimental \
+  --benchmark-threshold 0.5 \
+  --pre-nms-topk 1000 \
   --calibration-samples 300 \
   --validation-samples 500 \
   --max-accuracy-drop 0.01 \
@@ -538,20 +550,26 @@ docker compose -f docker-compose.yml -f compose.training.yml exec training \
   python -m person_detection.optimization.pipeline \
     --checkpoint best_model_fp32.pth \
     --output-dir optimized \
-    --input-size 480 \
+    --input-height 360 \
+    --input-width 640 \
     --calibration-samples 300 \
     --validation-samples 500 \
     --selection-seed 1337 \
     --max-accuracy-drop 0.01 \
-    --score-threshold 0.01 \
+    --evaluation-score-threshold 0.01 \
+    --benchmark-score-threshold 0.5 \
     --nms-threshold 0.5 \
+    --pre-nms-topk 1000 \
+    --release-status experimental \
     --benchmark-iterations 100 \
     --threads 1
 ```
 
 Calibration comes only from clean train-manifest records and is greedily stratified across status, size, city, source label, posture, and visibility. Validation uses a deterministic natural-order subset. All selected image and annotation identities are written to `calibration_manifest.json` or `optimization_report.json`.
 
-The optimizer creates FP32, FP16, and INT8 OpenVINO IR files, evaluates them on the same records, measures core and end-to-end p50/p95 latency, and rejects INT8 when the absolute AP50:95 loss exceeds `--max-accuracy-drop`. Dataset provenance is strict by default; `--allow-unverified-checkpoint` is an explicit diagnostic escape hatch and should not be used for release artifacts.
+The optimizer creates FP32, FP16, and INT8 OpenVINO IR files and evaluates them at the fixed `0.01` score threshold. Latency uses the separate production-like threshold (default `0.5`) and reports JPEG decode, color conversion, letterbox/normalization, inference, box decode/filter, and NMS independently for JPEG inputs, plus a raw-BGR-frame pipeline without JPEG decode. Candidate counts before filtering and entering NMS are included. Capped and uncapped validation runs prove the configured top-K does not exceed `--max-topk-quality-drop`.
+
+`experimental` is the default release status so a partially trained model can be packaged without being represented as production quality. A `production` invocation also applies `--min-map-50`, `--min-map-50-95`, and `--min-recall-fppi` to both FP32 and INT8, and requires `--camera-metrics PATH`. The camera JSON may be a direct metrics mapping, a `{ "metrics": ... }` mapping, or an evaluator `evaluation_metrics.json` containing `projectBinary.metrics`. Dataset provenance is strict by default; `--allow-unverified-checkpoint` is a diagnostic escape hatch and should not be used for release artifacts.
 
 Do not set `ENABLE_QUANTIZATION=true` during training. The retired in-training QAT route intentionally fails fast; `person_detection.optimization.pipeline` is the sole release INT8 workflow.
 

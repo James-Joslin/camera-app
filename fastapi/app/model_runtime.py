@@ -20,13 +20,21 @@ class OpenVinoPersonDetector:
         )
         self.input = self.compiled.input(0)
         self.outputs = self.compiled.outputs
-        self.input_size = int(self.input.shape[-1])
-        self.anchors = generate_anchors(self.input_size)
+        self.input_height = int(self.input.shape[-2])
+        self.input_width = int(self.input.shape[-1])
+        if self.input_width <= self.input_height:
+            raise ValueError("Person detector model must use a landscape input canvas")
+        self.anchors = generate_anchors(self.input_height, self.input_width)
+        self.pre_nms_topk = int(os.getenv("MODEL_PRE_NMS_TOPK", "1000"))
+        if self.pre_nms_topk < 1:
+            raise ValueError("MODEL_PRE_NMS_TOPK must be at least 1")
         self.lock = threading.Lock()
 
     def predict(self, image: np.ndarray, threshold: float = 0.5, nms_threshold: float = 0.45) -> tuple[list[dict], float]:
         original_height, original_width = image.shape[:2]
-        tensor, scale, pad_x, pad_y = preprocess(image, self.input_size)
+        tensor, scale, pad_x, pad_y = preprocess(
+            image, self.input_height, self.input_width
+        )
         started = time.perf_counter()
         with self.lock:
             raw = self.compiled([tensor])
@@ -50,11 +58,19 @@ class OpenVinoPersonDetector:
             raise RuntimeError(
                 f"Detector produced {len(offsets)} boxes for {len(self.anchors)} anchors"
             )
-        boxes = decode_boxes(offsets, self.anchors, self.input_size)
-        selected = scores >= threshold
-        boxes, scores = boxes[selected], scores[selected]
-        if not len(scores):
+        selected = np.flatnonzero(scores >= threshold)
+        if not len(selected):
             return [], inference_ms
+        if len(selected) > self.pre_nms_topk:
+            local_top = np.argpartition(scores[selected], -self.pre_nms_topk)[-self.pre_nms_topk:]
+            selected = selected[local_top]
+        scores = scores[selected]
+        boxes = decode_boxes(
+            offsets[selected],
+            self.anchors[selected],
+            self.input_height,
+            self.input_width,
+        )
         keep = nms(boxes, scores, nms_threshold)[:100]
         detections = []
         for index in keep:
@@ -124,17 +140,17 @@ class ModelService:
 
 
 def preprocess(
-    image: np.ndarray, input_size: int
+    image: np.ndarray, input_height: int, input_width: int
 ) -> tuple[np.ndarray, float, int, int]:
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     original_height, original_width = rgb.shape[:2]
-    scale = min(input_size / original_width, input_size / original_height)
+    scale = min(input_width / original_width, input_height / original_height)
     resized_width = max(1, round(original_width * scale))
     resized_height = max(1, round(original_height * scale))
     resized = cv2.resize(rgb, (resized_width, resized_height))
-    pad_x = (input_size - resized_width) // 2
-    pad_y = (input_size - resized_height) // 2
-    canvas = np.zeros((input_size, input_size, 3), dtype=np.uint8)
+    pad_x = (input_width - resized_width) // 2
+    pad_y = (input_height - resized_height) // 2
+    canvas = np.zeros((input_height, input_width, 3), dtype=np.uint8)
     canvas[pad_y:pad_y + resized_height, pad_x:pad_x + resized_width] = resized
     normalized = (canvas.astype(np.float32) / 255.0 - np.array(
         [0.485, 0.456, 0.406], dtype=np.float32
@@ -173,9 +189,14 @@ def classification_scores(logits: np.ndarray) -> np.ndarray:
     raise RuntimeError(f"Unsupported classification output shape: {logits.shape}")
 
 
-def generate_anchors(input_size: int) -> np.ndarray:
+def generate_anchors(input_height: int, input_width: int) -> np.ndarray:
+    if input_width <= input_height:
+        raise ValueError("Person detector input must be landscape: width > height")
     strides = [8, 16, 32, 64, 128]
-    scales = [[0.02, 0.04], [0.06, 0.10], [0.16, 0.24], [0.32, 0.48, 0.56], [0.64, 0.80, 0.95]]
+    scales = [
+        [0.02, 0.04], [0.06, 0.10], [0.16, 0.24],
+        [0.32, 0.48, 0.56], [0.64, 0.80, 0.95],
+    ]
     ratios = [
         [0.15, 0.25, 0.40],
         [0.15, 0.25, 0.40],
@@ -183,25 +204,49 @@ def generate_anchors(input_size: int) -> np.ndarray:
         [0.25, 0.50, 1.00],
         [0.25, 0.50, 1.00],
     ]
+    reference_pixels = np.sqrt(input_height * input_width)
     anchors = []
     for stride, level_scales, level_ratios in zip(strides, scales, ratios):
-        size = (input_size + stride - 1) // stride
-        for row in range(size):
-            for column in range(size):
+        feature_height = (input_height + stride - 1) // stride
+        feature_width = (input_width + stride - 1) // stride
+        for row in range(feature_height):
+            for column in range(feature_width):
                 for scale in level_scales:
+                    base_pixels = scale * reference_pixels
                     for ratio in level_ratios:
-                        anchors.append([(column + 0.5) / size, (row + 0.5) / size, scale * np.sqrt(ratio), scale / np.sqrt(ratio)])
+                        width_pixels = base_pixels * np.sqrt(ratio)
+                        height_pixels = base_pixels / np.sqrt(ratio)
+                        anchors.append([
+                            (column + 0.5) / feature_width,
+                            (row + 0.5) / feature_height,
+                            width_pixels / input_width,
+                            height_pixels / input_height,
+                        ])
     return np.asarray(anchors, dtype=np.float32)
 
 
-def decode_boxes(offsets: np.ndarray, anchors: np.ndarray, input_size: int) -> np.ndarray:
+def decode_boxes(
+    offsets: np.ndarray,
+    anchors: np.ndarray,
+    input_height: int,
+    input_width: int,
+) -> np.ndarray:
     center_x = offsets[:, 0] * anchors[:, 2] + anchors[:, 0]
     center_y = offsets[:, 1] * anchors[:, 3] + anchors[:, 1]
     width = np.exp(np.clip(offsets[:, 2], -10, 10)) * anchors[:, 2]
     height = np.exp(np.clip(offsets[:, 3], -10, 10)) * anchors[:, 3]
-    return np.stack(
-        [center_x - width / 2, center_y - height / 2, center_x + width / 2, center_y + height / 2], axis=1
-    ) * input_size
+    boxes = np.stack(
+        [
+            (center_x - width / 2) * input_width,
+            (center_y - height / 2) * input_height,
+            (center_x + width / 2) * input_width,
+            (center_y + height / 2) * input_height,
+        ],
+        axis=1,
+    )
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, input_width)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, input_height)
+    return boxes
 
 
 def softmax(values: np.ndarray, axis: int = -1) -> np.ndarray:

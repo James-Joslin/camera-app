@@ -73,7 +73,8 @@ class TrainingConfig:
     """Training configuration with sensible defaults"""
     # Data
     data_root: str = './data'
-    input_size: int = 480  # Reduced from 600 - better latency, multi-scale compensates
+    input_height: int = 360
+    input_width: int = 640
     batch_size: int = 32   # Increased - more stable gradients
     num_workers: int = 1
 
@@ -786,35 +787,37 @@ class LegacyYoloPersonDetectionDataset(Dataset):
 # ============================================================================
 
 class PersonAnchorGenerator:
-    """
-    Anchor generator optimized for person detection
+    """Generate normalized anchors from real rectangular feature-map shapes."""
 
-    People are typically:
-    - Taller than wide (aspect ratios 1:2, 1:3)
-    - Various sizes from distant to close
-    """
-
-    def __init__(self, input_size: int = 640):
-        self.input_size = input_size
-
-        self.strides = [8, 16, 32, 64, 128]  # Fixed strides at each level
-
-        # Feature map size = input_size / stride
-        self.feature_map_sizes = [
-            (input_size + stride - 1) // stride  # Ceiling division
+    def __init__(
+        self,
+        input_height: int = 360,
+        input_width: int = 640,
+        feature_map_shapes: Optional[List[Tuple[int, int]]] = None,
+    ):
+        if input_width <= input_height:
+            raise ValueError("Person detector input must be landscape: width > height")
+        self.input_height = input_height
+        self.input_width = input_width
+        self.strides = [8, 16, 32, 64, 128]
+        self.feature_map_shapes = feature_map_shapes or [
+            (
+                (input_height + stride - 1) // stride,
+                (input_width + stride - 1) // stride,
+            )
             for stride in self.strides
         ]
+        if len(self.feature_map_shapes) != len(self.strides):
+            raise ValueError("Expected one feature-map shape for each pyramid level")
 
-        # In PersonAnchorGenerator.__init__
         self.scales = [
-            [0.02, 0.04],           # P2: tiny distant people
-            [0.06, 0.10],           # P3: small people
-            [0.16, 0.24],           # P4: medium people
-            [0.32, 0.48, 0.56],     # P5: large people - ADD intermediate
-            [0.64, 0.80, 0.95],     # P6: very close - ADD near-full-frame
+            [0.02, 0.04],
+            [0.06, 0.10],
+            [0.16, 0.24],
+            [0.32, 0.48, 0.56],
+            [0.64, 0.80, 0.95],
         ]
-
-        # width / height ratios; pedestrian anchors must therefore be below 1.
+        # Pixel-space width / height ratios. Normalize x by width and y by height.
         self.aspect_ratios = [
             [0.15, 0.25, 0.40],
             [0.15, 0.25, 0.40],
@@ -822,46 +825,56 @@ class PersonAnchorGenerator:
             [0.25, 0.50, 1.00],
             [0.25, 0.50, 1.00],
         ]
-
         self.anchors = self._generate_anchors()
         self.num_anchors_per_level = self._count_anchors_per_level()
-        print(f"Generated {len(self.anchors)} anchors across {len(self.feature_map_sizes)} levels")
+        print(
+            f"Generated {len(self.anchors)} anchors across "
+            f"{len(self.feature_map_shapes)} rectangular levels"
+        )
 
     def _generate_anchors(self) -> torch.Tensor:
-        """Generate all anchor boxes"""
         all_anchors = []
-
-        for level_idx, fmap_size in enumerate(self.feature_map_sizes):
+        reference_pixels = np.sqrt(self.input_height * self.input_width)
+        for level_idx, (feature_height, feature_width) in enumerate(self.feature_map_shapes):
             scales = self.scales[level_idx]
             ratios = self.aspect_ratios[level_idx]
-
-            for i in range(fmap_size):
-                for j in range(fmap_size):
-                    cx = (j + 0.5) / fmap_size
-                    cy = (i + 0.5) / fmap_size
-
+            for row in range(feature_height):
+                for column in range(feature_width):
+                    center_x = (column + 0.5) / feature_width
+                    center_y = (row + 0.5) / feature_height
                     for scale in scales:
+                        base_pixels = scale * reference_pixels
                         for ratio in ratios:
-                            w = scale * np.sqrt(ratio)
-                            h = scale / np.sqrt(ratio)
-                            all_anchors.append([cx, cy, w, h])
-
+                            width_pixels = base_pixels * np.sqrt(ratio)
+                            height_pixels = base_pixels / np.sqrt(ratio)
+                            all_anchors.append([
+                                center_x,
+                                center_y,
+                                width_pixels / self.input_width,
+                                height_pixels / self.input_height,
+                            ])
         return torch.tensor(all_anchors, dtype=torch.float32)
 
     def _count_anchors_per_level(self) -> List[int]:
-        """Count anchors per feature map level"""
-        counts = []
-        for level_idx, fmap_size in enumerate(self.feature_map_sizes):
-            n_scales = len(self.scales[level_idx])
-            n_ratios = len(self.aspect_ratios[level_idx])
-            counts.append(fmap_size * fmap_size * n_scales * n_ratios)
-        return counts
+        return [
+            feature_height * feature_width * len(self.scales[level]) * len(self.aspect_ratios[level])
+            for level, (feature_height, feature_width) in enumerate(self.feature_map_shapes)
+        ]
 
     def get_anchors(self) -> torch.Tensor:
         return self.anchors
 
     def get_num_anchors_per_location(self, level: int) -> int:
         return len(self.scales[level]) * len(self.aspect_ratios[level])
+
+    def specification(self) -> Dict:
+        return {
+            "coordinateSystem": "normalized-xy-separate-v1",
+            "sizeBasis": "sqrt-canvas-area-pixels-v1",
+            "featureMapShapes": [list(shape) for shape in self.feature_map_shapes],
+            "scales": self.scales,
+            "aspectRatios": self.aspect_ratios,
+        }
 
 # ============================================================================
 # MODEL ARCHITECTURE
@@ -1037,27 +1050,35 @@ class AttentionDetectionHead(nn.Module):
         return cls, bbox
 
 class SSDPersonDetector(nn.Module):
-    """Enhanced SSD with FPN and attention mechanisms"""
+    """Enhanced SSD with an FPN on a fixed landscape input canvas."""
 
-    def __init__(self, num_classes: int = 1, input_size: int = 640, pretrained: bool = True):
+    def __init__(
+        self,
+        num_classes: int = 1,
+        input_height: int = 360,
+        input_width: int = 640,
+        pretrained: bool = True,
+    ):
         super().__init__()
+        if input_width <= input_height:
+            raise ValueError("Person detector input must be landscape: width > height")
         self.num_classes = num_classes
-        self.input_size = input_size
+        self.input_height = input_height
+        self.input_width = input_width
 
-        # Backbone
-        backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None)
+        backbone = mobilenet_v3_small(
+            weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        )
         self.features = backbone.features
         self.feature_indices = [3, 6, 12]
-
-        # Extra layers
         self.extra_layers = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(576, 128, kernel_size=1),  # Changed from 960
+                nn.Conv2d(576, 128, kernel_size=1),
                 nn.BatchNorm2d(128),
-                nn.SiLU (inplace=True),
+                nn.SiLU(inplace=True),
                 nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(256),
-                nn.SiLU(inplace=True)
+                nn.SiLU(inplace=True),
             ),
             nn.Sequential(
                 nn.Conv2d(256, 64, kernel_size=1),
@@ -1065,54 +1086,64 @@ class SSDPersonDetector(nn.Module):
                 nn.SiLU(inplace=True),
                 nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(128),
-                nn.SiLU(inplace=True)
+                nn.SiLU(inplace=True),
             ),
         ])
 
-        # FPN to unify channels
         backbone_channels = [24, 40, 576, 256, 128]
         fpn_channels = 128
         self.fpn = FPN(backbone_channels, out_channels=fpn_channels)
-
-        # Anchor generator
-        self.anchor_generator = PersonAnchorGenerator(input_size)
-
-        # Detection heads with attention (now all same channel dim due to FPN)
+        feature_map_shapes = self._infer_feature_map_shapes()
+        self.anchor_generator = PersonAnchorGenerator(
+            input_height, input_width, feature_map_shapes
+        )
         self.detection_heads = nn.ModuleList([
             AttentionDetectionHead(
                 fpn_channels,
-                self.anchor_generator.get_num_anchors_per_location(i),
-                num_classes
+                self.anchor_generator.get_num_anchors_per_location(level),
+                num_classes,
             )
-            for i in range(5)
+            for level in range(5)
         ])
 
-    def forward(self, x):
+    def _extract_backbone_features(self, tensor: torch.Tensor) -> List[torch.Tensor]:
         features = []
-
-        for i, layer in enumerate(self.features):
-            x = layer(x)
-            if i in self.feature_indices:
-                features.append(x)
-
+        for index, layer in enumerate(self.features):
+            tensor = layer(tensor)
+            if index in self.feature_indices:
+                features.append(tensor)
         for extra_layer in self.extra_layers:
-            x = extra_layer(x)
-            features.append(x)
+            tensor = extra_layer(tensor)
+            features.append(tensor)
+        return features
 
-        # Apply FPN
-        fpn_features = self.fpn(features)
+    def _infer_feature_map_shapes(self) -> List[Tuple[int, int]]:
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            features = self._extract_backbone_features(
+                torch.zeros(1, 3, self.input_height, self.input_width)
+            )
+        self.train(was_training)
+        return [(int(feature.shape[-2]), int(feature.shape[-1])) for feature in features]
 
-        # Detection heads
+    def forward(self, tensor: torch.Tensor):
+        input_shape = tuple(tensor.shape[-2:])
+        if not torch.jit.is_tracing() and input_shape != (self.input_height, self.input_width):
+            raise ValueError(
+                f"Expected {self.input_height}x{self.input_width} input, got "
+                f"{input_shape[0]}x{input_shape[1]}"
+            )
+        fpn_features = self.fpn(self._extract_backbone_features(tensor))
         all_cls, all_bbox = [], []
-        for feat, head in zip(fpn_features, self.detection_heads):
-            cls, bbox = head(feat)
-            all_cls.append(cls)
-            all_bbox.append(bbox)
-
+        for feature, head in zip(fpn_features, self.detection_heads):
+            classification, boxes = head(feature)
+            all_cls.append(classification)
+            all_bbox.append(boxes)
         return torch.cat(all_cls, dim=1), torch.cat(all_bbox, dim=1)
 
 
-MODEL_FORMAT_VERSION = 2
+MODEL_FORMAT_VERSION = 3
 
 
 def person_scores_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -1402,7 +1433,8 @@ class SSDLoss(nn.Module):
         use_focal_loss: bool = True,
         focal_alpha: float = 0.4,
         focal_gamma: float = 2.0,
-        input_size: int = 320,
+        input_height: int = 360,
+        input_width: int = 640,
         anchors_per_level: Optional[List[int]] = None,
         atss_topk: int = 9,
         giou_weight: float = 2.0,
@@ -1413,7 +1445,8 @@ class SSDLoss(nn.Module):
         self.num_classes = num_classes
         self.neg_pos_ratio = neg_pos_ratio
         self.use_focal_loss = use_focal_loss
-        self.input_size = input_size
+        self.input_height = input_height
+        self.input_width = input_width
         self.anchors_per_level = list(anchors_per_level or [])
         self.assigner = ATSSAnchorAssigner(top_k=atss_topk)
         self.giou_weight = giou_weight
@@ -1421,10 +1454,10 @@ class SSDLoss(nn.Module):
 
     def anchor_boxes(self, anchors: torch.Tensor) -> torch.Tensor:
         boxes = torch.zeros_like(anchors)
-        boxes[:, 0] = (anchors[:, 0] - anchors[:, 2] / 2) * self.input_size
-        boxes[:, 1] = (anchors[:, 1] - anchors[:, 3] / 2) * self.input_size
-        boxes[:, 2] = (anchors[:, 0] + anchors[:, 2] / 2) * self.input_size
-        boxes[:, 3] = (anchors[:, 1] + anchors[:, 3] / 2) * self.input_size
+        boxes[:, 0] = (anchors[:, 0] - anchors[:, 2] / 2) * self.input_width
+        boxes[:, 1] = (anchors[:, 1] - anchors[:, 3] / 2) * self.input_height
+        boxes[:, 2] = (anchors[:, 0] + anchors[:, 2] / 2) * self.input_width
+        boxes[:, 3] = (anchors[:, 1] + anchors[:, 3] / 2) * self.input_height
         return boxes
 
     def decode_boxes(self, offsets: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
@@ -1433,10 +1466,10 @@ class SSDLoss(nn.Module):
         widths = offsets[:, 2].clamp(max=10).exp() * anchors[:, 2]
         heights = offsets[:, 3].clamp(max=10).exp() * anchors[:, 3]
         return torch.stack([
-            (centers_x - widths / 2) * self.input_size,
-            (centers_y - heights / 2) * self.input_size,
-            (centers_x + widths / 2) * self.input_size,
-            (centers_y + heights / 2) * self.input_size,
+            (centers_x - widths / 2) * self.input_width,
+            (centers_y - heights / 2) * self.input_height,
+            (centers_x + widths / 2) * self.input_width,
+            (centers_y + heights / 2) * self.input_height,
         ], dim=1)
 
     @staticmethod
@@ -1562,14 +1595,19 @@ class SSDLoss(nn.Module):
 # INFERENCE UTILITIES
 # ============================================================================
 
-def decode_boxes(pred_offsets: torch.Tensor, anchors: torch.Tensor, input_size: int) -> torch.Tensor:
+def decode_boxes(
+    pred_offsets: torch.Tensor,
+    anchors: torch.Tensor,
+    input_height: int,
+    input_width: int,
+) -> torch.Tensor:
     """
     Decode predicted offsets to absolute box coordinates.
 
     Args:
         pred_offsets: [N, 4] tensor of (dx, dy, dw, dh)
         anchors: [N, 4] tensor of (cx, cy, w, h) in normalized coords
-        input_size: Image size for converting to absolute coords
+        input_height/input_width: Canvas dimensions for absolute coordinates
 
     Returns:
         boxes: [N, 4] tensor of (x1, y1, x2, y2) in absolute pixels
@@ -1579,10 +1617,10 @@ def decode_boxes(pred_offsets: torch.Tensor, anchors: torch.Tensor, input_size: 
     pred_w = torch.exp(pred_offsets[:, 2].clamp(max=10)) * anchors[:, 2]
     pred_h = torch.exp(pred_offsets[:, 3].clamp(max=10)) * anchors[:, 3]
 
-    x1 = (pred_cx - pred_w / 2) * input_size
-    y1 = (pred_cy - pred_h / 2) * input_size
-    x2 = (pred_cx + pred_w / 2) * input_size
-    y2 = (pred_cy + pred_h / 2) * input_size
+    x1 = (pred_cx - pred_w / 2) * input_width
+    y1 = (pred_cy - pred_h / 2) * input_height
+    x2 = (pred_cx + pred_w / 2) * input_width
+    y2 = (pred_cy + pred_h / 2) * input_height
 
     return torch.stack([x1, y1, x2, y2], dim=1)
 
@@ -1693,7 +1731,8 @@ class OpenVINOExporter:
         self,
         model: nn.Module,
         output_path: str,
-        input_size: int = 320,
+        input_height: int = 360,
+        input_width: int = 640,
         compress_to_fp16: bool = False
     ) -> Optional[str]:
         """Export PyTorch model to OpenVINO IR format."""
@@ -1705,7 +1744,7 @@ class OpenVINOExporter:
         model = model.cpu()
         model.eval()
 
-        dummy_input = torch.randn(1, 3, input_size, input_size)
+        dummy_input = torch.randn(1, 3, input_height, input_width)
 
         warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
         warnings.filterwarnings("ignore", category=UserWarning)
@@ -1714,7 +1753,7 @@ class OpenVINOExporter:
             ov_model = ov.convert_model(
                 model,
                 example_input=dummy_input,
-                input=[1, 3, input_size, input_size]
+                input=[1, 3, input_height, input_width]
             )
 
             ov.save_model(ov_model, output_path, compress_to_fp16=compress_to_fp16)
@@ -1734,10 +1773,12 @@ class OpenVINOExporter:
         model_path: str,
         dataloader: DataLoader,
         anchors: torch.Tensor,
-        input_size: int,
+        input_height: int,
+        input_width: int,
         device: str = 'CPU',
         score_threshold: float = 0.05,
-        nms_threshold: float = 0.5
+        nms_threshold: float = 0.5,
+        pre_nms_topk: int = 1000,
     ) -> Tuple[List[Dict], List[Dict]]:
         """
         Run inference on OpenVINO model and collect predictions.
@@ -1753,15 +1794,16 @@ class OpenVINOExporter:
         model = self.core.read_model(model_path)
         compiled_model = self.core.compile_model(model, device)
 
-        # Get input/output info
-        input_layer = compiled_model.input(0)
-        output_cls = compiled_model.output(0)
-        output_box = compiled_model.output(1)
+        output_layers = compiled_model.outputs
+        output_cls = next(
+            output for output in output_layers if int(output.shape[-1]) in (1, 2)
+        )
+        output_box = next(
+            output for output in output_layers if int(output.shape[-1]) == 4
+        )
 
         all_predictions = []
         all_ground_truths = []
-
-        anchors_np = anchors.numpy()
         anchors_torch = anchors
 
         for images, targets in tqdm(dataloader, desc=f"Inference ({Path(model_path).stem})"):
@@ -1780,17 +1822,21 @@ class OpenVINOExporter:
                 pred_cls_torch = torch.from_numpy(pred_cls)
                 pred_boxes_torch = torch.from_numpy(pred_boxes)
 
-                # Decode predictions
                 max_scores = person_scores_from_logits(pred_cls_torch)
-                boxes = decode_boxes(pred_boxes_torch, anchors_torch, input_size)
+                selected = torch.where(max_scores >= score_threshold)[0]
+                if len(selected) > pre_nms_topk:
+                    selected = selected[max_scores[selected].topk(pre_nms_topk).indices]
+                selected_scores = max_scores[selected]
+                boxes = decode_boxes(
+                    pred_boxes_torch[selected], anchors_torch[selected],
+                    input_height, input_width
+                )
+                pred_labels = torch.ones_like(selected_scores, dtype=torch.long)
 
-                pred_labels = torch.ones_like(max_scores, dtype=torch.long)
-
-                # Apply NMS
                 nms_boxes, nms_scores, nms_labels = apply_nms(
-                    boxes, max_scores, pred_labels,
+                    boxes, selected_scores, pred_labels,
                     iou_threshold=nms_threshold,
-                    score_threshold=score_threshold
+                    score_threshold=0.0,
                 )
 
                 # Store predictions
@@ -1986,7 +2032,8 @@ class OpenVINOExporter:
         model_path: str,
         dataloader: DataLoader,
         anchors: torch.Tensor,
-        input_size: int,
+        input_height: int,
+        input_width: int,
         device: str = 'CPU',
         iou_thresholds: List[float] = [0.5]
     ) -> Dict:
@@ -1997,7 +2044,7 @@ class OpenVINOExporter:
             model_path: Path to OpenVINO .xml file
             dataloader: Validation dataloader
             anchors: Anchor boxes
-            input_size: Model input size
+            input_height/input_width: Model canvas dimensions
             device: OpenVINO device
             iou_thresholds: IoU thresholds for mAP
 
@@ -2008,7 +2055,7 @@ class OpenVINOExporter:
 
         # Run inference
         predictions, ground_truths = self.run_inference(
-            model_path, dataloader, anchors, input_size, device
+            model_path, dataloader, anchors, input_height, input_width, device
         )
 
         print(f"    Collected {len(predictions)} predictions, {len(ground_truths)} ground truths")
@@ -2024,7 +2071,8 @@ class OpenVINOExporter:
         int8_path: str,
         dataloader: DataLoader = None,
         anchors: torch.Tensor = None,
-        input_size: int = 320,
+        input_height: int = 360,
+        input_width: int = 640,
         device: str = 'CPU',
         thread_counts: List[int] = None,
         evaluate_accuracy: bool = True,
@@ -2038,7 +2086,7 @@ class OpenVINOExporter:
             int8_path: Path to INT8 OpenVINO model
             dataloader: Validation dataloader (required if evaluate_accuracy=True)
             anchors: Anchor boxes (required if evaluate_accuracy=True)
-            input_size: Model input size
+            input_height/input_width: Model canvas dimensions
             device: OpenVINO device
             thread_counts: List of thread counts to benchmark
             evaluate_accuracy: Whether to calculate mAP
@@ -2097,7 +2145,7 @@ class OpenVINOExporter:
             # Evaluate FP32
             print("\n  FP32 Model:")
             fp32_map = self.evaluate_model(
-                fp32_path, dataloader, anchors, input_size, device, iou_thresholds
+                fp32_path, dataloader, anchors, input_height, input_width, device, iou_thresholds
             )
             results['fp32']['accuracy'] = fp32_map
 
@@ -2107,7 +2155,7 @@ class OpenVINOExporter:
             # Evaluate INT8
             print("\n  INT8 Model:")
             int8_map = self.evaluate_model(
-                int8_path, dataloader, anchors, input_size, device, iou_thresholds
+                int8_path, dataloader, anchors, input_height, input_width, device, iou_thresholds
             )
             results['int8']['accuracy'] = int8_map
 
@@ -2308,6 +2356,98 @@ def validate(
 # MAIN TRAINING PIPELINE
 # ============================================================================
 
+def checkpoint_resume_mismatches(
+    checkpoint: Dict,
+    config: TrainingConfig,
+    dataset_metadata: Dict,
+    anchor_specification: Dict,
+) -> Dict[str, Dict]:
+    """Explain why a checkpoint cannot safely resume this exact training contract."""
+    mismatches: Dict[str, Dict] = {}
+
+    def compare(name: str, checkpoint_value, current_value) -> None:
+        if checkpoint_value != current_value:
+            mismatches[name] = {
+                "checkpoint": checkpoint_value,
+                "current": current_value,
+            }
+
+    compare("modelFormatVersion", checkpoint.get("modelFormatVersion"), MODEL_FORMAT_VERSION)
+    checkpoint_config = checkpoint.get("config")
+    if not isinstance(checkpoint_config, dict):
+        mismatches["config"] = {"checkpoint": None, "current": "mapping"}
+    else:
+        compare("inputHeight", checkpoint_config.get("input_height"), config.input_height)
+        compare("inputWidth", checkpoint_config.get("input_width"), config.input_width)
+        compare("numClasses", checkpoint_config.get("num_classes"), config.num_classes)
+
+    checkpoint_dataset = checkpoint.get("dataset")
+    for key in ("versionPrefix", "manifestSha256", "schemaVersion"):
+        compare(
+            f"dataset.{key}",
+            checkpoint_dataset.get(key) if isinstance(checkpoint_dataset, dict) else None,
+            dataset_metadata.get(key),
+        )
+    compare("anchors", checkpoint.get("anchors"), anchor_specification)
+
+    required_state = (
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "scaler_state_dict",
+        "completedEpochs",
+        "best_val_loss",
+    )
+    missing = [key for key in required_state if key not in checkpoint]
+    if missing:
+        mismatches["resumeState"] = {"checkpoint": missing, "current": "all required"}
+    return mismatches
+
+
+def make_training_checkpoint(
+    *,
+    epoch: int,
+    training_complete: bool,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    best_val_loss: float,
+    config: TrainingConfig,
+    dataset_metadata: Dict,
+    anchor_generator: PersonAnchorGenerator,
+    sampling_generator: Optional[torch.Generator],
+) -> Dict:
+    return {
+        "epoch": epoch,
+        "completedEpochs": epoch + 1,
+        "trainingComplete": training_complete,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "sampler_generator_state": (
+            sampling_generator.get_state() if sampling_generator is not None else None
+        ),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "best_val_loss": best_val_loss,
+        "config": config.__dict__,
+        "dataset": dataset_metadata,
+        "modelFormatVersion": MODEL_FORMAT_VERSION,
+        "anchors": anchor_generator.specification(),
+        "assignment": {"name": "ATSS", "topKPerLevel": config.atss_topk},
+        "classificationHead": {"name": "binary-quality-v1", "target": "predictedIoU"},
+    }
+
+
+def save_training_checkpoint(checkpoint: Dict, path: str) -> None:
+    """Atomically replace a checkpoint so interruption cannot leave a partial file."""
+    temporary_path = f"{path}.tmp"
+    torch.save(checkpoint, temporary_path)
+    os.replace(temporary_path, path)
+
+
 class DetectorTrainingPipeline:
     """Own the canonical train/validate/checkpoint/export workflow."""
 
@@ -2326,15 +2466,18 @@ class DetectorTrainingPipeline:
             use_azurite=os.getenv("USE_AZURITE", "true").lower() == "true",
             data_root=os.getenv("DATA_ROOT", "./data"),
             enable_quantization=os.getenv("ENABLE_QUANTIZATION", "false").lower() == "true",
-            input_size=int(os.getenv("TRAINING_INPUT_SIZE", "480")),
+            input_height=int(os.getenv("TRAINING_INPUT_HEIGHT", "360")),
+            input_width=int(os.getenv("TRAINING_INPUT_WIDTH", "640")),
             batch_size=int(os.getenv("TRAINING_BATCH_SIZE", "32")),
             num_workers=int(os.getenv("TRAINING_NUM_WORKERS", "1")),
             num_epochs=int(os.getenv("TRAINING_EPOCHS", "100")),
         )
         if config.num_epochs < 1:
             raise ValueError("TRAINING_EPOCHS must be at least 1")
-        if config.input_size < 32:
-            raise ValueError("TRAINING_INPUT_SIZE must be at least 32")
+        if config.input_height < 32 or config.input_width < 32:
+            raise ValueError("TRAINING_INPUT_HEIGHT and TRAINING_INPUT_WIDTH must be at least 32")
+        if config.input_width <= config.input_height:
+            raise ValueError("TRAINING_INPUT_WIDTH must be greater than TRAINING_INPUT_HEIGHT")
         if config.batch_size < 1:
             raise ValueError("TRAINING_BATCH_SIZE must be at least 1")
         if config.num_workers < 0:
@@ -2346,7 +2489,8 @@ class DetectorTrainingPipeline:
         if config.enable_quantization:
             raise RuntimeError(
                 "The legacy in-training QAT path is retired. Train FP32 with "
-                "ENABLE_QUANTIZATION=false, then run python -m person_detection.optimization.pipeline for manifest-driven "
+                "ENABLE_QUANTIZATION=false, then run python -m "
+                "person_detection.optimization.pipeline for manifest-driven "
                 "accuracy-controlled INT8 calibration."
             )
 
@@ -2355,7 +2499,7 @@ class DetectorTrainingPipeline:
         print("ATSS + quality-aware binary classification")
         print("=" * 60)
         print(f"Device: {config.device}")
-        print(f"Input size: {config.input_size}")
+        print(f"Input canvas: {config.input_height}x{config.input_width} (HxW)")
         print(f"Batch size: {config.batch_size}")
         print(f"Epochs: {config.num_epochs}")
         print(f"Use AMP: {config.use_amp}")
@@ -2367,67 +2511,32 @@ class DetectorTrainingPipeline:
             print(f"Local data: {config.data_root}")
         print("=" * 60)
 
-        # Initialize components
         azurite_client = AzuriteClient(config)
         exporter = OpenVINOExporter(config)
+        best_checkpoint_path = "best_model_fp32.pth"
+        last_checkpoint_path = "last_training_checkpoint.pth"
 
-        # Check if FP32 checkpoint already exists
-        checkpoint_path = 'best_model_fp32.pth'
-        skip_fp32_training = False
-        if os.path.exists(checkpoint_path):
-            existing_checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            skip_fp32_training = existing_checkpoint.get("modelFormatVersion") == MODEL_FORMAT_VERSION
-
-        if skip_fp32_training:
-            print("\n" + "=" * 60)
-            print("Found compatible FP32 checkpoint - skipping FP32 training")
-            print("=" * 60)
-
-        elif os.path.exists(checkpoint_path):
-            print("\n" + "=" * 60)
-            print("Existing checkpoint uses the legacy softmax head; retraining the quality head")
-            print("=" * 60)
-        # Create datasets
         print("\nLoading datasets...")
         train_dataset = CanonicalPersonDetectionDataset(
             azurite_client,
-            split='train',
-            input_size=config.input_size,
-            augment=True
+            split="train",
+            input_height=config.input_height,
+            input_width=config.input_width,
+            augment=True,
         )
-
         val_dataset = CanonicalPersonDetectionDataset(
             azurite_client,
-            split='val',
-            input_size=config.input_size,
-            augment=False
+            split="val",
+            input_height=config.input_height,
+            input_width=config.input_width,
+            augment=False,
         )
-
-        if skip_fp32_training:
-            checkpoint_dataset = existing_checkpoint.get("dataset")
-            expected_dataset = train_dataset.dataset_metadata
-            provenance_keys = ("versionPrefix", "manifestSha256", "schemaVersion")
-            mismatches = {
-                key: {
-                    "checkpoint": checkpoint_dataset.get(key) if isinstance(checkpoint_dataset, dict) else None,
-                    "current": expected_dataset.get(key),
-                }
-                for key in provenance_keys
-                if not isinstance(checkpoint_dataset, dict)
-                or checkpoint_dataset.get(key) != expected_dataset.get(key)
-            }
-            if mismatches:
-                skip_fp32_training = False
-                print("Existing checkpoint dataset provenance differs; retraining")
-                print(f"  Mismatches: {mismatches}")
-
-        # Validate dataset structure
         print("\nValidating dataset structure...")
         train_dataset.validate_samples(num_samples=3)
         val_dataset.validate_samples(num_samples=3)
 
-        # Create dataloaders
         train_sampler = None
+        sampling_generator = None
         if config.use_stratified_oversampling:
             sampling_weights = train_dataset.build_sampling_weights()
             sampling_generator = torch.Generator().manual_seed(config.sampling_seed)
@@ -2446,191 +2555,206 @@ class DetectorTrainingPipeline:
             sampler=train_sampler,
             num_workers=config.num_workers,
             collate_fn=collate_fn,
-            pin_memory=True if config.device == 'cuda' else False,
-            drop_last=True
+            pin_memory=config.device == "cuda",
+            drop_last=True,
         )
-
         val_loader = DataLoader(
             val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
             collate_fn=collate_fn,
-            pin_memory=True if config.device == 'cuda' else False,
+            pin_memory=config.device == "cuda",
         )
 
-        # Create model
         print("\nInitializing model...")
         model = SSDPersonDetector(
             num_classes=config.num_classes,
-            input_size=config.input_size
-        )
-        model = model.to(config.device)
-
-        # Get anchors
+            input_height=config.input_height,
+            input_width=config.input_width,
+        ).to(config.device)
         anchors = model.anchor_generator.get_anchors()
-
         model_summary(
             model,
             model_type=ModelType.SINGLE_INPUT,
-            input1_size=(config.batch_size, 3, config.input_size, config.input_size)
+            input1_size=(config.batch_size, 3, config.input_height, config.input_width),
+        )
+        criterion = SSDLoss(
+            num_classes=config.num_classes,
+            neg_pos_ratio=config.neg_pos_ratio,
+            use_focal_loss=config.use_focal_loss,
+            focal_alpha=config.focal_alpha,
+            focal_gamma=config.focal_gamma,
+            input_height=config.input_height,
+            input_width=config.input_width,
+            anchors_per_level=model.anchor_generator.num_anchors_per_level,
+            atss_topk=config.atss_topk,
+            giou_weight=config.giou_weight,
         )
 
-        # ========================================================================
-        # PHASE 1: FP32 Training (skip if checkpoint exists)
-        # ========================================================================
-        if not skip_fp32_training:
-            print("\n" + "=" * 60)
-            print("PHASE 1: FP32 Training")
-            print("=" * 60)
-
-            # Loss function
-            criterion = SSDLoss(
-                num_classes=config.num_classes,
-                neg_pos_ratio=config.neg_pos_ratio,
-                use_focal_loss=config.use_focal_loss,
-                focal_alpha=config.focal_alpha,
-                focal_gamma=config.focal_gamma,
-                input_size=config.input_size,
-                anchors_per_level=model.anchor_generator.num_anchors_per_level,
-                atss_topk=config.atss_topk,
-                giou_weight=config.giou_weight,
-            )
-
-            # Optimizer
-            if config.use_varied_lr:
-                # optimizer = optim.AdamW(
-                #     [
-                #         {'params': model.features.parameters(), 'lr': config.learning_rate * 0.1},      # Backbone frozen-ish
-                #         {'params': model.fpn.parameters(), 'lr': config.learning_rate},           # FPN
-                #         {'params': model.detection_heads.parameters(), 'lr': config.learning_rate}, # Heads
-                #     ],
-                #     weight_decay=config.weight_decay,  # AdamW handles this properly
-                #     betas=(0.9, 0.999)
-                # )
-                optimizer = optim.SGD([
-                    {'params': model.features.parameters(), 'lr': config.learning_rate * 0.1},      # Backbone frozen-ish
-                    {'params': model.fpn.parameters(), 'lr': config.learning_rate},           # FPN
-                    {'params': model.detection_heads.parameters(), 'lr': config.learning_rate}, # Heads
+        if config.use_varied_lr:
+            optimizer = optim.SGD(
+                [
+                    {"params": model.features.parameters(), "lr": config.learning_rate * 0.1},
+                    {"params": model.fpn.parameters(), "lr": config.learning_rate},
+                    {"params": model.detection_heads.parameters(), "lr": config.learning_rate},
                 ],
                 momentum=config.momentum,
-                weight_decay=config.weight_decay
+                weight_decay=config.weight_decay,
             )
+        else:
+            optimizer = optim.SGD(
+                model.parameters(),
+                lr=config.learning_rate,
+                momentum=config.momentum,
+                weight_decay=config.weight_decay,
+            )
+        warmup = WarmupScheduler(optimizer, config.warmup_epochs, config.learning_rate)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, config.num_epochs - config.warmup_epochs),
+            eta_min=config.learning_rate * 0.1,
+        )
+        scaler = GradScaler(device=config.device, enabled=config.use_amp)
+
+        start_epoch = 0
+        best_val_loss = float("inf")
+        training_complete = False
+        resume_path = next(
+            (path for path in (last_checkpoint_path, best_checkpoint_path) if os.path.exists(path)),
+            None,
+        )
+        if resume_path is not None:
+            candidate = torch.load(resume_path, map_location=config.device, weights_only=True)
+            mismatches = checkpoint_resume_mismatches(
+                candidate,
+                config,
+                train_dataset.dataset_metadata,
+                model.anchor_generator.specification(),
+            )
+            if mismatches:
+                print(f"Checkpoint {resume_path} is incompatible; starting a new run")
+                print(f"  Mismatches: {mismatches}")
             else:
-                # optimizer = optim.AdamW(
-                #     model.parameters(),
-                #     lr=config.learning_rate,  # Lower than SGD (start here)
-                #     weight_decay=config.weight_decay,  # AdamW handles this properly
-                #     betas=(0.9, 0.999)
-                # )
-                optimizer = optim.SGD(
-                    model.parameters(),
-                    lr=config.learning_rate,
-                    momentum=config.momentum,
-                    weight_decay=config.weight_decay
+                load_detector_state_dict(model, candidate["model_state_dict"])
+                optimizer.load_state_dict(candidate["optimizer_state_dict"])
+                scheduler.load_state_dict(candidate["scheduler_state_dict"])
+                scaler.load_state_dict(candidate["scaler_state_dict"])
+                start_epoch = int(candidate["completedEpochs"])
+                best_val_loss = float(candidate["best_val_loss"])
+                training_complete = bool(candidate.get("trainingComplete", False))
+                if sampling_generator is not None and candidate.get("sampler_generator_state") is not None:
+                    sampling_generator.set_state(candidate["sampler_generator_state"])
+                if candidate.get("torch_rng_state") is not None:
+                    torch.set_rng_state(candidate["torch_rng_state"].cpu())
+                if torch.cuda.is_available() and candidate.get("cuda_rng_state") is not None:
+                    torch.cuda.set_rng_state_all(candidate["cuda_rng_state"])
+                print(
+                    f"Resuming {resume_path} after epoch {start_epoch}; "
+                    f"best validation loss is {best_val_loss:.4f}"
                 )
 
-            # Schedulers
-            warmup = WarmupScheduler(optimizer, config.warmup_epochs, config.learning_rate)
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=config.num_epochs - config.warmup_epochs,
-                eta_min=config.learning_rate * 0.1
+        if training_complete and start_epoch >= config.num_epochs:
+            print(
+                f"Training is already complete ({start_epoch}/{config.num_epochs} epochs); "
+                "skipping optimization steps."
             )
-
-            # Mixed precision scaler
-            scaler = GradScaler(device=config.device)
-
-            best_val_loss = float('inf')
-
-            for epoch in range(config.num_epochs):
+        else:
+            print("\n" + "=" * 60)
+            print(f"PHASE 1: FP32 Training (epochs {start_epoch + 1}-{config.num_epochs})")
+            print("=" * 60)
+            for epoch in range(start_epoch, config.num_epochs):
                 print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
                 print("-" * 40)
-
                 is_warmup = warmup.step(epoch)
-
                 train_metrics = train_one_epoch(
                     model, train_loader, optimizer, criterion,
                     anchors, config.device, epoch, config, scaler
                 )
-
                 val_metrics = validate(
-                    model, val_loader, criterion,
-                    anchors, config.device
+                    model, val_loader, criterion, anchors, config.device
                 )
-
                 if not is_warmup:
                     scheduler.step()
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(
+                    f"\nTrain Loss: {train_metrics['loss']:.4f} | "
+                    f"Val Loss: {val_metrics['loss']:.4f} | LR: {current_lr:.6f}"
+                )
 
-                current_lr = optimizer.param_groups[0]['lr']
-                print(f"\nTrain Loss: {train_metrics['loss']:.4f} | "
-                      f"Val Loss: {val_metrics['loss']:.4f} | "
-                      f"LR: {current_lr:.6f}")
-
-                # Save best model
-                if val_metrics['loss'] < best_val_loss:
-                    best_val_loss = val_metrics['loss']
-
-                    checkpoint = {
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'best_val_loss': best_val_loss,
-                        'config': config.__dict__,
-                        'dataset': train_dataset.dataset_metadata,
-                        'modelFormatVersion': MODEL_FORMAT_VERSION,
-                        'assignment': {'name': 'ATSS', 'topKPerLevel': config.atss_topk},
-                        'classificationHead': {'name': 'binary-quality-v1', 'target': 'predictedIoU'},
-                    }
-
-                    torch.save(checkpoint, checkpoint_path)
-
+                improved = val_metrics["loss"] < best_val_loss
+                if improved:
+                    best_val_loss = val_metrics["loss"]
+                checkpoint = make_training_checkpoint(
+                    epoch=epoch,
+                    training_complete=epoch + 1 >= config.num_epochs,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    best_val_loss=best_val_loss,
+                    config=config,
+                    dataset_metadata=train_dataset.dataset_metadata,
+                    anchor_generator=model.anchor_generator,
+                    sampling_generator=sampling_generator,
+                )
+                save_training_checkpoint(checkpoint, last_checkpoint_path)
+                if config.use_azurite:
+                    azurite_client.put_object(
+                        config.azurite_model_bucket,
+                        "person_detector_ssd/last_training_checkpoint.pth",
+                        last_checkpoint_path,
+                    )
+                if improved:
+                    save_training_checkpoint(checkpoint, best_checkpoint_path)
                     if config.use_azurite:
                         azurite_client.put_object(
                             config.azurite_model_bucket,
-                            'person_detector_ssd/best_model_fp32.pth',
-                            checkpoint_path
+                            "person_detector_ssd/best_model_fp32.pth",
+                            best_checkpoint_path,
                         )
-
                     print(f"✓ Saved best FP32 model (loss: {best_val_loss:.4f})")
-
+                print(f"✓ Saved resumable epoch {epoch + 1} state")
             print("\n✓ FP32 training complete!")
 
-        # ========================================================================
-        # Load best FP32 checkpoint before export/quantization
-        # ========================================================================
         print("\n" + "=" * 60)
         print("Loading best FP32 checkpoint...")
         print("=" * 60)
+        if not os.path.exists(best_checkpoint_path):
+            raise RuntimeError("Training completed without producing a best FP32 checkpoint")
+        checkpoint = torch.load(best_checkpoint_path, map_location=config.device, weights_only=True)
+        mismatches = checkpoint_resume_mismatches(
+            checkpoint,
+            config,
+            train_dataset.dataset_metadata,
+            model.anchor_generator.specification(),
+        )
+        if mismatches:
+            raise RuntimeError(f"Best checkpoint is incompatible with this run: {mismatches}")
+        load_detector_state_dict(model, checkpoint["model_state_dict"])
+        print(
+            f"✓ Loaded checkpoint from epoch {checkpoint['epoch']} "
+            f"(val_loss: {checkpoint['best_val_loss']})"
+        )
 
-        checkpoint = torch.load(checkpoint_path, map_location=config.device)
-        load_detector_state_dict(model, checkpoint['model_state_dict'])
-
-        best_val_loss = checkpoint.get('best_val_loss', 'N/A')
-        checkpoint_epoch = checkpoint.get('epoch', 'N/A')
-        print(f"✓ Loaded checkpoint from epoch {checkpoint_epoch} (val_loss: {best_val_loss})")
-
-        # ========================================================================
-        # PHASE 2: Export FP32 to OpenVINO
-        # ========================================================================
         print("\n" + "=" * 60)
         print("PHASE 2: Export FP32 Model to OpenVINO")
         print("=" * 60)
-
         exporter.export_to_openvino(
             model,
-            'person_detector_fp32.xml',
-            input_size=config.input_size,
-            compress_to_fp16=False
+            "person_detector_fp32.xml",
+            input_height=config.input_height,
+            input_width=config.input_width,
+            compress_to_fp16=False,
         )
 
         print("\n" + "=" * 60)
         print("Training Pipeline Complete!")
         print("=" * 60)
         print("\nOutput files:")
-        print("  - best_model_fp32.pth (PyTorch FP32)")
+        print("  - last_training_checkpoint.pth (resumable training state)")
+        print("  - best_model_fp32.pth (best PyTorch FP32 weights)")
         print("  - person_detector_fp32.xml/bin (OpenVINO FP32)")
-
 
 def main() -> None:
     DetectorTrainingPipeline.from_environment().run()

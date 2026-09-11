@@ -10,19 +10,19 @@ from app.model_runtime import (
 
 def test_preprocess_uses_aspect_preserving_letterbox() -> None:
     image = np.zeros((100, 200, 3), dtype=np.uint8)
-    tensor, scale, pad_x, pad_y = preprocess(image, 480)
+    tensor, scale, pad_x, pad_y = preprocess(image, 360, 640)
 
-    assert tensor.shape == (1, 3, 480, 480)
+    assert tensor.shape == (1, 3, 360, 640)
     assert tensor.dtype == np.float32
-    assert (scale, pad_x, pad_y) == (2.4, 0, 120)
+    assert (scale, pad_x, pad_y) == (3.2, 0, 20)
 
 
 def test_maps_letterboxed_box_back_to_source_image() -> None:
     mapped = map_box_from_letterbox(
-        np.array([24, 144, 240, 336], dtype=np.float32),
-        scale=2.4,
+        np.array([32, 52, 320, 308], dtype=np.float32),
+        scale=3.2,
         pad_x=0,
-        pad_y=120,
+        pad_y=20,
         original_width=200,
         original_height=100,
     )
@@ -39,7 +39,8 @@ def test_supports_quality_logit_and_legacy_softmax_outputs() -> None:
 
 
 def test_serving_anchors_match_current_person_detector() -> None:
-    anchors = generate_anchors(480)
+    anchors = generate_anchors(360, 640)
 
-    assert anchors.shape == (29070, 4)
-    assert np.isclose(anchors[0, 2] / anchors[0, 3], 0.15)
+    assert anchors.shape == (29235, 4)
+    physical_ratio = anchors[0, 2] * 640 / (anchors[0, 3] * 360)
+    assert np.isclose(physical_ratio, 0.15)

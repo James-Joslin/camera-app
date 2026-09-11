@@ -19,7 +19,7 @@ from person_detection.training.pipeline import SSDLoss
 class CanonicalIntegrationTests(unittest.TestCase):
     def test_letterbox_preserves_aspect_ratio_and_maps_boxes(self):
         image = np.zeros((100, 200, 3), dtype=np.uint8)
-        transformed, scale, pad_x, pad_y = letterbox_image(image, 100)
+        transformed, scale, pad_x, pad_y = letterbox_image(image, 100, 100)
         self.assertEqual(transformed.shape, (100, 100, 3))
         self.assertEqual((scale, pad_x, pad_y), (0.5, 0, 25))
         self.assertEqual(map_letterbox_box([20, 10, 100, 90], scale, pad_x, pad_y),
@@ -29,7 +29,7 @@ class CanonicalIntegrationTests(unittest.TestCase):
         self.assertIsNone(clip_box_to_image([27, 54, 27, 74], 100, 80))
 
     def test_ignore_regions_neutralize_background_anchors(self):
-        loss = SSDLoss(input_size=100)
+        loss = SSDLoss(input_height=100, input_width=100)
         anchors = torch.tensor([
             [0.30, 0.30, 0.20, 0.20],
             [0.80, 0.80, 0.10, 0.10],

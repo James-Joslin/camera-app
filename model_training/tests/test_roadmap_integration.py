@@ -28,7 +28,10 @@ from person_detection.training.pipeline import (
     PersonAnchorGenerator,
     QualityFocalLoss,
     SSDLoss,
+    TrainingConfig,
+    checkpoint_resume_mismatches,
     load_detector_state_dict,
+    make_training_checkpoint,
 )
 
 
@@ -70,11 +73,11 @@ class SamplingAndSliceTests(unittest.TestCase):
     def test_production_preprocessing_returns_letterbox_geometry(self):
         image = np.zeros((100, 200, 3), dtype=np.uint8)
         tensor, scale, pad_x, pad_y = preprocess_rgb_image(
-            image, 100, add_batch=True, return_geometry=True
+            image, 90, 160, add_batch=True, return_geometry=True
         )
-        self.assertEqual(tensor.shape, (1, 3, 100, 100))
+        self.assertEqual(tensor.shape, (1, 3, 90, 160))
         self.assertEqual(tensor.dtype, np.float32)
-        self.assertEqual((scale, pad_x, pad_y), (0.5, 0, 25))
+        self.assertEqual((scale, pad_x, pad_y), (0.8, 0, 5))
         self.assertEqual(
             clip_box_to_image([-10, 20, 20, 60], 100, 80), [0.0, 20.0, 20.0, 60.0]
         )
@@ -140,13 +143,22 @@ class SamplingAndSliceTests(unittest.TestCase):
 
 class AssignmentAndHeadTests(unittest.TestCase):
     def test_person_anchors_are_tall_at_fine_levels(self):
-        generator = PersonAnchorGenerator(input_size=128)
+        generator = PersonAnchorGenerator(input_height=72, input_width=128)
         first_anchor = generator.get_anchors()[0]
-        self.assertLess(float(first_anchor[2]), float(first_anchor[3]))
+        physical_ratio = float(first_anchor[2] * 128 / (first_anchor[3] * 72))
+        self.assertAlmostEqual(physical_ratio, 0.15, places=5)
+
+    def test_rectangular_anchors_use_actual_feature_map_height_and_width(self):
+        generator = PersonAnchorGenerator(input_height=360, input_width=640)
+        self.assertEqual(
+            generator.feature_map_shapes,
+            [(45, 80), (23, 40), (12, 20), (6, 10), (3, 5)],
+        )
+        self.assertEqual(tuple(generator.get_anchors().shape), (29235, 4))
 
     def test_atss_selects_adaptive_positive_and_respects_ignore(self):
         criterion = SSDLoss(
-            input_size=100, anchors_per_level=[2, 2], atss_topk=1
+            input_height=100, input_width=100, anchors_per_level=[2, 2], atss_topk=1
         )
         anchors = torch.tensor([
             [0.50, 0.50, 0.20, 0.60],
@@ -210,10 +222,82 @@ class AssignmentAndHeadTests(unittest.TestCase):
         self.assertEqual(model.head.cls_conv.bias.tolist(), [5.0])
 
 
+class ResumeContractTests(unittest.TestCase):
+    def test_complete_resume_contract_matches_rectangular_run(self):
+        config = TrainingConfig(input_height=360, input_width=640)
+        dataset = {
+            "versionPrefix": "datasets/citypersons/v1",
+            "manifestSha256": "a" * 64,
+            "schemaVersion": 1,
+        }
+        anchors = {"featureMapShapes": [[45, 80]]}
+        checkpoint = {
+            "modelFormatVersion": 3,
+            "config": {"input_height": 360, "input_width": 640, "num_classes": 1},
+            "dataset": dataset,
+            "anchors": anchors,
+            "model_state_dict": {},
+            "optimizer_state_dict": {},
+            "scheduler_state_dict": {},
+            "scaler_state_dict": {},
+            "completedEpochs": 9,
+            "best_val_loss": 1.2,
+        }
+        self.assertEqual(
+            checkpoint_resume_mismatches(checkpoint, config, dataset, anchors), {}
+        )
+
+    def test_resume_rejects_canvas_mismatch(self):
+        config = TrainingConfig(input_height=360, input_width=640)
+        checkpoint = {
+            "modelFormatVersion": 3,
+            "config": {"input_height": 480, "input_width": 480, "num_classes": 1},
+            "dataset": {},
+            "anchors": {},
+        }
+        mismatches = checkpoint_resume_mismatches(checkpoint, config, {}, {})
+        self.assertIn("inputHeight", mismatches)
+        self.assertIn("inputWidth", mismatches)
+        self.assertIn("resumeState", mismatches)
+
+
+    def test_resumable_checkpoint_round_trips_all_training_state_weights_only(self):
+        config = TrainingConfig(input_height=72, input_width=128, device="cpu")
+        model = nn.Linear(2, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4)
+        scaler = torch.amp.GradScaler(device="cpu", enabled=False)
+        generator = PersonAnchorGenerator(input_height=72, input_width=128)
+        checkpoint = make_training_checkpoint(
+            epoch=2,
+            training_complete=False,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            best_val_loss=0.5,
+            config=config,
+            dataset_metadata={},
+            anchor_generator=generator,
+            sampling_generator=torch.Generator().manual_seed(4),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "checkpoint.pth"
+            torch.save(checkpoint, target)
+            restored = torch.load(target, map_location="cpu", weights_only=True)
+        self.assertEqual(restored["completedEpochs"], 3)
+        self.assertFalse(restored["trainingComplete"])
+        for key in (
+            "model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
+            "scaler_state_dict", "sampler_generator_state", "torch_rng_state",
+        ):
+            self.assertIn(key, restored)
+
+
 class MixedPrecisionLossTests(unittest.TestCase):
     def test_bfloat16_quality_targets_accept_float32_iou(self):
         criterion = SSDLoss(
-            input_size=100, anchors_per_level=[2, 2], atss_topk=1
+            input_height=100, input_width=100, anchors_per_level=[2, 2], atss_topk=1
         )
         anchors = torch.tensor([
             [0.50, 0.50, 0.20, 0.60],

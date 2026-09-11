@@ -2,19 +2,40 @@
 
 ## Executive recommendation
 
-The next production architecture should remain a compact convolutional one-stage detector, but it should stop spending compute on square padding, dense FPN convolutions, redundant normalization, and six-to-nine anchors per location.
+The product foundations needed before changing the network are now implemented: a fixed 360×640 H×W landscape canvas, rectangular anchors and decoding, resumable training, explicit experimental/production release states, quality floors, and a stage-by-stage latency benchmark with bounded pre-NMS candidates.
 
-The recommended progression is:
+The immediate priority is therefore to train the model-format-v3 rectangular detector long enough to establish a trustworthy experimental baseline. It does not need to reach epoch 100 before it can be evaluated or packaged as `experimental`: the run now resumes from the last completed epoch. It must not be labelled `production` until both the model and representative camera footage pass the new quality gates.
 
-1. Establish a valid, measured baseline for the current quality-aware model.
-2. Make the input canvas rectangular and configurable, starting with 640×320 for CityPersons and 640×360 for a 16:9 camera.
-3. Replace the dense top-down FPN smoothing convolutions with one lightweight depthwise-separable, weighted bidirectional feature-fusion block.
-4. Simplify and share the detection tower: one normalization/activation sequence per convolution, no default CBAM-style attention, shared tower weights across pyramid levels, and small level-specific output layers.
-5. Build an anchor-free pedestrian variant with one prediction per feature-map location, direct l/t/r/b regression, and the existing joint person/localization-quality score.
-6. Improve crowd behavior with training-only repulsion loss and a Soft-NMS experiment before adding a learned density or occlusion subnetwork.
-7. Use a larger or higher-resolution model as a training teacher; keep the deployed student compact.
+The remaining progression is:
+
+1. Train and measure the current 360×640 anchor-based control without mixing in network changes.
+2. Measure person width/height distributions, rectangular-anchor coverage, ATSS positives, and recall by size and occlusion on CityPersons and representative cameras.
+3. Validate the implemented top-1,000 pre-NMS cap and the new production-threshold latency results on that trained artifact.
+4. Decide the C# / FastAPI / OpenVINO preprocessing boundary from JPEG and raw-frame measurements; keep geometry and normalization owned by one canonical contract.
+5. Replace dense FPN smoothing with a depthwise-separable variant, then test one lightweight weighted bidirectional fusion pass.
+6. Simplify and share the detection tower before considering more attention.
+7. Build an anchor-free branch only after the anchor-based rectangular control is measured.
+8. Add crowd-aware loss/suppression and teacher distillation only when slice metrics show they are needed.
 
 A transformer or NMS-free detector is not the next move. The dataset is small, the current quality-head model has not yet produced a valid baseline checkpoint, and the existing architecture has simpler, measurable inefficiencies.
+
+## Implementation status
+
+“Implemented” below means the code path and contracts exist and have passed unit/smoke checks. It does not mean a newly trained rectangular checkpoint has already demonstrated production accuracy.
+
+| Area | Status | Current result |
+| --- | --- | --- |
+| 360×640 H×W landscape input | Implemented | Independent height/width flow through dataset loading, augmentation, calibration, export, evaluation, optimization, and FastAPI serving; non-landscape configurations fail fast. |
+| Rectangular anchors and boxes | Implemented | Anchors use actual feature-map `(height, width)`, are constructed in canvas pixel space, and normalize x/width separately from y/height. The current output has 29,235 predictions. |
+| Letterbox and inverse mapping | Implemented | Aspect ratio is preserved; boxes are transformed and mapped back per axis without square-canvas assumptions. |
+| Interrupted-run recovery | Implemented | An atomic last checkpoint stores model, optimizer, scheduler, AMP scaler, epoch/completion, best loss, sampler state, and RNG state. Only a compatible completed run is skipped. |
+| Release safety | Implemented | Releases are explicitly `experimental` or `production`; production requires minimum FP32 and INT8 metrics plus representative camera-domain acceptance. |
+| Latency benchmark | Implemented | Accuracy remains at threshold 0.01; latency defaults to 0.5 and reports JPEG decode, color conversion, letterbox/normalization, inference, box decode/filter, and NMS separately, including a raw-BGR path. |
+| NMS candidate control | Implemented | Score filtering occurs before decoding/NMS, then top 1,000 candidates are retained by default. Capped and uncapped validation are compared before release. |
+| Pedestrian/anchor ratio evidence | Pending measurement | The physical ratios are preserved on the new canvas, but CityPersons/camera distributions, coverage, ATSS-positive counts, and recall slices still need a trained v3 artifact and analysis. |
+| OpenVINO-owned preprocessing | Deferred | The current IR accepts normalized NCHW tensors. Moving layout/color/normalization into OpenVINO should follow measurement and an explicit C# payload contract. |
+| Asynchronous multi-camera inference | Out of scope | C# frame extraction/routing, OpenVINO async requests/streams, tracking, and removal of the FastAPI global serialization lock are intentionally unchanged. |
+| Neck/head/anchor-free changes | Deferred | Dense FPN smoothing, per-level towers, redundant normalization/activation, attention, and anchor multiplication remain the architecture experiments below. |
 
 ## Scope and constraints
 
@@ -22,7 +43,7 @@ This assessment assumes:
 
 - Binary person detection from fixed cameras.
 - CityPersons as the current supervised dataset: 2,975 training images and 500 validation images.
-- A 480×480 current input, CPU inference through OpenVINO, and manifest-driven INT8 calibration.
+- A 360×640 H×W current input (equivalently 640×360 W×H), CPU inference through OpenVINO, and manifest-driven INT8 calibration.
 - Small and occluded people, low false positives, and official CityPersons miss rate matter more than generic COCO AP.
 - Architecture changes must remain exportable and quantizable with ordinary convolutional operators.
 
@@ -40,18 +61,18 @@ The implementation in `person_detection/training/pipeline.py` is a 2.743-million
 | Five detection heads | 484,510 | 17.7% |
 | Total | 2,742,910 | 100% |
 
-The model taps MobileNetV3-Small at three stages, adds stride-64 and stride-128 features, applies a 128-channel top-down FPN, and predicts on five levels. At 480×480, those levels contain 4,805 spatial locations but emit 29,070 anchors:
+The model taps MobileNetV3-Small at three stages, adds stride-64 and stride-128 features, applies a 128-channel top-down FPN, and predicts on five levels. At 360×640, the actual rectangular feature maps contain 4,835 spatial locations and emit 29,235 anchors:
 
-| Level | Locations | Anchors/location | Predictions |
-| --- | ---: | ---: | ---: |
-| stride 8 | 3,600 | 6 | 21,600 |
-| stride 16 | 900 | 6 | 5,400 |
-| stride 32 | 225 | 6 | 1,350 |
-| stride 64 | 64 | 9 | 576 |
-| stride 128 | 16 | 9 | 144 |
-| Total | 4,805 | — | 29,070 |
+| Level | Feature map | Locations | Anchors/location | Predictions |
+| --- | ---: | ---: | ---: | ---: |
+| stride 8 | 45×80 | 3,600 | 6 | 21,600 |
+| stride 16 | 23×40 | 920 | 6 | 5,520 |
+| stride 32 | 12×20 | 240 | 6 | 1,440 |
+| stride 64 | 6×10 | 60 | 9 | 540 |
+| stride 128 | 3×5 | 15 | 9 | 135 |
+| Total | — | 4,835 | — | 29,235 |
 
-The current output shapes are `[B, 29070, 1]` for the joint person-quality logit and `[B, 29070, 4]` for box offsets.
+The current output shapes are `[B, 29235, 1]` for the joint person-quality logit and `[B, 29235, 4]` for box offsets.
 
 ### Strengths worth retaining
 
@@ -64,7 +85,7 @@ The current output shapes are `[B, 29070, 1]` for the joint person-quality logit
 
 ### Weaknesses visible in the code
 
-1. **The square canvas wastes spatial budget.** CityPersons frames are 2048×1024. Letterboxing them into 480×480 produces 480×240 image content plus 120 pixels of padding above and below. Half of the tensor contains no scene information, while a 50-pixel source pedestrian becomes only about 11.7 pixels tall.
+1. **The original square canvas wasted spatial budget (resolved).** CityPersons frames are 2048×1024. The former 480×480 canvas produced 480×240 content with 50% padding. The implemented 360×640 canvas produces 640×320 content with 20 pixels of padding above and below, while retaining the same 230,400-pixel tensor budget.
 
 2. **The neck is disproportionately expensive.** Five dense 3×3, 128-to-128 FPN smoothing convolutions contain 737,280 kernel weights and require about 709 million multiply-accumulates across the five maps. A depthwise 3×3 plus pointwise 1×1 replacement would use about 87,680 kernel weights and 84 million multiply-accumulates for the same maps, before normalization: roughly an 8.4× reduction for this part of the neck. Actual OpenVINO latency must still be measured because operator efficiency is hardware-specific.
 
@@ -84,33 +105,32 @@ The current output shapes are `[B, 29070, 1]` for the joint person-quality logit
 
 ## Highest-priority improvements
 
-## 1. Rectangular, deployment-shaped input
+## 1. Rectangular, deployment-shaped input — implemented
 
-Make `input_height` and `input_width` independent throughout preprocessing, anchor generation, decoding, export, calibration, and evaluation.
+The active contract is a fixed **360×640 H×W** landscape canvas across training and serving. Width is deliberately greater than height. For the current CityPersons source geometry, this retains the 640×320 image content and adds only 20 pixels of padding above and below.
 
-Two useful starting points are:
+The spatial-budget comparison that motivated the change remains useful:
 
 | Canvas | Pixels | CityPersons content | Padding | Scale from 2048×1024 |
 | --- | ---: | ---: | ---: | ---: |
-| Current 480×480 | 230,400 | 480×240 | 50.0% | 0.234× |
+| Historical 480×480 | 230,400 | 480×240 | 50.0% | 0.234× |
 | 640×320 | 204,800 | 640×320 | 0% | 0.3125× |
-| 640×360 | 230,400 | 640×320 | 11.1% | 0.3125× |
+| Implemented 640×360 | 230,400 | 640×320 | 11.1% | 0.3125× |
 | 768×384 | 294,912 | 768×384 | 0% | 0.375× |
 
-At 640×320, a 50-pixel source pedestrian becomes 15.6 pixels tall rather than 11.7 pixels, a 33% linear increase, while total input pixels fall by 11%. At 640×360, the pixel count exactly matches 480×480 and leaves room for a 16:9 production stream.
+At 640×360, a 50-pixel source pedestrian becomes about 15.6 pixels tall rather than 11.7 pixels, a 33% linear increase with the same tensor pixel count as 480×480. This is still an analytical projection, not an accuracy claim; a newly trained checkpoint must establish the gain.
 
-This is an analytical projection, not an accuracy claim. It is nevertheless the cleanest first experiment because it reallocates existing computation from padding to people. Low-resolution detection research also supports the importance of preserving spatial information and shows that multi-resolution teachers can improve low-resolution students without changing student inference cost.[^7]
+The implementation now:
 
-Implementation implications:
+- Replaces scalar `input_size` with `input_height` and `input_width` in active training, preprocessing, augmentation, calibration, export, decoding, evaluation, optimization, and serving paths.
+- Preserves aspect ratio with deterministic letterboxing and carries scale/padding metadata for source-image inverse mapping.
+- Derives anchors from the model's real per-level `(height, width)` feature tensors instead of assuming square maps.
+- Creates anchor dimensions in canvas pixel space using the square root of canvas area as the scale reference, then normalizes x/width by 640 and y/height by 360. Changing canvas shape therefore does not silently change physical width/height ratios.
+- Decodes and clips each axis using its corresponding canvas dimension.
+- Exports and validates a static OpenVINO input of `[1, 3, 360, 640]`; FastAPI reads both dimensions from the compiled model and rejects a non-landscape input.
+- Records the rectangular input and anchor specification in model-format-v3 checkpoints, optimization reports, and release metadata.
 
-- Store input shape as `(height, width)`, not one scalar.
-- Generate anchors from actual per-level `(H, W)` feature shapes.
-- Normalize x coordinates by width and y coordinates by height.
-- Export OpenVINO with the chosen fixed rectangular shape.
-- Use the production camera aspect ratio for release testing, not only the dataset ratio.
-- Keep stride 8 initially. Add a stride-4 head only if the rectangular baseline still has poor Reasonable-small miss rate; stride 4 is expensive.
-
-**Recommendation:** make 640×320 the first CityPersons experiment and 640×360 the first deployment-shaped experiment.
+The model topology itself is otherwise unchanged: stride 8 is retained, and no stride-4 head has been added. The remaining work for this item is empirical rather than structural: train v3, compare optional 320×640 only if useful, verify round-trip boxes on representative frames, and measure small/heavy-occlusion metrics.
 
 ## 2. Lightweight bidirectional neck
 
@@ -150,7 +170,7 @@ Create a separate experimental model rather than mutating the stable anchor-base
 - Four positive l/t/r/b distances from the location to box edges.
 - Optionally one training-only visibility scalar.
 
-At the current feature sizes, one prediction per location reduces candidates from 29,070 to 4,805—an 83.5% reduction. It also removes hand-designed scales and aspect ratios. FCOS established direct per-location l/t/r/b regression as a strong anchor-free design,[^9] while pedestrian-specific CSP showed that center-and-scale prediction can be both structurally simple and competitive on pedestrian benchmarks.[^10]
+At the current feature sizes, one prediction per location reduces candidates from 29,235 to 4,835—an 83.5% reduction. It also removes hand-designed scales and aspect ratios. FCOS established direct per-location l/t/r/b regression as a strong anchor-free design,[^9] while pedestrian-specific CSP showed that center-and-scale prediction can be both structurally simple and competitive on pedestrian benchmarks.[^10]
 
 Two target-assignment options are credible:
 
@@ -207,55 +227,76 @@ The head should be removed from the exported inference graph unless its output i
 
 Do not predict visible-box coordinates initially. A scalar visibility objective is simpler, handles zero visible area naturally, and is less sensitive to noisy boundary annotations.
 
-## Proposed target architecture
+## Proposed next-generation architecture — not implemented
+
+The block below is the target for later controlled experiments, not a description of the current model. Completed foundation work is labelled explicitly.
 
 ```text
 RGB frame
   ↓
-configurable rectangular letterbox (640×320 or camera-shaped 640×360)
+fixed 360×640 letterbox and normalization                  [implemented]
   ↓
-MobileNetV3-Small control backbone
+MobileNetV3-Small control backbone                         [current]
   ├── stride 8
   ├── stride 16
   └── stride 32
   ↓
-lightweight stride-64 and stride-128 blocks
+lightweight stride-64 and stride-128 blocks                [current]
   ↓
-one 96/128-channel separable weighted BiFPN pass
+one 96/128-channel separable weighted BiFPN pass           [planned]
   ↓
-shared decoupled separable towers
+shared decoupled separable towers                          [planned]
   ├── joint person × IoU score: 1 value/location
   ├── l/t/r/b box distances: 4 values/location
   └── visibility auxiliary: training only
   ↓
-decode → score floor → Soft-NMS/hard-NMS experiment → detections
+score floor → top-K → decode → Soft-NMS/hard-NMS experiment
+              [top-K implemented]       [Soft-NMS planned]
 ```
 
-This target preserves the current strengths—P2-scale detail, quality-aware ranking, ignore regions, GIoU, and INT8-friendly convolution—while removing square-padding waste, dense neck convolutions, redundant normalization, duplicated towers, and anchor multiplication.
+This target keeps the completed rectangular spatial efficiency and the current strengths—stride-8 detail, quality-aware ranking, ignore regions, GIoU, and INT8-friendly convolution—while targeting the remaining dense neck convolutions, redundant normalization, duplicated towers, and anchor multiplication.
 
 ## Experiment roadmap
 
-Never combine all changes into one training run. The current CPU training time is about 20 minutes per epoch, so poorly isolated experiments are expensive and uninterpretable.
+Do not combine model changes into one long run. The current CPU training time is about 20 minutes per epoch, and the new recovery checkpoint allows useful evidence to accumulate without restarting after an interruption.
 
-| Order | Experiment | Change from control | Primary question |
+| Order | Experiment | Status | Change from control / primary question |
 | ---: | --- | --- | --- |
-| 0 | B0 | Valid current quality-head model at 480×480 | What is the real accuracy/latency baseline? |
-| 1 | R1 | 640×320 input only | Does spatial reallocation improve small/heavy metrics without latency cost? |
-| 2 | R2 | 640×360 input only | Does the camera-shaped canvas give the best operational trade-off? |
-| 3 | N1 | Separable FPN smoothing only | How much neck latency/size can be removed safely? |
-| 4 | N2 | One separable weighted BiFPN pass | Does bidirectional fusion recover or improve accuracy? |
-| 5 | H1 | Clean shared head, no attention | Are double normalization and per-level towers unnecessary? |
-| 6 | H2 | Lightweight attention added back | Does attention provide measurable value after cleanup? |
-| 7 | C1 | Repulsion Loss | Does heavy-occlusion miss rate improve without runtime cost? |
-| 8 | C2 | Soft-NMS | Are crowded-person misses caused by suppression? |
-| 9 | A1 | Anchor-free direct regression | Can candidate count fall 83.5% without recall loss? |
-| 10 | A2 | Task-aligned assignment | Does classification/localization alignment improve ranking? |
-| 11 | D1 | High-resolution teacher distillation | Can the compact student recover localization accuracy? |
-| 12 | K1 | Backbone finalists | Which backbone wins on the actual OpenVINO CPU? |
+| 0 | B0 | Historical reference only | The 480×480 model-format-v2 report explains the previous behavior but is not the new baseline. |
+| 1 | R2 | Code complete; training pending | Train the unchanged quality-head topology at 360×640. What are its real accuracy, slice recall, and latency? |
+| 2 | V1 | Pending evidence | Measure full-body ratios, anchor coverage, ATSS positives, and recall by size/occlusion on CityPersons and camera footage. Can wide anchors be removed safely? |
+| 3 | P1 | Tooling complete; artifact run pending | Compare top-1,000 with uncapped post-processing at threshold 0.01, then benchmark at 0.5. Does the cap preserve quality and reduce NMS cost? |
+| 4 | O1 | Deferred until P1 | Benchmark JPEG and raw camera frames and choose whether C#, FastAPI, or OpenVINO owns decode, resize, layout conversion, and normalization. |
+| 5 | R1 | Optional | Compare 320×640 H×W only if exact CityPersons aspect ratio could justify another long input-shape run. |
+| 6 | N1 | Planned | Use separable FPN smoothing only. How much neck latency/size can be removed safely? |
+| 7 | N2 | Planned | Add one separable weighted BiFPN pass. Does bidirectional fusion recover or improve accuracy? |
+| 8 | H1 | Planned | Use a clean shared head without attention. Are double normalization and per-level towers unnecessary? |
+| 9 | H2 | Optional ablation | Add lightweight attention back only if H1 loses important slice accuracy. |
+| 10 | C1/C2 | Planned after error analysis | Test Repulsion Loss and then Soft-NMS when crowded-person errors justify them. |
+| 11 | A1/A2 | Next-generation branch | Replace anchors with direct l/t/r/b regression, then consider task-aligned assignment. Can candidates fall 83.5% without recall loss? |
+| 12 | D1/K1 | Later | Use teacher distillation, then compare backbone finalists on the actual OpenVINO CPU. |
 
-Use one seed for screening and at least three seeds for finalists because 2,975 training images make small metric differences noisy. Preserve the same manifest, augmentation policy, schedule, evaluation thresholds, and INT8 calibration records.
+The viable-product path is R2 → V1 → P1. It can produce an `experimental` artifact before all requested epochs finish, while preserving the ability to resume training. N1 and later network changes are not prerequisites for that artifact. A `production` release still requires the enforced model-quality and camera-domain evidence.
+
+Use one seed for screening and at least three seeds for architecture finalists because 2,975 training images make small metric differences noisy. Preserve the same manifest, augmentation policy, schedule, evaluation threshold, calibration records, and release status across comparisons.
 
 ## Acceptance gates
+
+### Automated artifact gates — implemented
+
+The optimization/release pipeline now separates technical packaging from production readiness:
+
+- Accuracy evaluation always uses the low `0.01` score threshold; the latency benchmark defaults to the production-like `0.5` threshold.
+- INT8 must remain within `0.01` absolute AP50:95 of its own FP32 source by default.
+- Top-1,000 and uncapped validation are compared at the evaluation threshold; the default maximum permitted quality drop is `0.0001`.
+- `experimental` is the default release status. It still requires successful quantization and top-K gates, but it may honestly package an incomplete or below-target model.
+- `production` requires both FP32 and INT8 to meet the configured minimums. Defaults are AP50 ≥ 0.25, AP50:95 ≥ 0.10, and recall at FPPI 0.10 ≥ 0.20.
+- `production` also requires representative camera-domain metrics that meet the same configured minimums.
+- The chosen release status, all gate evidence, input geometry, anchor specification, preprocessing contract, and artifact hashes are carried into the optimization report and publication metadata.
+
+These are safety floors, not claims that the default numbers define an ideal product. They prevent a tiny INT8-vs-FP32 drop from approving a model whose FP32 baseline is itself unusably weak.
+
+### Architecture comparison evidence
 
 Every architecture variant should report:
 
@@ -264,24 +305,27 @@ Every architecture variant should report:
 - Small, medium, large, clear, partially occluded, and heavily occluded slices.
 - Official Reasonable, Reasonable-small, heavy-occlusion, and All log-average miss rate.
 - FP32/FP16/INT8 model bytes.
-- OpenVINO core and end-to-end p50/p95 latency at fixed thread count.
-- INT8 accuracy drop against that variant’s own FP32 result.
-- Parameters, MACs, decoded candidate count, and peak preprocessing/inference memory.
+- OpenVINO core and stage-by-stage JPEG/raw-frame p50/p95 latency at fixed thread count.
+- Candidates before score filtering, after filtering, entering NMS, and retained after NMS.
+- INT8 accuracy drop against that variant's own FP32 result.
+- Parameters, MACs, and peak preprocessing/inference memory.
 
-Suggested screening rules:
+Suggested screening rules for later architecture experiments:
 
 - A simplification is successful if it reduces end-to-end p50 latency by at least 10% or model size by at least 15%, while worsening official Reasonable miss rate by no more than 0.3 percentage points and AP50:95 by no more than 0.5 points.
 - An accuracy feature is successful if it improves heavy-occlusion or Reasonable-small miss rate by at least 1 percentage point without worsening end-to-end p95 latency by more than 10%.
-- A backbone is acceptable only after successful OpenVINO FP16 and INT8 export and the existing maximum 0.01 absolute AP50:95 INT8-drop gate.
+- A backbone is acceptable only after successful OpenVINO FP16 and INT8 export and all current release gates.
 - A result that appears only at one seed should be treated as provisional.
 
-These thresholds are engineering recommendations, not published standards. They should be adjusted when an explicit camera FPS and memory budget is defined.
+The architecture thresholds are engineering recommendations rather than published standards. Adjust them once explicit single-frame latency, aggregate camera FPS, and memory budgets exist.
 
 ## Baseline warning
 
-The existing `optimized/benchmark.json` reports historical FP16 mean latency of 8.29 ms and INT8 mean latency of 4.69 ms. It should not be used as the current architecture baseline. Safe checkpoint metadata inspection shows that `best_model_fp32.pth` has no `modelFormatVersion` or dataset provenance and has 12/18 classification output channels at the five levels—the legacy two-logit softmax head. The current model would have 6/9 output channels for its one-logit head.
+The checked-in `optimized/optimization_report.json` is a historical square-canvas report. It identifies a model-format-v2 checkpoint, scalar 480 input, schema-v2 report, and a small INT8 degradation of about 0.0023 AP50:95. It predates rectangular inputs, the stage-by-stage benchmark, top-K validation, absolute quality floors, camera-domain acceptance, and release statuses. Its “accepted” result therefore does not establish that either the old FP32 model or the current architecture is production-viable.
 
-The quality-head training run failed before its first validation checkpoint was saved. Architecture decisions should therefore wait for a valid model-format-v2 checkpoint and complete accuracy-controlled optimization report.
+The active code now requires model format v3 because input geometry and anchor semantics changed. A v2 480×480 checkpoint cannot safely resume into the 360×640 model: tensor geometry, anchor metadata, and optimizer trajectory are incompatible. Begin one v3 rectangular run. After that run completes its first epoch, future interruptions can resume model, optimizer, scheduler, scaler, sampling, RNG, best-loss, and epoch state from `last_training_checkpoint.pth`.
+
+Until a v3 artifact has been trained and measured, the 29,235-prediction figures in this document describe the implemented topology, not achieved accuracy or latency.
 
 ## What not to prioritize
 
@@ -294,11 +338,11 @@ The quality-head training run failed before its first validation checkpoint was 
 
 ## Conclusion
 
-The strongest near-term architecture is not “MobileNetV3 plus more modules.” It is a spatially efficient, rectangular, lightweight pedestrian detector.
+The highest-value foundation work is complete. The repository now has one landscape 360×640 geometry contract, physically stable rectangular anchors, genuine interruption recovery, honest experimental/production release states, bounded NMS input, and a benchmark capable of showing where time is spent.
 
-The first production-minded prototype should use 640×320 or 640×360 input, MobileNetV3-Small, a single separable weighted BiFPN pass, a clean shared head, and the current ATSS plus joint quality objective. This can be implemented incrementally and benchmarked against the existing design.
+For a viable product before the full training schedule finishes, start the v3 run, let the recovery checkpoint accumulate epochs, and evaluate/package selected checkpoints as `experimental`. Use the new ratio/coverage analysis, camera-domain metrics, and stage timings to decide whether more training or a targeted change is needed. Do not represent the artifact as `production` until its FP32, INT8, and camera results pass the production gates.
 
-The next-generation branch should then replace 29,070 anchors with about 4,805 point predictions and direct l/t/r/b regression. Crowd-specific loss, Soft-NMS, and teacher distillation should be layered around that baseline only when the official small/heavy-occlusion metrics demonstrate the need.
+The first network experiment after that evidence should be separable FPN smoothing, followed by a clean shared head. The anchor-free branch can later reduce 29,235 anchor predictions to about 4,835 point predictions. OpenVINO preprocessing ownership and multi-camera asynchronous throughput remain separate deployment projects; they should not block the current model baseline or be mixed into its architecture comparison.
 
 ## Sources
 

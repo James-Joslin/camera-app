@@ -57,6 +57,11 @@ def build_release_manifest(
     accuracy_control = optimization_report.get("accuracyControl")
     if not isinstance(accuracy_control, dict) or accuracy_control.get("accepted") is not True:
         raise RuntimeError("INT8 optimization was not accepted; refusing to publish release")
+    release = optimization_report.get("release")
+    if not isinstance(release, dict) or release.get("accepted") is not True:
+        raise RuntimeError("Model release gates were not accepted; refusing to publish release")
+    if release.get("status") not in ("experimental", "production"):
+        raise RuntimeError("Optimization report has no valid release status")
 
     artifacts = []
     for path in sorted(release_dir.rglob("*")):
@@ -70,7 +75,7 @@ def build_release_manifest(
             )
 
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "releaseId": release_id,
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "storage": {
@@ -80,7 +85,10 @@ def build_release_manifest(
         "checkpoint": optimization_report.get("checkpoint"),
         "dataset": optimization_report.get("dataset"),
         "preprocessing": optimization_report.get("preprocessing"),
+        "anchors": optimization_report.get("anchors"),
         "accuracyControl": accuracy_control,
+        "topKValidation": optimization_report.get("topKValidation"),
+        "release": release,
         "artifacts": artifacts,
     }
 
@@ -105,9 +113,10 @@ def build_current_pointer(
         for precision in ("fp32", "fp16", "int8")
     }
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "model": "person_detector_ssd",
         "releaseId": manifest["releaseId"],
+        "releaseStatus": manifest["release"]["status"],
         "publishedAt": datetime.now(timezone.utc).isoformat(),
         "storage": {
             "container": container_name,

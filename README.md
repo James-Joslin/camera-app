@@ -1,5 +1,7 @@
 # Sentinel Camera Software
 
+High — multi-camera inference is not implemented yet. C# currently produces stream-copy HLS only ([StreamManager.cs (line 80)](/home/james/dockerfiles/camera-software/api/Streaming/StreamManager.cs:80)); it does not extract or forward inference frames. FastAPI runs synchronous inference behind a global lock ([model_runtime.py (line 27)](/home/james/dockerfiles/camera-software/fastapi/app/model_runtime.py:27)), so requests are serialized.
+
 A local-first multi-camera platform with a modern Next.js operations console, an ASP.NET Core control API, a dedicated FastAPI/OpenVINO inference plane, PostgreSQL, Alembic, and Azurite Blob Storage.
 
 The previous Axis camera code and the existing training assets were used as source material. The unsafe shell-built RTSP/OpenSSL flow and redundant Node streaming server were replaced; original model checkpoints and datasets remain under [`project/`](project/).

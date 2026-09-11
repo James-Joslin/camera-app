@@ -88,6 +88,7 @@ services:
       MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
       OPENVINO_DEVICE: ${OPENVINO_DEVICE:-CPU}
       OPENVINO_PERFORMANCE_HINT: ${OPENVINO_PERFORMANCE_HINT:-LATENCY}
+      MODEL_PRE_NMS_TOPK: ${MODEL_PRE_NMS_TOPK:-1000}
     depends_on:
       migrations:
         condition: service_completed_successfully
