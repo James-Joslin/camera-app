@@ -29,9 +29,10 @@ public sealed class StreamManager(
         if (camera is null) return (null, "Camera not found.");
         if (!camera.Enabled) return (null, "Camera is disabled.");
 
-        var sessionId = await sessions.StartedAsync(cameraId, userId, cancellationToken);
         var cameraDirectory = Path.Combine(streamRoot, cameraId.ToString());
         Directory.CreateDirectory(cameraDirectory);
+        ClearStaleStreamArtifacts(cameraDirectory);
+        var sessionId = await sessions.StartedAsync(cameraId, userId, cancellationToken);
         var playlist = Path.Combine(cameraDirectory, "index.m3u8");
         var process = BuildProcess(BuildRtspUrl(camera), playlist);
 
@@ -77,6 +78,23 @@ public sealed class StreamManager(
         await base.StopAsync(cancellationToken);
     }
 
+    private void ClearStaleStreamArtifacts(string cameraDirectory)
+    {
+        foreach (var file in Directory.EnumerateFiles(cameraDirectory))
+        {
+            var extension = Path.GetExtension(file);
+            if (extension is not (".m3u8" or ".ts" or ".tmp")) continue;
+            try
+            {
+                File.Delete(file);
+            }
+            catch (IOException exception)
+            {
+                logger.LogWarning(exception, "Could not remove stale stream artifact {File}", file);
+            }
+        }
+    }
+
     private static Process BuildProcess(string rtspUrl, string playlist)
     {
         var start = new ProcessStartInfo("ffmpeg")
@@ -88,10 +106,14 @@ public sealed class StreamManager(
         };
         foreach (var argument in new[]
         {
-            "-hide_banner", "-loglevel", "warning", "-rtsp_transport", "tcp", "-i", rtspUrl,
-            "-map", "0:v:0", "-an", "-c:v", "copy", "-f", "hls", "-hls_time", "2",
-            "-hls_list_size", "8", "-hls_flags", "delete_segments+append_list+omit_endlist",
-            "-hls_segment_filename", Path.Combine(Path.GetDirectoryName(playlist)!, "segment-%06d.ts"), playlist
+            "-hide_banner", "-loglevel", "warning",
+            "-fflags", "nobuffer", "-rtsp_transport", "tcp", "-reorder_queue_size", "0",
+            "-i", rtspUrl, "-map", "0:v:0", "-an", "-c:v", "copy",
+            "-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
+            "-f", "hls", "-hls_time", "1", "-hls_list_size", "4",
+            "-hls_delete_threshold", "2", "-hls_start_number_source", "epoch",
+            "-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file",
+            "-hls_segment_filename", Path.Combine(Path.GetDirectoryName(playlist)!, "segment-%010d.ts"), playlist
         }) start.ArgumentList.Add(argument);
         return new Process { StartInfo = start, EnableRaisingEvents = true };
     }

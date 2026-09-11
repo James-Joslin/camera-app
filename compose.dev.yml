@@ -126,6 +126,7 @@ services:
     environment:
       CAMERA_API_URL: http://api:8080
       INFERENCE_API_URL: http://fastapi:8000
+      NEXT_ALLOWED_DEV_ORIGINS: ${NEXT_ALLOWED_DEV_ORIGINS:-192.168.1.252}
     ports:
       - "${FRONTEND_PORT:-3101}:3000"
     volumes:

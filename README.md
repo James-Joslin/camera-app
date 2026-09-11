@@ -26,6 +26,8 @@ Open `http://localhost:3001`, the ASP.NET API at `http://localhost:5155/swagger`
 
 The development stack starts PostgreSQL, Azurite, the Alembic migration runner, the APIs, and Next.js. Start the specialized ML service separately with `docker compose --env-file .env -f compose.dev.yml --profile ml up --build ml-api` after providing `kaggle.json` if dataset downloads are needed.
 
+When opening the development UI from another device, set `NEXT_ALLOWED_DEV_ORIGINS` in `.env` to the hostname or LAN IP used in the browser (for example, `192.168.1.252`). Next.js uses this allowlist for its development HMR WebSocket; production does not expose HMR.
+
 ## Model optimization
 
 `./scripts/optimize-model.sh` is the complete post-training release workflow. It starts the Azurite and training services, creates and accuracy-checks FP32, FP16, and INT8 OpenVINO variants from `model_training/best_model_fp32.pth`, runs the full FP32 project and official CityPersons evaluation, uploads an immutable checksum-verified release to Azurite, and refreshes `model_training/optimized/` for the FastAPI service.
