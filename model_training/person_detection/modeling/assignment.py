@@ -35,11 +35,14 @@ class AnchorAssigner(ABC):
 class ATSSAnchorAssigner(AnchorAssigner):
     """Adaptive Training Sample Selection with ignore-region neutralization."""
 
-    def __init__(self, top_k: int = 9, ignore_overlap_threshold: float = 0.5):
+    def __init__(self, top_k: int = 9, ignore_overlap_threshold: float = 0.5,
+                 point_regression: bool = False):
         if top_k <= 0:
             raise ValueError("ATSS top_k must be positive")
         self.top_k = top_k
         self.ignore_overlap_threshold = ignore_overlap_threshold
+        self.point_regression = point_regression
+        self.unmatched_ground_truths = 0
 
     @staticmethod
     def anchors_overlapping_ignore(
@@ -83,6 +86,11 @@ class ATSSAnchorAssigner(AnchorAssigner):
         ignored = self.anchors_overlapping_ignore(
             anchor_boxes, ignore_boxes, self.ignore_overlap_threshold
         )
+        self.unmatched_ground_truths = 0
+        if self.point_regression and ignore_boxes.numel():
+            centers = (anchor_boxes[:, :2] + anchor_boxes[:, 2:]) / 2
+            ignored = ((centers[:, None] >= ignore_boxes[None, :, :2]).all(dim=2)
+                       & (centers[:, None] <= ignore_boxes[None, :, 2:]).all(dim=2)).any(dim=1)
         if ground_truth_boxes.numel() == 0:
             labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
             labels[ignored] = -1
@@ -123,13 +131,54 @@ class ATSSAnchorAssigner(AnchorAssigner):
 
         for gt_index in range(ground_truth_boxes.size(0)):
             if not positives[:, gt_index].any():
-                candidates = torch.where(candidate_mask[:, gt_index])[0]
+                eligible = (centers_inside[:, gt_index] if self.point_regression
+                            else candidate_mask[:, gt_index])
+                candidates = torch.where(eligible)[0]
+                if not candidates.numel():
+                    continue
                 best = candidates[ious[candidates, gt_index].argmax()]
                 positives[best, gt_index] = True
 
         positive_quality = torch.where(positives, ious, torch.full_like(ious, -1))
         best_iou, best_gt_index = positive_quality.max(dim=1)
         positive_mask = best_iou >= 0
+        if self.point_regression:
+            # Repair conflicts with an augmenting path, keeping all distance
+            # targets inside their assigned full box. Unrepresentable GTs are
+            # counted rather than silently assigned negative LTRB distances.
+            owners = torch.where(positive_mask, best_gt_index, -1).tolist()
+            counts = [0] * ground_truth_boxes.size(0)
+            for owner in owners:
+                if owner >= 0:
+                    counts[owner] += 1
+            options = {}
+
+            def claim(gt, visited):
+                if gt in visited:
+                    return False
+                visited.add(gt)
+                if gt not in options:
+                    candidates = torch.where(centers_inside[:, gt])[0]
+                    options[gt] = candidates[ious[candidates, gt].argsort(descending=True)].tolist()
+                for point in options[gt]:
+                    previous = owners[point]
+                    if previous == gt:
+                        continue
+                    if previous < 0 or counts[previous] > 1 or claim(previous, visited):
+                        owners[point] = gt
+                        counts[gt] += 1
+                        if previous >= 0:
+                            counts[previous] -= 1
+                        return True
+                return False
+
+            for gt in range(len(counts)):
+                if counts[gt] == 0:
+                    claim(gt, set())
+            owner_tensor = torch.tensor(owners, device=device, dtype=torch.long)
+            positive_mask = owner_tensor >= 0
+            best_gt_index = owner_tensor.clamp(min=0)
+            self.unmatched_ground_truths = sum(count == 0 for count in counts)
         matched_boxes = ground_truth_boxes[best_gt_index]
         matched_labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
         matched_labels[positive_mask] = ground_truth_labels[best_gt_index[positive_mask]]

@@ -1,6 +1,45 @@
 # Person detector training and release workflow
 
-This directory owns the CityPersons binary-person detector from immutable dataset ingestion through FP32 training, metric evaluation, and accuracy-controlled OpenVINO INT8 release. The exported model has one quality-aware person logit per anchor; canonical source labels remain available for sampling and metrics but are not exported as extra heads.
+This directory owns the CityPersons binary-person detector from immutable dataset ingestion through FP32 training, metric evaluation, and accuracy-controlled OpenVINO INT8 release. The exported model has one quality-aware person logit per prediction; canonical source labels remain available for sampling and metrics but are not exported as extra heads.
+
+## C + E training variant
+
+New training commands default to `TRAINING_MODEL_VARIANT=clean_ltrb` (C+E). Three variants are available:
+
+| Variant | Neck/head | Regression | Format |
+| --- | --- | --- | --- |
+| `anchor` | Original dense FPN and per-level attention heads | Multiple anchor offsets; baseline comparison | v3 |
+| `clean_anchor` | Separable FPN and clean shared towers | Original multiple anchor offsets; C ablation | v4 |
+| `clean_ltrb` | Separable FPN and clean shared towers | One direct LTRB prediction per location; C+E | v4 |
+
+C keeps 128 channels and the five existing strides (8–128). Tower convolution weights are shared across levels, with separate BatchNorm statistics per level and separate classification/regression branches. The duplicate normalization/activation and head attention are removed. Dropout remains training-only. Backbone, input, QFL-style classification, and GIoU are retained.
+
+E produces **4,835 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and FastAPI serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
+
+ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. No stride-4 level, DFL, visibility loss, repulsion, or camera adaptation is included yet.
+
+Use a **fresh run ID/directory** for C+E. Incompatible checkpoints fail without being overwritten; the previous v3 model remains evaluable. C/E cloud checkpoint uploads use variant-specific prefixes. Python `TrainingConfig()`, `SSDPersonDetector()`, and `SSDLoss()` also default to `clean_ltrb`. Existing checkpoints are loaded using their recorded variant; v3 checkpoints without a variant are still interpreted as the anchor baseline.
+
+For the existing production training workflow, from the repository root:
+
+```bash
+TRAINING_MODEL_VARIANT=clean_ltrb TRAINING_EPOCHS=20 TRAINING_RUN_ID=ce-20-01 \
+  ./scripts/run-production-training.sh
+```
+
+This workflow trains, evaluates, optimizes, and publishes an experimental release using the normal release gates. No trained C+E checkpoint is included with the code change. Compare its exact mAP metric and precision against the 0.2688 baseline at 20 epochs, and measure INT8 core latency against 14.7749 ms mean / 15.2730 ms p95 under identical runtime settings.
+
+For training/export only in the development container, use a fresh working directory:
+
+```bash
+docker compose -f docker-compose.yml -f compose.training.yml exec training mkdir -p /workspace/runs/ce-20-01
+docker compose -f docker-compose.yml -f compose.training.yml exec \
+  -w /workspace/runs/ce-20-01 -e PYTHONPATH=/workspace \
+  -e TRAINING_MODEL_VARIANT=clean_ltrb -e TRAINING_EPOCHS=20 \
+  -e ENABLE_QUANTIZATION=false training python -m person_detection.training.pipeline
+```
+
+Use `TRAINING_MODEL_VARIANT=anchor` to reproduce the baseline or `clean_anchor` to isolate C. The architecture table and detailed anchor walkthrough below describe the selectable anchor baseline.
 
 ## What is implemented
 
@@ -61,7 +100,7 @@ Abstract classes are used only where implementations are genuinely interchangeab
 
 Place new implementation code in the responsibility-specific package and invoke it with `python -m package.module`. Checkpoints, OpenVINO outputs, reports, and validation previews remain at their existing paths and are not part of the Python package.
 
-## Model architecture
+## Model architecture — anchor baseline
 
 The detector remains an SSD-style, anchor-based network with a pretrained MobileNetV3-Small backbone. The changes in this project improve the person-specific anchors, target assignment, confidence semantics, and loss; they do not replace the backbone with a larger model.
 
@@ -157,6 +196,7 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
 - `AZURITE_DATA_CONTAINER` and `AZURITE_MODEL_CONTAINER`
 - `USE_AZURITE` (`true` by default) and `DATA_ROOT` for local fallback
 - `ENABLE_QUANTIZATION`, which must remain `false`
+- `TRAINING_MODEL_VARIANT` (CLI default `clean_ltrb`; also `clean_anchor` or `anchor`)
 - `TRAINING_EPOCHS` (default `100`), `TRAINING_BATCH_SIZE` (default `32`),
   `TRAINING_NUM_WORKERS` (default `1`), `TRAINING_INPUT_HEIGHT` (default `360`),
   and `TRAINING_INPUT_WIDTH` (default `640`, which must exceed the height)

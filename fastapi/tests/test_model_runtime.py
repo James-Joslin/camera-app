@@ -44,3 +44,25 @@ def test_serving_anchors_match_current_person_detector() -> None:
     assert anchors.shape == (29235, 4)
     physical_ratio = anchors[0, 2] * 640 / (anchors[0, 3] * 360)
     assert np.isclose(physical_ratio, 0.15)
+
+
+def test_serving_accepts_named_decoded_boxes_without_anchors(tmp_path) -> None:
+    import openvino as ov
+    from openvino import opset13 as ops
+    from app.model_runtime import OpenVinoPersonDetector
+
+    image = ops.parameter([1, 3, 72, 128], np.float32)
+    # Keep an input-dependent graph while supplying known pixel box geometry.
+    zero = ops.multiply(ops.reduce_mean(image, ops.constant([0, 1, 2, 3]), False), ops.constant(0., np.float32))
+    logits = ops.add(ops.constant(np.array([[[8.]]], np.float32)), zero)
+    boxes = ops.add(ops.constant(np.array([[[16., 12., 48., 60.]]], np.float32)), zero)
+    model = ov.Model([logits, boxes], [image])
+    model.output(0).get_tensor().set_names({"person_quality_logits"})
+    model.output(1).get_tensor().set_names({"boxes_xyxy_pixels"})
+    path = tmp_path / "person.xml"
+    ov.save_model(model, path, compress_to_fp16=False)
+    runtime = OpenVinoPersonDetector(path)
+    detections, _ = runtime.predict(np.zeros((72, 128, 3), np.uint8))
+    assert runtime.anchors is None
+    assert len(detections) == 1
+    assert detections[0]["box"] == [16, 12, 48, 60]

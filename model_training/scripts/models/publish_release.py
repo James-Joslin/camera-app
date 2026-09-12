@@ -86,6 +86,8 @@ def build_release_manifest(
         "dataset": optimization_report.get("dataset"),
         "preprocessing": optimization_report.get("preprocessing"),
         "anchors": optimization_report.get("anchors"),
+        "modelVariant": optimization_report.get("modelVariant", "anchor"),
+        "boxEncoding": optimization_report.get("boxEncoding", "anchor_offsets"),
         "accuracyControl": accuracy_control,
         "topKValidation": optimization_report.get("topKValidation"),
         "release": release,

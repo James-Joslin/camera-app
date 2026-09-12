@@ -32,12 +32,14 @@ from person_detection.data.dataset import (
     size_slice,
 )
 from person_detection.core.contracts import ModelOptimizationPipeline
+from person_detection.modeling.clean_head import (
+    checkpoint_variant, mark_openvino_outputs, has_decoded_boxes,
+)
 from person_detection.evaluation.inference import MAPCalculator
 from person_detection.training.pipeline import (
     AzuriteClient,
     SSDPersonDetector,
     TrainingConfig,
-    MODEL_FORMAT_VERSION,
     load_detector_state_dict,
 )
 
@@ -152,7 +154,11 @@ def verify_checkpoint_dataset(checkpoint: dict, dataset: CanonicalPersonDetectio
 def load_checkpoint_model(
     checkpoint: dict, input_height: int, input_width: int
 ) -> SSDPersonDetector:
+    config = checkpoint.get("config", {})
+    if (config.get("input_height"), config.get("input_width")) != (input_height, input_width):
+        raise RuntimeError("Checkpoint input dimensions do not match the requested export canvas")
     model = SSDPersonDetector(
+        model_variant=checkpoint_variant(checkpoint),
         num_classes=1,
         input_height=input_height,
         input_width=input_width,
@@ -215,16 +221,19 @@ def decode_predictions(
     selected_anchors = anchors[score_indices]
 
     if len(selected_scores):
-        centers_x = selected_offsets[:, 0] * selected_anchors[:, 2] + selected_anchors[:, 0]
-        centers_y = selected_offsets[:, 1] * selected_anchors[:, 3] + selected_anchors[:, 1]
-        widths = np.exp(np.clip(selected_offsets[:, 2], -10, 10)) * selected_anchors[:, 2]
-        heights = np.exp(np.clip(selected_offsets[:, 3], -10, 10)) * selected_anchors[:, 3]
-        boxes = np.stack([
-            (centers_x - widths / 2) * input_width,
-            (centers_y - heights / 2) * input_height,
-            (centers_x + widths / 2) * input_width,
-            (centers_y + heights / 2) * input_height,
-        ], axis=1).astype(np.float32)
+        if has_decoded_boxes(compiled_model.outputs):
+            boxes = selected_offsets.astype(np.float32, copy=True)
+        else:
+            centers_x = selected_offsets[:, 0] * selected_anchors[:, 2] + selected_anchors[:, 0]
+            centers_y = selected_offsets[:, 1] * selected_anchors[:, 3] + selected_anchors[:, 1]
+            widths = np.exp(np.clip(selected_offsets[:, 2], -10, 10)) * selected_anchors[:, 2]
+            heights = np.exp(np.clip(selected_offsets[:, 3], -10, 10)) * selected_anchors[:, 3]
+            boxes = np.stack([
+                (centers_x - widths / 2) * input_width,
+                (centers_y - heights / 2) * input_height,
+                (centers_x + widths / 2) * input_width,
+                (centers_y + heights / 2) * input_height,
+            ], axis=1).astype(np.float32)
         boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, input_width)
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, input_height)
         valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
@@ -634,11 +643,7 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
 
         checkpoint_bytes = args.checkpoint.read_bytes()
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-        if checkpoint.get("modelFormatVersion") != MODEL_FORMAT_VERSION:
-            raise RuntimeError(
-                f"Checkpoint format {checkpoint.get('modelFormatVersion')} cannot be released "
-                f"with rectangular model format {MODEL_FORMAT_VERSION}; retrain or resume first"
-            )
+        checkpoint_variant(checkpoint)
         checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
         input_height = args.input_height or checkpoint_config.get("input_height", 360)
         input_width = args.input_width or checkpoint_config.get("input_width", 640)
@@ -717,6 +722,7 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
         ov_model = ov.convert_model(
             model, example_input=example, input=[1, 3, input_height, input_width]
         )
+        mark_openvino_outputs(ov_model, model.model_variant)
         fp32_path = args.output_dir / "person_detector_fp32.xml"
         fp16_path = args.output_dir / "person_detector_fp16.xml"
         int8_path = args.output_dir / "person_detector_int8.xml"
@@ -755,6 +761,7 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
             subset_size=len(calibration_records),
             fast_bias_correction=True,
         )
+        mark_openvino_outputs(quantized_model, model.model_variant)
         ov.save_model(quantized_model, int8_path, compress_to_fp16=False)
 
         variants = {}
@@ -883,6 +890,8 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
                 "inputHeight": input_height,
                 "inputWidth": input_width,
             },
+            "modelVariant": model.model_variant,
+            "boxEncoding": model.box_encoding,
             "anchors": anchor_specification,
             "accuracyControl": {
                 "metric": metric_name,

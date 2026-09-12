@@ -159,7 +159,7 @@ class AssignmentAndHeadTests(unittest.TestCase):
         self.assertEqual(tuple(generator.get_anchors().shape), (29235, 4))
 
     def test_atss_selects_adaptive_positive_and_respects_ignore(self):
-        criterion = SSDLoss(
+        criterion = SSDLoss(model_variant="anchor",
             input_height=100, input_width=100, anchors_per_level=[2, 2], atss_topk=1
         )
         anchors = torch.tensor([
@@ -226,7 +226,7 @@ class AssignmentAndHeadTests(unittest.TestCase):
 
 class ResumeContractTests(unittest.TestCase):
     def test_complete_resume_contract_matches_rectangular_run(self):
-        config = TrainingConfig(input_height=360, input_width=640)
+        config = TrainingConfig(model_variant="anchor", input_height=360, input_width=640)
         dataset = {
             "versionPrefix": "datasets/citypersons/v1",
             "manifestSha256": "a" * 64,
@@ -250,7 +250,7 @@ class ResumeContractTests(unittest.TestCase):
         )
 
     def test_resume_rejects_canvas_mismatch(self):
-        config = TrainingConfig(input_height=360, input_width=640)
+        config = TrainingConfig(model_variant="anchor", input_height=360, input_width=640)
         checkpoint = {
             "modelFormatVersion": 3,
             "config": {"input_height": 480, "input_width": 480, "num_classes": 1},
@@ -264,7 +264,7 @@ class ResumeContractTests(unittest.TestCase):
 
 
     def test_resumable_checkpoint_round_trips_all_training_state_weights_only(self):
-        config = TrainingConfig(input_height=72, input_width=128, device="cpu")
+        config = TrainingConfig(model_variant="anchor", input_height=72, input_width=128, device="cpu")
         model = nn.Linear(2, 1)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4)
@@ -299,7 +299,7 @@ class ResumeContractTests(unittest.TestCase):
 
 class TrainingMetricTests(unittest.TestCase):
     def test_validation_batch_produces_perfect_rectangular_canvas_ap(self):
-        config = TrainingConfig(
+        config = TrainingConfig(model_variant="anchor",
             input_height=100,
             input_width=200,
             validation_ap_score_threshold=0.01,
@@ -380,7 +380,7 @@ class TrainingMetricTests(unittest.TestCase):
 
 class MixedPrecisionLossTests(unittest.TestCase):
     def test_bfloat16_quality_targets_accept_float32_iou(self):
-        criterion = SSDLoss(
+        criterion = SSDLoss(model_variant="anchor",
             input_height=100, input_width=100, anchors_per_level=[2, 2], atss_topk=1
         )
         anchors = torch.tensor([

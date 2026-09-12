@@ -30,3 +30,6 @@ model_training/old/*
 /model_training/.citypersons-official/
 /model_training/releases/
 /model_training/release_evaluations/
+
+/model_training/ARCHITECTURE_IMPROVEMENTS.md
+/model_training/ENHANCEMENT_RESEARCH.md

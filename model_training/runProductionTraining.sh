@@ -42,6 +42,7 @@ One-shot production job:
   5. Publish a checksum-verified immutable model release and current pointer.
 
 Configuration is supplied through environment variables. Common settings:
+  TRAINING_MODEL_VARIANT      clean_ltrb (C+E, default), clean_anchor, or anchor
   TRAINING_EPOCHS             Training epochs (default: 100)
   TRAINING_BATCH_SIZE         Batch size (default: 32)
   TRAINING_NUM_WORKERS        DataLoader workers (default: 1)

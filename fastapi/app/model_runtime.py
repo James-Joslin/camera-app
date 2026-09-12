@@ -24,7 +24,12 @@ class OpenVinoPersonDetector:
         self.input_width = int(self.input.shape[-1])
         if self.input_width <= self.input_height:
             raise ValueError("Person detector model must use a landscape input canvas")
-        self.anchors = generate_anchors(self.input_height, self.input_width)
+        self.decoded_boxes = any("boxes_xyxy_pixels" in output.get_names() for output in self.outputs)
+        if self.decoded_boxes:
+            # Decoded output needs no external anchor/grid reconstruction.
+            self.anchors = None
+        else:
+            self.anchors = generate_anchors(self.input_height, self.input_width)
         self.pre_nms_topk = int(os.getenv("MODEL_PRE_NMS_TOPK", "1000"))
         if self.pre_nms_topk < 1:
             raise ValueError("MODEL_PRE_NMS_TOPK must be at least 1")
@@ -54,7 +59,7 @@ class OpenVinoPersonDetector:
         classes = class_candidates[0][0]
         offsets = box_candidates[0][0]
         scores = classification_scores(classes)
-        if len(offsets) != len(self.anchors):
+        if not self.decoded_boxes and len(offsets) != len(self.anchors):
             raise RuntimeError(
                 f"Detector produced {len(offsets)} boxes for {len(self.anchors)} anchors"
             )
@@ -65,12 +70,19 @@ class OpenVinoPersonDetector:
             local_top = np.argpartition(scores[selected], -self.pre_nms_topk)[-self.pre_nms_topk:]
             selected = selected[local_top]
         scores = scores[selected]
-        boxes = decode_boxes(
-            offsets[selected],
-            self.anchors[selected],
-            self.input_height,
-            self.input_width,
-        )
+        if self.decoded_boxes:
+            boxes = offsets[selected].astype(np.float32, copy=True)
+            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, self.input_width)
+            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, self.input_height)
+        else:
+            boxes = decode_boxes(
+                offsets[selected],
+                self.anchors[selected],
+                self.input_height,
+                self.input_width,
+            )
+        valid = np.isfinite(boxes).all(axis=1) & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+        boxes, scores = boxes[valid], scores[valid]
         keep = nms(boxes, scores, nms_threshold)[:100]
         detections = []
         for index in keep:

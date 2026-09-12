@@ -29,7 +29,7 @@ class CanonicalIntegrationTests(unittest.TestCase):
         self.assertIsNone(clip_box_to_image([27, 54, 27, 74], 100, 80))
 
     def test_ignore_regions_neutralize_background_anchors(self):
-        loss = SSDLoss(input_height=100, input_width=100)
+        loss = SSDLoss(model_variant="anchor", input_height=100, input_width=100)
         anchors = torch.tensor([
             [0.30, 0.30, 0.20, 0.20],
             [0.80, 0.80, 0.10, 0.10],

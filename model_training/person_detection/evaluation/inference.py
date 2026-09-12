@@ -43,6 +43,9 @@ from person_detection.evaluation.metrics import (
     compute_iou_matrix,
 )
 from person_detection.core.contracts import DetectionBackend
+from person_detection.modeling.clean_head import (
+    DEFAULT_MODEL_VARIANT, PointReferenceGenerator, has_decoded_boxes, model_format, box_encoding,
+)
 
 # Try to import from main training script
 try:
@@ -270,6 +273,7 @@ class DetectionPredictor(DetectionBackend):
 
     def __init__(self, model: nn.Module, anchors: torch.Tensor, config: InferenceConfig):
         self.model = model
+        self.box_encoding = getattr(model, "box_encoding", "anchor_offsets")
         self.anchors = anchors
         self.config = config
         self.device = config.device
@@ -298,6 +302,8 @@ class DetectionPredictor(DetectionBackend):
         self, pred_boxes: torch.Tensor, anchors: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Decode predicted box offsets to absolute coordinates"""
+        if self.box_encoding == "xyxy_pixels":
+            return pred_boxes.clone()
         anchors = self.anchors if anchors is None else anchors
         anchor_cx = anchors[:, 0]
         anchor_cy = anchors[:, 1]
@@ -418,6 +424,17 @@ class OpenVINOPredictor(DetectionBackend):
             output for output in self.output_layers if int(output.shape[-1]) == 4
         )
 
+        self.box_encoding = "xyxy_pixels" if has_decoded_boxes(self.output_layers) else "anchor_offsets"
+        if self.box_encoding == "xyxy_pixels":
+            shapes = [((config.input_height + stride - 1) // stride,
+                       (config.input_width + stride - 1) // stride)
+                      for stride in (8, 16, 32, 64, 128)]
+            self.anchors = PointReferenceGenerator(
+                config.input_height, config.input_width, shapes
+            ).get_anchors().numpy()
+        if int(self.box_output.shape[1]) != len(self.anchors):
+            raise ValueError("OpenVINO output count does not match its prediction contract")
+
         print("✓ OpenVINO model loaded")
         print(f"  Input shape: {self.input_layer.shape}")
         print(f"  Outputs: {len(self.output_layers)}")
@@ -438,6 +455,8 @@ class OpenVINOPredictor(DetectionBackend):
         self, pred_boxes: np.ndarray, anchors: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """Decode predicted box offsets to absolute coordinates"""
+        if self.box_encoding == "xyxy_pixels":
+            return pred_boxes.copy()
         anchors = self.anchors if anchors is None else anchors
         anchor_cx = anchors[:, 0]
         anchor_cy = anchors[:, 1]
@@ -766,7 +785,8 @@ def validate_checkpoint_contract(
 ) -> None:
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
         raise RuntimeError("Checkpoint lacks the rectangular model contract")
-    if checkpoint.get("modelFormatVersion") != MODEL_FORMAT_VERSION:
+    variant = checkpoint.get("config", {}).get("model_variant", "anchor")
+    if checkpoint.get("modelFormatVersion") != model_format(variant):
         raise RuntimeError(
             f"Checkpoint format {checkpoint.get('modelFormatVersion')} is incompatible with "
             f"rectangular model format {MODEL_FORMAT_VERSION}"
@@ -781,6 +801,10 @@ def validate_checkpoint_contract(
         raise RuntimeError(
             f"Checkpoint input contract {actual} does not match requested {expected}"
         )
+    if variant != model.model_variant:
+        raise RuntimeError("Checkpoint model variant does not match the evaluation model")
+    if checkpoint.get("boxEncoding", "anchor_offsets") != box_encoding(variant):
+        raise RuntimeError("Checkpoint box encoding does not match its model variant")
     if checkpoint.get("anchors") != model.anchor_generator.specification():
         raise RuntimeError("Checkpoint anchors do not match the evaluation model")
 
@@ -799,7 +823,13 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
     if not IMPORTS_AVAILABLE:
         raise ImportError("Cannot import from ssd_person_detection.py")
 
+    checkpoint = None
+    if model_type != 'openvino' and os.path.exists(config.model_path):
+        checkpoint = torch.load(config.model_path, map_location='cpu', weights_only=True)
+    variant = (checkpoint.get("config", {}).get("model_variant", "anchor") if checkpoint
+               else ("anchor" if model_type == "openvino" else DEFAULT_MODEL_VARIANT))
     base_model = SSDPersonDetector(
+        model_variant=variant,
         num_classes=config.num_classes,
         pretrained=False,
         input_height=config.input_height,
@@ -812,7 +842,7 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
             raise RuntimeError("OpenVINO not installed. Install with: pip install openvino")
 
         predictor = OpenVINOPredictor(config.model_path, anchors, config)
-        return predictor, anchors, 'openvino'
+        return predictor, torch.from_numpy(predictor.anchors), 'openvino'
 
     elif model_type == 'nncf':
         if not HAS_NNCF:
@@ -821,7 +851,7 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
                 print(f"  NNCF not installed, but found OpenVINO model at: {openvino_path}")
                 print("  Using OpenVINO for INT8 inference instead.")
                 predictor = OpenVINOPredictor(openvino_path, anchors, config)
-                return predictor, anchors, 'openvino'
+                return predictor, torch.from_numpy(predictor.anchors), 'openvino'
             else:
                 raise RuntimeError(
                     "NNCF not installed and no OpenVINO IR found.\n"

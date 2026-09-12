@@ -10,6 +10,7 @@ services:
     working_dir: /workspace
     shm_size: 16g
     environment:
+      TRAINING_MODEL_VARIANT: ${TRAINING_MODEL_VARIANT:-clean_ltrb}
       AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
       AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
       AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
