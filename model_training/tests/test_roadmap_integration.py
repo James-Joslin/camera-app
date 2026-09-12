@@ -29,8 +29,10 @@ from person_detection.training.pipeline import (
     QualityFocalLoss,
     SSDLoss,
     TrainingConfig,
+    add_validation_map_batch,
     checkpoint_resume_mismatches,
     load_detector_state_dict,
+    log_epoch_to_tensorboard,
     make_training_checkpoint,
 )
 
@@ -290,8 +292,90 @@ class ResumeContractTests(unittest.TestCase):
         for key in (
             "model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
             "scaler_state_dict", "sampler_generator_state", "torch_rng_state",
+            "best_val_map_50_95", "last_validation_metrics",
         ):
             self.assertIn(key, restored)
+
+
+class TrainingMetricTests(unittest.TestCase):
+    def test_validation_batch_produces_perfect_rectangular_canvas_ap(self):
+        config = TrainingConfig(
+            input_height=100,
+            input_width=200,
+            validation_ap_score_threshold=0.01,
+            validation_ap_nms_threshold=0.5,
+            validation_ap_pre_nms_topk=1000,
+            validation_ap_max_detections=100,
+        )
+        calculator = MAPCalculator(
+            [0.5 + index * 0.05 for index in range(10)],
+            recall_fppi=0.1,
+        )
+        anchors = torch.tensor([[0.5, 0.5, 0.1, 0.4]])
+        add_validation_map_batch(
+            calculator,
+            torch.tensor([[[10.0]]]),
+            torch.zeros((1, 1, 4)),
+            [{
+                "boxes": torch.tensor([[90.0, 30.0, 110.0, 70.0]]),
+                "labels": torch.tensor([1]),
+                "ignore_regions": torch.empty((0, 4)),
+                "image_id": 7,
+            }],
+            anchors,
+            config,
+        )
+        metrics = calculator.compute_map(verbose=False)
+        self.assertAlmostEqual(metrics["mAP@0.50"], 1.0)
+        self.assertAlmostEqual(metrics["mAP@0.50:0.95"], 1.0)
+        self.assertAlmostEqual(metrics["Recall@FPPI=0.10"], 1.0)
+
+    def test_tensorboard_logger_uses_stable_metric_names(self):
+        class FakeWriter:
+            def __init__(self):
+                self.scalars = []
+                self.flush_count = 0
+
+            def add_scalar(self, tag, value, step):
+                self.scalars.append((tag, value, step))
+
+            def flush(self):
+                self.flush_count += 1
+
+        writer = FakeWriter()
+        log_epoch_to_tensorboard(
+            writer,
+            5,
+            {
+                "loss": 1.2,
+                "cls_loss": 0.2,
+                "loc_loss": 1.0,
+                "duration_seconds": 12.5,
+            },
+            {
+                "loss": 1.1,
+                "mAP@0.50": 0.4,
+                "mAP@0.50:0.95": 0.2,
+                "Recall@FPPI=0.10": 0.3,
+            },
+            0.0005,
+        )
+        tags = {tag for tag, _, step in writer.scalars if step == 5}
+        self.assertEqual(
+            tags,
+            {
+                "Loss/train",
+                "Loss/validation",
+                "Loss/classification",
+                "Loss/localization",
+                "Optimization/learning_rate",
+                "Timing/train_epoch_seconds",
+                "Metrics/validation_mAP_50",
+                "Metrics/validation_mAP_50_95",
+                "Metrics/validation_recall_fppi_0_10",
+            },
+        )
+        self.assertEqual(writer.flush_count, 1)
 
 
 class MixedPrecisionLossTests(unittest.TestCase):

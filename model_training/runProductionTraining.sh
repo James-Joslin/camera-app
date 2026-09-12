@@ -48,6 +48,10 @@ Configuration is supplied through environment variables. Common settings:
   TRAINING_INPUT_HEIGHT       Model canvas height (default: 360)
   TRAINING_INPUT_WIDTH        Model canvas width (default: 640)
   TRAINING_RUN_ID             Persistent run directory name; reuse it to resume
+  TRAINING_AP_EVERY_N_EPOCHS   Validation AP cadence; 0 disables it (default: 5)
+  TRAINING_AP_SCORE_THRESHOLD  Low score floor used to build PR curves (default: 0.01)
+  TRAINING_TENSORBOARD_ENABLED Write TensorBoard events (default: true)
+  TRAINING_TENSORBOARD_LOG_DIR Run-relative event directory (default: tensorboard)
   MODEL_RELEASE_ID            Immutable model release ID
   CALIBRATION_SAMPLES         INT8 calibration records (default: 300)
   VALIDATION_SAMPLES          Optimization validation records (default: 500)

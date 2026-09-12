@@ -14,8 +14,9 @@ COMPOSE=(
 
 "${COMPOSE[@]}" up -d --wait azurite
 "${COMPOSE[@]}" build training-job
-"${COMPOSE[@]}" up -d --no-deps --force-recreate training-job
+"${COMPOSE[@]}" up -d --no-deps --force-recreate training-job training-tensorboard
 
 echo "Production training started in the background."
+echo "TensorBoard: http://${TENSORBOARD_BIND_ADDRESS:-127.0.0.1}:${TENSORBOARD_HOST_PORT:-6006}"
 echo "Status: docker compose -f docker-compose.yml -f compose.training.yml -f compose.training.prod.yml ps -a training-job"
 echo "Logs:   docker compose -f docker-compose.yml -f compose.training.yml -f compose.training.prod.yml logs -f training-job"

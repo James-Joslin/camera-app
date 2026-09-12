@@ -17,10 +17,12 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
-from torchvision.ops import box_iou
+from torchvision.ops import box_iou, nms
 import cv2
 import numpy as np
+import json
 import os
 import time
 import warnings
@@ -39,6 +41,7 @@ from person_detection.data.layout import (
 )
 from person_detection.data.dataset import CanonicalPersonDetectionDataset
 from person_detection.modeling.assignment import ATSSAnchorAssigner
+from person_detection.evaluation.metrics import MAPCalculator
 
 # Optional imports with fallbacks
 try:
@@ -102,6 +105,16 @@ class TrainingConfig:
     use_amp: bool = True  # Mixed precision training
     gradient_clip: float = 10.0
     warmup_epochs: int = 3
+
+    # Periodic validation metrics and visual logging
+    validation_ap_every_n_epochs: int = 5
+    validation_ap_score_threshold: float = 0.01
+    validation_ap_nms_threshold: float = 0.5
+    validation_ap_pre_nms_topk: int = 1000
+    validation_ap_max_detections: int = 100
+    validation_recall_fppi: float = 0.1
+    tensorboard_enabled: bool = True
+    tensorboard_log_dir: str = 'tensorboard'
 
     # Legacy in-training QAT; release INT8 artifacts are built by the optimization pipeline.
     enable_quantization: bool = False
@@ -2326,31 +2339,104 @@ def train_one_epoch(
     return {
         'loss': loss_meter.avg,
         'cls_loss': cls_meter.avg,
-        'loc_loss': loc_meter.avg
+        'loc_loss': loc_meter.avg,
+        'duration_seconds': elapsed,
     }
+
+def add_validation_map_batch(
+    calculator: MAPCalculator,
+    pred_cls: torch.Tensor,
+    pred_boxes: torch.Tensor,
+    targets: List[Dict],
+    anchors: torch.Tensor,
+    config: TrainingConfig,
+) -> None:
+    """Accumulate one validation batch using the release evaluator's semantics."""
+    anchors = anchors.to(pred_boxes.device)
+    for batch_index, target in enumerate(targets):
+        scores = person_scores_from_logits(pred_cls[batch_index])
+        selected = torch.where(scores >= config.validation_ap_score_threshold)[0]
+        if len(selected) > config.validation_ap_pre_nms_topk:
+            selected = selected[
+                scores[selected].topk(config.validation_ap_pre_nms_topk).indices
+            ]
+
+        detections = []
+        if len(selected) > 0:
+            selected_scores = scores[selected]
+            boxes = decode_boxes(
+                pred_boxes[batch_index, selected],
+                anchors[selected],
+                config.input_height,
+                config.input_width,
+            )
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, config.input_width)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, config.input_height)
+            keep = nms(boxes, selected_scores, config.validation_ap_nms_threshold)
+            keep = keep[:config.validation_ap_max_detections]
+            for box, score in zip(boxes[keep], selected_scores[keep]):
+                detections.append({
+                    "class": 1,
+                    "score": float(score.detach().cpu()),
+                    "box": box.detach().cpu().tolist(),
+                })
+
+        image_id = int(target["image_id"])
+        calculator.add_predictions(image_id, detections)
+        calculator.add_ground_truths(
+            image_id,
+            target["boxes"].detach().cpu().tolist(),
+            target["labels"].detach().cpu().tolist(),
+        )
+        ignore_regions = target.get("ignore_regions")
+        if ignore_regions is not None:
+            calculator.add_ignore_regions(
+                image_id, ignore_regions.detach().cpu().tolist()
+            )
+
 
 def validate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: SSDLoss,
     anchors: torch.Tensor,
-    device: str
+    device: str,
+    *,
+    compute_ap: bool = False,
+    config: Optional[TrainingConfig] = None,
 ) -> Dict:
-    """Validation pass"""
+    """Validate loss and optionally calculate dataset-level AP in the same pass."""
+    if compute_ap and config is None:
+        raise ValueError("TrainingConfig is required when validation AP is enabled")
     model.eval()
-
     loss_meter = AverageMeter('Loss')
+    calculator = (
+        MAPCalculator(
+            [0.5 + index * 0.05 for index in range(10)],
+            recall_fppi=config.validation_recall_fppi,
+        )
+        if compute_ap else None
+    )
 
     with torch.no_grad():
         for images, targets in dataloader:
             images = images.to(device)
-
             pred_cls, pred_boxes = model(images)
             loss, _ = criterion(pred_cls, pred_boxes, targets, anchors)
-
             loss_meter.update(loss.item())
+            if calculator is not None:
+                add_validation_map_batch(
+                    calculator, pred_cls, pred_boxes, targets, anchors, config
+                )
 
-    return {'loss': loss_meter.avg}
+    results = {'loss': loss_meter.avg}
+    if calculator is not None:
+        results.update(calculator.compute_map(verbose=False))
+        results.update({
+            f"metric_{key}": value
+            for key, value in calculator.get_summary().items()
+        })
+    return results
 
 # ============================================================================
 # MAIN TRAINING PIPELINE
@@ -2417,6 +2503,8 @@ def make_training_checkpoint(
     dataset_metadata: Dict,
     anchor_generator: PersonAnchorGenerator,
     sampling_generator: Optional[torch.Generator],
+    best_val_map: float = -1.0,
+    last_validation_metrics: Optional[Dict] = None,
 ) -> Dict:
     return {
         "epoch": epoch,
@@ -2432,6 +2520,8 @@ def make_training_checkpoint(
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "best_val_loss": best_val_loss,
+        "best_val_map_50_95": best_val_map,
+        "last_validation_metrics": dict(last_validation_metrics or {}),
         "config": config.__dict__,
         "dataset": dataset_metadata,
         "modelFormatVersion": MODEL_FORMAT_VERSION,
@@ -2446,6 +2536,33 @@ def save_training_checkpoint(checkpoint: Dict, path: str) -> None:
     temporary_path = f"{path}.tmp"
     torch.save(checkpoint, temporary_path)
     os.replace(temporary_path, path)
+
+
+def log_epoch_to_tensorboard(
+    writer: SummaryWriter,
+    epoch_number: int,
+    train_metrics: Dict,
+    val_metrics: Dict,
+    learning_rate: float,
+) -> None:
+    """Write stable scalar names so resumed and compared runs share one dashboard."""
+    writer.add_scalar("Loss/train", train_metrics["loss"], epoch_number)
+    writer.add_scalar("Loss/validation", val_metrics["loss"], epoch_number)
+    writer.add_scalar("Loss/classification", train_metrics["cls_loss"], epoch_number)
+    writer.add_scalar("Loss/localization", train_metrics["loc_loss"], epoch_number)
+    writer.add_scalar("Optimization/learning_rate", learning_rate, epoch_number)
+    writer.add_scalar(
+        "Timing/train_epoch_seconds", train_metrics["duration_seconds"], epoch_number
+    )
+    metric_tags = {
+        "mAP@0.50": "Metrics/validation_mAP_50",
+        "mAP@0.50:0.95": "Metrics/validation_mAP_50_95",
+        "Recall@FPPI=0.10": "Metrics/validation_recall_fppi_0_10",
+    }
+    for metric_name, tag in metric_tags.items():
+        if metric_name in val_metrics:
+            writer.add_scalar(tag, val_metrics[metric_name], epoch_number)
+    writer.flush()
 
 
 class DetectorTrainingPipeline:
@@ -2471,6 +2588,30 @@ class DetectorTrainingPipeline:
             batch_size=int(os.getenv("TRAINING_BATCH_SIZE", "32")),
             num_workers=int(os.getenv("TRAINING_NUM_WORKERS", "1")),
             num_epochs=int(os.getenv("TRAINING_EPOCHS", "100")),
+            validation_ap_every_n_epochs=int(
+                os.getenv("TRAINING_AP_EVERY_N_EPOCHS", "5")
+            ),
+            validation_ap_score_threshold=float(
+                os.getenv("TRAINING_AP_SCORE_THRESHOLD", "0.01")
+            ),
+            validation_ap_nms_threshold=float(
+                os.getenv("TRAINING_AP_NMS_THRESHOLD", "0.5")
+            ),
+            validation_ap_pre_nms_topk=int(
+                os.getenv("TRAINING_AP_PRE_NMS_TOPK", "1000")
+            ),
+            validation_ap_max_detections=int(
+                os.getenv("TRAINING_AP_MAX_DETECTIONS", "100")
+            ),
+            validation_recall_fppi=float(
+                os.getenv("TRAINING_RECALL_FPPI", "0.1")
+            ),
+            tensorboard_enabled=os.getenv(
+                "TRAINING_TENSORBOARD_ENABLED", "true"
+            ).lower() == "true",
+            tensorboard_log_dir=os.getenv(
+                "TRAINING_TENSORBOARD_LOG_DIR", "tensorboard"
+            ),
         )
         if config.num_epochs < 1:
             raise ValueError("TRAINING_EPOCHS must be at least 1")
@@ -2482,6 +2623,21 @@ class DetectorTrainingPipeline:
             raise ValueError("TRAINING_BATCH_SIZE must be at least 1")
         if config.num_workers < 0:
             raise ValueError("TRAINING_NUM_WORKERS cannot be negative")
+        if config.validation_ap_every_n_epochs < 0:
+            raise ValueError("TRAINING_AP_EVERY_N_EPOCHS cannot be negative")
+        if config.validation_ap_pre_nms_topk < 1:
+            raise ValueError("TRAINING_AP_PRE_NMS_TOPK must be at least 1")
+        if config.validation_ap_max_detections < 1:
+            raise ValueError("TRAINING_AP_MAX_DETECTIONS must be at least 1")
+        for name, value in (
+            ("TRAINING_AP_SCORE_THRESHOLD", config.validation_ap_score_threshold),
+            ("TRAINING_AP_NMS_THRESHOLD", config.validation_ap_nms_threshold),
+            ("TRAINING_RECALL_FPPI", config.validation_recall_fppi),
+        ):
+            if not 0 < value <= 1:
+                raise ValueError(f"{name} must be in (0, 1]")
+        if not config.tensorboard_log_dir.strip():
+            raise ValueError("TRAINING_TENSORBOARD_LOG_DIR cannot be empty")
         return cls(config)
 
     def run(self) -> None:
@@ -2502,6 +2658,17 @@ class DetectorTrainingPipeline:
         print(f"Input canvas: {config.input_height}x{config.input_width} (HxW)")
         print(f"Batch size: {config.batch_size}")
         print(f"Epochs: {config.num_epochs}")
+        print(
+            "Validation AP: "
+            + (
+                f"every {config.validation_ap_every_n_epochs} epoch(s)"
+                if config.validation_ap_every_n_epochs > 0 else "disabled"
+            )
+        )
+        print(
+            f"TensorBoard: {config.tensorboard_log_dir}"
+            if config.tensorboard_enabled else "TensorBoard: disabled"
+        )
         print(f"Use AMP: {config.use_amp}")
         print(f"Use Focal Loss: {config.use_focal_loss}")
         print(f"Enable Quantization: {config.enable_quantization}")
@@ -2514,6 +2681,7 @@ class DetectorTrainingPipeline:
         azurite_client = AzuriteClient(config)
         exporter = OpenVINOExporter(config)
         best_checkpoint_path = "best_model_fp32.pth"
+        best_ap_checkpoint_path = "best_model_ap.pth"
         last_checkpoint_path = "last_training_checkpoint.pth"
 
         print("\nLoading datasets...")
@@ -2619,6 +2787,7 @@ class DetectorTrainingPipeline:
 
         start_epoch = 0
         best_val_loss = float("inf")
+        best_val_map = -1.0
         training_complete = False
         resume_path = next(
             (path for path in (last_checkpoint_path, best_checkpoint_path) if os.path.exists(path)),
@@ -2642,6 +2811,7 @@ class DetectorTrainingPipeline:
                 scaler.load_state_dict(candidate["scaler_state_dict"])
                 start_epoch = int(candidate["completedEpochs"])
                 best_val_loss = float(candidate["best_val_loss"])
+                best_val_map = float(candidate.get("best_val_map_50_95", -1.0))
                 training_complete = bool(candidate.get("trainingComplete", False))
                 if sampling_generator is not None and candidate.get("sampler_generator_state") is not None:
                     sampling_generator.set_state(candidate["sampler_generator_state"])
@@ -2651,8 +2821,24 @@ class DetectorTrainingPipeline:
                     torch.cuda.set_rng_state_all(candidate["cuda_rng_state"])
                 print(
                     f"Resuming {resume_path} after epoch {start_epoch}; "
-                    f"best validation loss is {best_val_loss:.4f}"
+                    f"best validation loss is {best_val_loss:.4f}; "
+                    f"best validation AP50:95 is {best_val_map:.4f}"
                 )
+
+        writer = None
+        if config.tensorboard_enabled:
+            tensorboard_path = Path(config.tensorboard_log_dir)
+            tensorboard_path.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(
+                log_dir=str(tensorboard_path),
+                purge_step=start_epoch + 1 if start_epoch > 0 else None,
+            )
+            writer.add_text(
+                "run/config",
+                "```json\n" + json.dumps(config.__dict__, indent=2, default=str) + "\n```",
+                start_epoch,
+            )
+            writer.flush()
 
         if training_complete and start_epoch >= config.num_epochs:
             print(
@@ -2671,20 +2857,54 @@ class DetectorTrainingPipeline:
                     model, train_loader, optimizer, criterion,
                     anchors, config.device, epoch, config, scaler
                 )
+                compute_ap = (
+                    config.validation_ap_every_n_epochs > 0
+                    and (
+                        (epoch + 1) % config.validation_ap_every_n_epochs == 0
+                        or epoch + 1 == config.num_epochs
+                    )
+                )
+                if compute_ap:
+                    print(
+                        "Calculating validation AP at score threshold "
+                        f"{config.validation_ap_score_threshold:.3f}..."
+                    )
                 val_metrics = validate(
-                    model, val_loader, criterion, anchors, config.device
+                    model,
+                    val_loader,
+                    criterion,
+                    anchors,
+                    config.device,
+                    compute_ap=compute_ap,
+                    config=config,
                 )
                 if not is_warmup:
                     scheduler.step()
                 current_lr = optimizer.param_groups[0]["lr"]
-                print(
+                summary = (
                     f"\nTrain Loss: {train_metrics['loss']:.4f} | "
                     f"Val Loss: {val_metrics['loss']:.4f} | LR: {current_lr:.6f}"
                 )
+                if compute_ap:
+                    summary += (
+                        f" | AP50: {val_metrics['mAP@0.50']:.4f}"
+                        f" | AP50:95: {val_metrics['mAP@0.50:0.95']:.4f}"
+                        f" | Recall@FPPI=0.10: "
+                        f"{val_metrics['Recall@FPPI=0.10']:.4f}"
+                    )
+                print(summary)
 
                 improved = val_metrics["loss"] < best_val_loss
                 if improved:
                     best_val_loss = val_metrics["loss"]
+                measured_map = val_metrics.get("mAP@0.50:0.95")
+                map_improved = measured_map is not None and measured_map > best_val_map
+                if map_improved:
+                    best_val_map = measured_map
+                if writer is not None:
+                    log_epoch_to_tensorboard(
+                        writer, epoch + 1, train_metrics, val_metrics, current_lr
+                    )
                 checkpoint = make_training_checkpoint(
                     epoch=epoch,
                     training_complete=epoch + 1 >= config.num_epochs,
@@ -2697,6 +2917,8 @@ class DetectorTrainingPipeline:
                     dataset_metadata=train_dataset.dataset_metadata,
                     anchor_generator=model.anchor_generator,
                     sampling_generator=sampling_generator,
+                    best_val_map=best_val_map,
+                    last_validation_metrics=val_metrics,
                 )
                 save_training_checkpoint(checkpoint, last_checkpoint_path)
                 if config.use_azurite:
@@ -2714,8 +2936,23 @@ class DetectorTrainingPipeline:
                             best_checkpoint_path,
                         )
                     print(f"✓ Saved best FP32 model (loss: {best_val_loss:.4f})")
+                if map_improved:
+                    save_training_checkpoint(checkpoint, best_ap_checkpoint_path)
+                    if config.use_azurite:
+                        azurite_client.put_object(
+                            config.azurite_model_bucket,
+                            "person_detector_ssd/best_model_ap.pth",
+                            best_ap_checkpoint_path,
+                        )
+                    print(
+                        "✓ Saved best validation-AP model "
+                        f"(AP50:95: {best_val_map:.4f})"
+                    )
                 print(f"✓ Saved resumable epoch {epoch + 1} state")
             print("\n✓ FP32 training complete!")
+
+        if writer is not None:
+            writer.close()
 
         print("\n" + "=" * 60)
         print("Loading best FP32 checkpoint...")
@@ -2753,7 +2990,11 @@ class DetectorTrainingPipeline:
         print("=" * 60)
         print("\nOutput files:")
         print("  - last_training_checkpoint.pth (resumable training state)")
-        print("  - best_model_fp32.pth (best PyTorch FP32 weights)")
+        print("  - best_model_fp32.pth (best validation-loss weights)")
+        if os.path.exists(best_ap_checkpoint_path):
+            print("  - best_model_ap.pth (best measured validation AP50:95 weights)")
+        if config.tensorboard_enabled:
+            print(f"  - {config.tensorboard_log_dir}/ (TensorBoard event logs)")
         print("  - person_detector_fp32.xml/bin (OpenVINO FP32)")
 
 def main() -> None:

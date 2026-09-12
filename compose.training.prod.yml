@@ -24,6 +24,14 @@ services:
       TRAINING_NUM_WORKERS: ${TRAINING_NUM_WORKERS:-1}
       TRAINING_INPUT_HEIGHT: ${TRAINING_INPUT_HEIGHT:-360}
       TRAINING_INPUT_WIDTH: ${TRAINING_INPUT_WIDTH:-640}
+      TRAINING_AP_EVERY_N_EPOCHS: ${TRAINING_AP_EVERY_N_EPOCHS:-5}
+      TRAINING_AP_SCORE_THRESHOLD: ${TRAINING_AP_SCORE_THRESHOLD:-0.01}
+      TRAINING_AP_NMS_THRESHOLD: ${TRAINING_AP_NMS_THRESHOLD:-0.5}
+      TRAINING_AP_PRE_NMS_TOPK: ${TRAINING_AP_PRE_NMS_TOPK:-1000}
+      TRAINING_AP_MAX_DETECTIONS: ${TRAINING_AP_MAX_DETECTIONS:-100}
+      TRAINING_RECALL_FPPI: ${TRAINING_RECALL_FPPI:-0.1}
+      TRAINING_TENSORBOARD_ENABLED: ${TRAINING_TENSORBOARD_ENABLED:-true}
+      TRAINING_TENSORBOARD_LOG_DIR: ${TRAINING_TENSORBOARD_LOG_DIR:-tensorboard}
       MODEL_RELEASE_STATUS: ${MODEL_RELEASE_STATUS:-experimental}
       MIN_MAP_50: ${MIN_MAP_50:-0.25}
       MIN_MAP_50_95: ${MIN_MAP_50_95:-0.10}
@@ -47,6 +55,20 @@ services:
     depends_on:
       azurite:
         condition: service_healthy
+
+  training-tensorboard:
+    image: ${TRAINING_IMAGE:-camera-software-training:production}
+    restart: unless-stopped
+    entrypoint: ["tensorboard"]
+    command:
+      - --logdir=/state/runs
+      - --host=0.0.0.0
+      - --port=6006
+      - --reload_interval=10
+    ports:
+      - "${TENSORBOARD_BIND_ADDRESS:-127.0.0.1}:${TENSORBOARD_HOST_PORT:-6006}:6006"
+    volumes:
+      - training-state:/state:ro
 
 volumes:
   training-state:

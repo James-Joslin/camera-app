@@ -8,7 +8,7 @@ This directory owns the CityPersons binary-person detector from immutable datase
 - Aspect-preserving letterbox preprocessing shared by training, PyTorch inference, OpenVINO inference, and INT8 calibration.
 - Pedestrian-shaped anchors, ATSS assignment, ignore-region neutralization, GIoU regression, and a one-logit Quality Focal Loss head whose target is aligned IoU.
 - Training-only weighted oversampling for small, heavily occluded, rider, sitting, other-person, and unusual-pose records. Validation remains in natural manifest order.
-- Project binary-person AP50, AP50:95, Recall@FPPI, and size/source-label/visibility slices.
+- Project binary-person AP50, AP50:95, Recall@FPPI, and size/source-label/visibility slices, with periodic in-training validation AP and TensorBoard scalars.
 - Checksum-pinned official CityPersons evaluation for Reasonable, Reasonable-small, heavy-occlusion, and All miss rates.
 - Deterministic manifest-driven INT8 calibration with NNCF accuracy control, identical validation records across FP32/FP16/INT8, and core plus end-to-end latency reports.
 
@@ -33,7 +33,8 @@ model_training/
 │   │   └── pipeline.py
 │   ├── evaluation/
 │   │   ├── citypersons.py
-│   │   └── inference.py
+│   │   ├── inference.py
+│   │   └── metrics.py
 │   └── optimization/
 │       └── pipeline.py
 ├── scripts/
@@ -108,7 +109,7 @@ Compared with the legacy checkpoint:
 | Several nominally pedestrian anchors were wide | Fine-level anchors are explicitly tall |
 | Fixed IoU matching | ATSS assignment during training |
 | Smooth-L1 localization | GIoU localization |
-| Model format version 1 | Model format version 2 |
+| Model format version 1 | Model format version 3 |
 
 ATSS, hard-case sampling, and the losses are training-only changes and add no deployment operations. The one-logit head is slightly smaller than the old two-logit head.
 
@@ -159,8 +160,14 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
 - `TRAINING_EPOCHS` (default `100`), `TRAINING_BATCH_SIZE` (default `32`),
   `TRAINING_NUM_WORKERS` (default `1`), `TRAINING_INPUT_HEIGHT` (default `360`),
   and `TRAINING_INPUT_WIDTH` (default `640`, which must exceed the height)
+- `TRAINING_AP_EVERY_N_EPOCHS` (default `5`; set `0` to disable), `TRAINING_AP_SCORE_THRESHOLD`
+  (default `0.01`), `TRAINING_AP_NMS_THRESHOLD` (default `0.5`),
+  `TRAINING_AP_PRE_NMS_TOPK` (default `1000`), `TRAINING_AP_MAX_DETECTIONS`
+  (default `100`), and `TRAINING_RECALL_FPPI` (default `0.1`)
+- `TRAINING_TENSORBOARD_ENABLED` (default `true`) and
+  `TRAINING_TENSORBOARD_LOG_DIR` (default `tensorboard`, relative to the run directory)
 
-Model and optimizer hyperparameters live in `TrainingConfig`. `last_training_checkpoint.pth` is atomically replaced after every epoch and contains model, optimizer, scheduler, AMP scaler, completed epoch, best loss, sampler state, and RNG state. A run resumes only when model format, rectangular input, anchors, and immutable dataset provenance match. Training is skipped only when `trainingComplete` is true and `completedEpochs` covers the requested epoch count. `best_model_fp32.pth` remains the export source.
+Model and optimizer hyperparameters live in `TrainingConfig`. `last_training_checkpoint.pth` is atomically replaced after every epoch and contains model, optimizer, scheduler, AMP scaler, completed epoch, best loss, best measured AP50:95, last validation metrics, sampler state, and RNG state. A run resumes only when model format, rectangular input, anchors, and immutable dataset provenance match. Training is skipped only when `trainingComplete` is true and `completedEpochs` covers the requested epoch count. `best_model_fp32.pth` remains the minimum-validation-loss export source; `best_model_ap.pth` records the best epoch on which periodic AP was measured.
 
 The training pipeline also exports `person_detector_fp32.xml` and `.bin` when OpenVINO is available.
 
@@ -179,7 +186,7 @@ From the repository root, start the self-contained production job with:
 ./scripts/run-production-training.sh
 ```
 
-The image contains the training source and has no source-code bind mount. It uses the NNCF-compatible PyTorch 2.8.0/torchvision 0.23.0 pair and includes the C++ compiler required by TorchInductor. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` container in detached mode. The command returns after startup, and the stopped container remains available for status and log inspection. A separate persistent `training-state` volume retains downloads, checkpoints, reports, compiler artifacts, and logs between container runs.
+The image contains the training source and has no source-code bind mount. It uses the NNCF-compatible PyTorch 2.8.0/torchvision 0.23.0 pair and includes the C++ compiler required by TorchInductor. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` plus a TensorBoard sidecar in detached mode. The command returns after startup, and the stopped training container remains available for status and log inspection. A separate persistent `training-state` volume retains downloads, checkpoints, reports, compiler artifacts, TensorBoard events, and logs between container runs. TensorBoard is available at `http://127.0.0.1:6006` by default; change `TENSORBOARD_BIND_ADDRESS` and `TENSORBOARD_HOST_PORT` when remote access is intentionally required.
 
 Check the detached job with:
 
@@ -189,6 +196,9 @@ docker compose -f docker-compose.yml -f compose.training.yml \
 
 docker compose -f docker-compose.yml -f compose.training.yml \
   -f compose.training.prod.yml logs -f training-job
+
+docker compose -f docker-compose.yml -f compose.training.yml \
+  -f compose.training.prod.yml ps training-tensorboard
 ```
 
 The entrypoint performs these gated stages in order:
@@ -211,6 +221,8 @@ TRAINING_EPOCHS=50 \
 TRAINING_BATCH_SIZE=16 \
 TRAINING_INPUT_HEIGHT=360 \
 TRAINING_INPUT_WIDTH=640 \
+TRAINING_AP_EVERY_N_EPOCHS=5 \
+TENSORBOARD_HOST_PORT=6006 \
 MODEL_RELEASE_STATUS=experimental \
 CALIBRATION_SAMPLES=300 \
 VALIDATION_SAMPLES=500 \
@@ -224,6 +236,10 @@ Inside the Compose `training-state` volume, job output is retained at:
 
 ```text
 /state/runs/<run-id>/
+├── last_training_checkpoint.pth
+├── best_model_fp32.pth
+├── best_model_ap.pth
+└── tensorboard/
 /state/releases/<release-id>/
 /state/release-evaluations/<release-id>/
 /state/active-models/
@@ -299,9 +315,11 @@ The implemented losses are:
 - `Loc`: `2 × mean(1 − GIoU)` over positive anchors. Zero is perfect. Since GIoU lies between -1 and 1, the weighted localization term is normally between 0 and 4.
 - `Loss`: `Cls + Loc`. The printed values can differ by a very small amount because the total and components may be rounded independently under autocast.
 
-At the end of each epoch, the model is evaluated on the natural, non-augmented validation split using the same loss. Warm-up controls the first three epochs; cosine decay advances afterward. The checkpoint is replaced only when validation loss reaches a new minimum. After the final epoch, the best checkpoint—not necessarily the last epoch—is reloaded and exported to OpenVINO FP32.
+At the end of each epoch, the model is evaluated on the natural, non-augmented validation split using the same loss. Warm-up controls the first three epochs; cosine decay advances afterward. `best_model_fp32.pth` is replaced when validation loss reaches a new minimum. After the final epoch, that checkpoint—not necessarily the last epoch—is reloaded and exported to OpenVINO FP32.
 
-Training does not calculate AP during every epoch. Per-epoch validation loss chooses the checkpoint cheaply; run the separate evaluation command to measure detection quality before accepting a release.
+By default, every fifth epoch and the final epoch also decode the same validation forward pass and calculate AP50, AP50:95, and Recall@FPPI=0.10. The evaluator deliberately uses the low `0.01` score floor, filters scores before decoding, caps input to NMS at 1,000 candidates, and retains at most 100 detections per image. `best_model_ap.pth` records the best measured AP50:95 checkpoint. The cadence limits postprocessing overhead; set `TRAINING_AP_EVERY_N_EPOCHS=1` for every epoch or `0` to disable it.
+
+TensorBoard receives train/validation loss, classification/localization loss, learning rate, epoch duration, and the periodic detection metrics. Resumed runs append to the same run directory and purge overlapping steps. Runs created before this feature have no historical event data, so their dashboard begins at the first newly completed epoch. Full release evaluation remains authoritative because it also produces slices and official CityPersons miss rates.
 
 ### Reading the training progress line
 
@@ -451,7 +469,7 @@ Interpret common patterns as follows:
 
 `--map-threshold 0.01` is deliberately low so the evaluator receives enough detections to construct the precision-recall curve. It is not the displayed confidence threshold. `--confidence 0.5` controls visualizations, while `--nms-threshold 0.5` removes duplicate boxes before both visualization and evaluation.
 
-The training pipeline chooses `best_model_fp32.pth` by minimum validation loss. Release acceptance should additionally require improved AP50:95/Recall@FPPI, acceptable hard-case slices, and lower official miss rate. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
+The training pipeline chooses export source `best_model_fp32.pth` by minimum validation loss and separately retains `best_model_ap.pth` by periodically measured AP50:95. Release acceptance should require acceptable AP50:95/Recall@FPPI, hard-case slices, and official miss rate from the full release evaluation. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
 
 ## Automated model release
 
