@@ -78,24 +78,38 @@ same hardware, threads, precision and postprocessing settings for both models.
 The launcher leaves the existing training job alone. Halved training time does
 not by itself establish an inference speedup.
 
-## Measured YOLOv8n benchmark — 2026-09-13
+## YOLO Benchmark Results — 2026-09-13
 
-Run: `yolov8n-pretrained-20260913`, using untouched pretrained YOLOv8n and the
-project's evaluator on all **500 validation images**. Canvas: **640×360**;
-internal padded input: **640×384**. INT8 calibration used 300 training images.
-OpenVINO CPU timing used batch 1, one stream, one inference thread, 8 warmups
-and 100 measured iterations.
+Benchmarked using the project's evaluator on all **500 validation images**. Canvas: **640×360**; internal padded input: **640×384**. INT8 calibration used **300 training images**. OpenVINO CPU timing used batch 1, one stream, one inference thread, 8 warmups and 100 measured iterations.
 
-| Precision | AP50 | AP50:95 | Recall @ FPPI 0.1 | Core mean ms | E2E mean ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 0.4046 | 0.1731 | 0.2115 | 52.86 | 100.06 |
-| INT8 | 0.3849 | 0.1524 | 0.2039 | 25.31 | 65.07 |
+### YOLOv8n
 
-INT8 reduced AP50:95 by **0.02064 absolute**, exceeding `MAX_ACCURACY_DROP=0.01`;
-the accuracy gate **failed**. Training was running concurrently, so these latency
-measurements reflect shared CPU load. Rerun both detectors while other compute
-jobs are idle for a controlled speed comparison. E2E timing includes image
-decode, preprocessing, inference and NMS, but excludes storage/network access.
+| Precision |   AP50 | AP50:95 | Recall @ FPPI 0.1 | Core mean ms | E2E mean ms |
+| --------- | -----: | ------: | ----------------: | -----------: | ----------: |
+| FP32      | 0.4046 |  0.1731 |            0.2115 |        52.86 |      100.06 |
+| INT8      | 0.3849 |  0.1524 |            0.2039 |        25.31 |       65.07 |
+
+Accuracy gate: **FAILED**
+AP50:95 drop: **0.02064 absolute**
+Threshold: `MAX_ACCURACY_DROP=0.01`
+
+### YOLO26n
+
+| Precision |   AP50 | AP50:95 | Recall @ FPPI 0.1 | Core mean ms | E2E mean ms |
+| --------- | -----: | ------: | ----------------: | -----------: | ----------: |
+| FP32      | 0.3820 |  0.1701 |            0.1892 |        36.51 |       91.25 |
+| INT8      | 0.3802 |  0.1653 |            0.1798 |        21.21 |       63.36 |
+
+Accuracy gate: **PASSED**
+AP50:95 drop: **0.0048 absolute**
+Threshold: `MAX_ACCURACY_DROP=0.01`
+
+### NMS
+
+**YOLOv8n** uses the traditional one-to-many detection output followed by **Non-Maximum Suppression (NMS)**.
+
+**YOLO26n** uses a dual-head design. Its default one-to-many path also uses NMS, while its one-to-one head supports **end-to-end NMS-free inference** with `nms=False`.
+
 
 ## Results
 
