@@ -1,0 +1,26 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    OPENVINO_TELEMETRY_DISABLED=1 \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    PYTHONPATH=/opt/model_training
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ p7zip-full libglib2.0-0 libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/model_training
+COPY tools/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir \
+        torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip install --no-cache-dir kaggle azure-storage-blob albumentations
+
+COPY yolo_benchmark/requirements.txt /tmp/yolo-requirements.txt
+RUN pip install --no-cache-dir -c /tmp/requirements.txt -r /tmp/yolo-requirements.txt
+COPY . /opt/model_training
+RUN chmod +x /opt/model_training/getCityPersons.sh /opt/model_training/yolo_benchmark/entrypoint.sh && mkdir -p /state
+ENV YOLO_CONFIG_DIR=/state NO_ALBUMENTATIONS_UPDATE=1
+WORKDIR /state
+ENTRYPOINT ["/opt/model_training/yolo_benchmark/entrypoint.sh"]

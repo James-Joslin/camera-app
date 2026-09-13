@@ -1,0 +1,13 @@
+**
+!tools/
+!tools/requirements.txt
+!person_detection/
+!person_detection/**
+!scripts/
+!scripts/**
+!getCityPersons.sh
+!yolo_benchmark/
+!yolo_benchmark/**
+**/__pycache__/
+**/*.pyc
+yolo_benchmark/results/
