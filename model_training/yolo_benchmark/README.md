@@ -78,31 +78,47 @@ same hardware, threads, precision and postprocessing settings for both models.
 The launcher leaves the existing training job alone. Halved training time does
 not by itself establish an inference speedup.
 
-## YOLO Benchmark Results — 2026-09-13
+## Model comparison — 2026-09-13
 
-Benchmarked using the project's evaluator on all **500 validation images**. Canvas: **640×360**; internal padded input: **640×384**. INT8 calibration used **300 training images**. OpenVINO CPU timing used batch 1, one stream, one inference thread, 8 warmups and 100 measured iterations.
+Benchmarked using the project's evaluator on all **500 validation images**, with **300 training images** for INT8 calibration. OpenVINO CPU timing used batch 1, one stream, one inference thread, 8 warmups and 100 measured iterations. Public canvas: **640×360**; YOLO additionally pads internally to **640×384**.
 
-### YOLOv8n
+The trained person detector (`clean_ltrb`, C+E) uses **best_model_fp32.pth from epoch 57** (stored index 56) of the **60-epoch** run `v2026-09-12T220016Z`, selected by minimum validation loss (0.8901988). Its measurements were taken on an Intel Core i3-13100. The YOLO rows retain the pretrained model measurements recorded on this date; they were not rerun with the detector evaluation.
 
-| Precision |   AP50 | AP50:95 | Recall @ FPPI 0.1 | Core mean ms | E2E mean ms |
-| --------- | -----: | ------: | ----------------: | -----------: | ----------: |
-| FP32      | 0.4046 |  0.1731 |            0.2115 |        52.86 |      100.06 |
-| INT8      | 0.3849 |  0.1524 |            0.2039 |        25.31 |       65.07 |
+| Model | Precision | AP50 | AP50:95 | Recall @ FPPI 0.1 | Core mean ms | E2E mean ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Trained person detector (C+E) | FP32 | 0.3567 | 0.1403 | 0.1638 | 14.72 | 59.22 |
+| Trained person detector (C+E) | FP16 | 0.3567 | 0.1399 | 0.1640 | 15.04 | 58.82 |
+| Trained person detector (C+E) | INT8 | 0.3509 | 0.1381 | 0.1579 | 9.04 | 53.57 |
+| YOLOv8n | FP32 | 0.4046 | 0.1731 | 0.2115 | 52.86 | 100.06 |
+| YOLOv8n | INT8 | 0.3849 | 0.1524 | 0.2039 | 25.31 | 65.07 |
+| YOLO26n | FP32 | 0.3820 | 0.1701 | 0.1892 | 36.51 | 91.25 |
+| YOLO26n | INT8 | 0.3802 | 0.1653 | 0.1798 | 21.21 | 63.36 |
 
-Accuracy gate: **FAILED**
-AP50:95 drop: **0.02064 absolute**
-Threshold: `MAX_ACCURACY_DROP=0.01`
+Core latency measures inference on a prepared tensor. E2E includes image decode, preprocessing, inference and person postprocessing, excluding storage/network access. Accuracy uses score ≥0.01; timing uses score ≥0.5. Models retain their respective preprocessing and native postprocessing paths described above. FP16 here means **compressed FP16 weights with FP32 CPU execution**, not native FP16 compute. YOLO FP16 was not measured.
 
-### YOLO26n
+### INT8 accuracy gates
 
-| Precision |   AP50 | AP50:95 | Recall @ FPPI 0.1 | Core mean ms | E2E mean ms |
-| --------- | -----: | ------: | ----------------: | -----------: | ----------: |
-| FP32      | 0.3820 |  0.1701 |            0.1892 |        36.51 |       91.25 |
-| INT8      | 0.3802 |  0.1653 |            0.1798 |        21.21 |       63.36 |
+Maximum permitted absolute AP50:95 drop: **0.01**.
 
-Accuracy gate: **PASSED**
-AP50:95 drop: **0.0048 absolute**
-Threshold: `MAX_ACCURACY_DROP=0.01`
+| Model | AP50:95 drop | Gate |
+| --- | ---: | --- |
+| Trained person detector (C+E) | 0.002221 | PASSED |
+| YOLOv8n | 0.02064 | FAILED |
+| YOLO26n | 0.0048 | PASSED |
+
+The trained detector's INT8 core inference is **1.63× faster** than its FP32 export. Its AP50:95 is lower than both pretrained YOLO models in this comparison.
+
+### Trained detector latency details
+
+| Precision | Core p95 ms | E2E p95 ms | Core FPS | E2E FPS | XML + weights MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP32 | 15.56 | 62.00 | 67.93 | 16.89 | 7.45 |
+| FP16 | 16.10 | 61.13 | 66.49 | 17.00 | 4.00 |
+| INT8 | 9.29 | 56.69 | 110.64 | 18.67 | 3.75 |
+
+Independent PyTorch FP32 checkpoint evaluation: AP50 **0.356940**, AP50:95 **0.140553**, Recall@FPPI=0.1 **0.163281**. The comparison table uses the exported OpenVINO models' measured accuracy.
+
+Full detector results, official CityPersons miss rates and software versions: [dated summary](../benchmark_results/ce-60-best-20260913/summary.md). Per-slice accuracy, dataset provenance, latency stages and quality gates: [optimization report](../benchmark_results/ce-60-best-20260913/models/optimization_report.json).
 
 ### NMS
 
