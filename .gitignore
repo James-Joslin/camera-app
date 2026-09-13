@@ -33,3 +33,4 @@ model_training/old/*
 
 /model_training/ARCHITECTURE_IMPROVEMENTS.md
 /model_training/ENHANCEMENT_RESEARCH.md
+/model_training/benchmark_results/*
