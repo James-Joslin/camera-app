@@ -10,7 +10,7 @@ DATA_CONTAINER="${AZURITE_DATA_CONTAINER:-computer-vision-data}"
 MODEL_CONTAINER="${AZURITE_MODEL_CONTAINER:-computer-vision-models}"
 MODEL_REMOTE_ROOT="${AZURITE_MODEL_REMOTE_ROOT:-person_detector_ssd/releases}"
 MODEL_CURRENT_POINTER="${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/current.json}"
-EPOCHS="${TRAINING_EPOCHS:-100}"
+EPOCHS="${TRAINING_EPOCHS:-60}"
 BATCH_SIZE="${TRAINING_BATCH_SIZE:-32}"
 NUM_WORKERS="${TRAINING_NUM_WORKERS:-1}"
 INPUT_HEIGHT="${TRAINING_INPUT_HEIGHT:-360}"
@@ -36,20 +36,29 @@ Usage: ./runProductionTraining.sh
 One-shot production job:
   1. Fully validate the current CityPersons dataset in Azurite.
   2. Download, build, upload, validate, and publish it when validation fails.
-  3. Train and export FP32.
+  3. Train C+E with full training-only G, select best AP50:95, and export FP32.
   4. Export/evaluate FP32 and FP16, calibrate/evaluate INT8, and enforce the
      configured INT8 accuracy gate.
   5. Publish a checksum-verified immutable model release and current pointer.
 
 Configuration is supplied through environment variables. Common settings:
   TRAINING_MODEL_VARIANT      clean_ltrb (C+E, default), clean_anchor, or anchor
-  TRAINING_EPOCHS             Training epochs (default: 100)
+  TRAINING_VISIBLE_LOSS_WEIGHT  Training-only visible boxes (default: 0.25; set 0 to disable)
+  TRAINING_REPGT_LOSS_WEIGHT    Neighbor-GT repulsion (default: 0.05; set 0 to disable)
+  TRAINING_REPBOX_LOSS_WEIGHT   Cross-person prediction repulsion (default: 0.01; set 0 to disable)
+  TRAINING_AUXILIARY_RAMP_EPOCHS  Zero to full G weight over this many epochs (default: 5)
+  TRAINING_REPGT_SIGMA          RepGT smoothing threshold (default: 0.5)
+  TRAINING_REPBOX_SIGMA         RepBox smoothing threshold (default: 0)
+  TRAINING_REPBOX_PREDICTIONS_PER_GT  Maximum predictions per person for RepBox (default: 4)
+  TRAINING_REPULSION_CHUNK_SIZE  Pairwise geometry chunk size (default: 64)
+  TRAINING_CHECKPOINT_SELECTION ap (default), detection_loss, or final
+  TRAINING_EPOCHS             Training epochs (default: 60)
   TRAINING_BATCH_SIZE         Batch size (default: 32)
   TRAINING_NUM_WORKERS        DataLoader workers (default: 1)
   TRAINING_INPUT_HEIGHT       Model canvas height (default: 360)
   TRAINING_INPUT_WIDTH        Model canvas width (default: 640)
   TRAINING_RUN_ID             Persistent run directory name; reuse it to resume
-  TRAINING_AP_EVERY_N_EPOCHS   Validation AP cadence; 0 disables it (default: 5)
+  TRAINING_AP_EVERY_N_EPOCHS   Validation AP cadence (default: 1; AP selection requires it)
   TRAINING_AP_SCORE_THRESHOLD  Low score floor used to build PR curves (default: 0.01)
   TRAINING_TENSORBOARD_ENABLED Write TensorBoard events (default: true)
   TRAINING_TENSORBOARD_LOG_DIR Run-relative event directory (default: tensorboard)
@@ -109,6 +118,13 @@ fi
 
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export ENABLE_QUANTIZATION=false
+# Full G is the normal production recipe, including direct script invocation.
+export TRAINING_EPOCHS="$EPOCHS"
+export TRAINING_VISIBLE_LOSS_WEIGHT="${TRAINING_VISIBLE_LOSS_WEIGHT:-0.25}"
+export TRAINING_REPGT_LOSS_WEIGHT="${TRAINING_REPGT_LOSS_WEIGHT:-0.05}"
+export TRAINING_REPBOX_LOSS_WEIGHT="${TRAINING_REPBOX_LOSS_WEIGHT:-0.01}"
+export TRAINING_CHECKPOINT_SELECTION="${TRAINING_CHECKPOINT_SELECTION:-ap}"
+export TRAINING_AP_EVERY_N_EPOCHS="${TRAINING_AP_EVERY_N_EPOCHS:-1}"
 export TRAINING_INPUT_HEIGHT="$INPUT_HEIGHT"
 export TRAINING_INPUT_WIDTH="$INPUT_WIDTH"
 

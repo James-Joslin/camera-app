@@ -2,6 +2,79 @@
 
 This directory owns the CityPersons binary-person detector from immutable dataset ingestion through FP32 training, metric evaluation, and accuracy-controlled OpenVINO INT8 release. The exported model has one quality-aware person logit per prediction; canonical source labels remain available for sampling and metrics but are not exported as extra heads.
 
+
+## Full training-only G: visibility and repulsion
+
+G keeps the `clean_ltrb` deployment graph and its two outputs unchanged. Training adds a shared visible-box projection plus RepGT and RepBox losses. The auxiliary projection is absent from the model constructed for OpenVINO export, evaluation and calibration. Camera adaptation (H) is out of scope.
+
+From the repository root, start a **fresh 60-epoch full-G run** with:
+
+```bash
+./scripts/run-production-training.sh
+```
+
+The normal production pipeline creates a timestamped run ID, enables all three losses, measures validation AP every epoch, and selects `best_model_fp32.pth` by highest AP50:95 (earliest epoch wins ties). The workflow is: build the training image, train, export, evaluate/quantize, and publish through the existing release gates. It starts in the background; follow the log command printed by the launcher. Nothing resumes your previous C+E run unless you explicitly reuse its ID, which G compatibility checks reject.
+
+To resume the same G run after interruption, supply its original `TRAINING_RUN_ID` and the same recipe. The 60-epoch run is performed by the user; unit/integration tests use tiny synthetic batches.
+
+| Environment variable | Production default | Direct Python/development default |
+| --- | ---: | ---: |
+| `TRAINING_VISIBLE_LOSS_WEIGHT` | 0.25 | 0 |
+| `TRAINING_REPGT_LOSS_WEIGHT` | 0.05 | 0 |
+| `TRAINING_REPBOX_LOSS_WEIGHT` | 0.01 | 0 |
+| `TRAINING_AUXILIARY_RAMP_EPOCHS` | 5 | 5 |
+| `TRAINING_REPGT_SIGMA` | 0.5 | 0.5 |
+| `TRAINING_REPBOX_SIGMA` | 0 | 0 |
+| `TRAINING_REPBOX_PREDICTIONS_PER_GT` | 4 | 4 |
+| `TRAINING_REPULSION_CHUNK_SIZE` | 64 | 64 |
+| `TRAINING_CHECKPOINT_SELECTION` | `ap` | `detection_loss` |
+| `TRAINING_AP_EVERY_N_EPOCHS` | 1 | 5 |
+| `TRAINING_EPOCHS` | 60 | 100 |
+
+All settings are independently overridable. Setting a loss weight to zero disables that component. For a G-disabled, AP-selected 60-epoch run:
+
+```bash
+TRAINING_VISIBLE_LOSS_WEIGHT=0 TRAINING_REPGT_LOSS_WEIGHT=0 \
+TRAINING_REPBOX_LOSS_WEIGHT=0 ./scripts/run-production-training.sh
+```
+
+Development training supports the same variables through `compose.training.yml`. To train in an isolated directory without the production release workflow:
+
+```bash
+TRAINING_VISIBLE_LOSS_WEIGHT=0.25 TRAINING_REPGT_LOSS_WEIGHT=0.05 \
+TRAINING_REPBOX_LOSS_WEIGHT=0.01 TRAINING_CHECKPOINT_SELECTION=ap \
+TRAINING_AP_EVERY_N_EPOCHS=1 TRAINING_EPOCHS=60 \
+docker compose -f docker-compose.yml -f compose.training.yml run --rm training \
+  bash -lc 'mkdir -p /workspace/runs/g-dev-01 && cd /workspace/runs/g-dev-01 && PYTHONPATH=/workspace python -m person_detection.training.pipeline'
+```
+
+Use a new directory for a new experiment. Existing checkpoint mismatches fail rather than overwrite another recipe. `final` is also supported for checkpoint selection; AP selection requires AP evaluation to be enabled.
+
+### Loss and annotation contracts
+
+- Assignment exposes the final ground-truth index after conflict repair, with `-1` for background/ignored locations. The existing three-value matching interface remains available.
+- The visible projection reads shared features before dropout. Signed center offsets and softplus-positive sizes are scaled by each level's stride. It uses Smooth L1 on normalized center/size (mean across four coordinates) plus visible-box GIoU, averaged over supervised positive locations.
+- Full and visible boxes retain identity through geometry transforms. Degenerate/missing visible boxes are skipped without deleting full-person targets. Noncontained valid pairs are counted and retained rather than clipped to an invented target; inspect `visible_noncontained_pairs` if annotations look suspect.
+- CoarseDropout is disabled whenever visible supervision is enabled, because synthetic pixel holes do not update visible annotations. Other augmentation is retained.
+- RepGT chooses the highest detached predicted-box IoU among nonassigned people, then penalizes intersection over neighboring GT area. RepBox selects up to four predictions per person by detached target IoU, ties by location index, and penalizes overlapping cross-person pairs once each. Ignore regions and same-person duplicate predictions are excluded. Pair geometry is chunked to bound intermediate tensors.
+- RepGT normalizes by positive prediction count; RepBox by overlapping-pair count. Both use the smoothed negative-log overlap penalty from [Repulsion Loss](https://arxiv.org/html/1711.07752v2). Predicted-box neighbor selection and bounded sampling are adaptations to this dense head.
+- Auxiliary geometry runs in FP32 under AMP. Empty supervision produces a differentiable zero. The five-epoch ramp uses multipliers 0, 0.2, 0.4, 0.6, 0.8 in epochs 1–5 and 1.0 from epoch 6. Initial weights are experiment defaults, not validated optimum values.
+
+### Checkpoints, monitoring and comparison
+
+`last_training_checkpoint.pth` saves separate detector/auxiliary state dictionaries, optimizer, scheduler, scaler, sampling and RNG state, the G recipe and augmentation policy. `best_model_ap.pth`, `best_model_loss.pth` and selected `best_model_fp32.pth` retain their own selection metric/epoch. Resume checks reject changed G settings. Existing detector checkpoints remain loadable. Release metadata carries selection and G provenance.
+
+TensorBoard `G/train/*` and `G/validation/*` report each raw and weighted auxiliary loss, detection loss, ramp multiplier, visible valid/skipped/noncontained pair counts, supervised location counts and repulsion counts. Count fields are totals over the epoch's sampled batches; loss fields are batch means. Plain validation detection metrics still use only person scores and full boxes.
+
+Compare all **500 validation images** and **300 calibration training images**, retaining the recorded calibration manifest where available. Keep the same 640×360 canvas, evaluator/NMS settings and i3-13100 CPU protocol (batch 1, one stream/thread, 8 warmups, 100 iterations). Report FP32 and INT8 AP50, AP50:95, Recall@FPPI 0.1, existing size/visibility slices and core/E2E latency. The changed AP checkpoint selection and disabled CoarseDropout must be recorded alongside the comparison to the previous loss-selected C+E run.
+
+Run the G regression tests in the training environment with:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest tests.test_occlusion -v
+```
+
+
 ## C + E training variant
 
 New training commands default to `TRAINING_MODEL_VARIANT=clean_ltrb` (C+E). Three variants are available:
@@ -16,14 +89,16 @@ C keeps 128 channels and the five existing strides (8–128). Tower convolution 
 
 E produces **4,835 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and FastAPI serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
 
-ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. No stride-4 level, DFL, visibility loss, repulsion, or camera adaptation is included yet.
+ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. Stride-4 and DFL remain outside this variant. Training-only G (visible-box supervision, RepGT and RepBox) is enabled by default in the production pipeline; camera adaptation is out of scope.
 
 Use a **fresh run ID/directory** for C+E. Incompatible checkpoints fail without being overwritten; the previous v3 model remains evaluable. C/E cloud checkpoint uploads use variant-specific prefixes. Python `TrainingConfig()`, `SSDPersonDetector()`, and `SSDLoss()` also default to `clean_ltrb`. Existing checkpoints are loaded using their recorded variant; v3 checkpoints without a variant are still interpreted as the anchor baseline.
 
 For the existing production training workflow, from the repository root:
 
 ```bash
-TRAINING_MODEL_VARIANT=clean_ltrb TRAINING_EPOCHS=20 TRAINING_RUN_ID=ce-20-01 \
+TRAINING_VISIBLE_LOSS_WEIGHT=0 TRAINING_REPGT_LOSS_WEIGHT=0 TRAINING_REPBOX_LOSS_WEIGHT=0 \
+TRAINING_CHECKPOINT_SELECTION=detection_loss TRAINING_MODEL_VARIANT=clean_ltrb \
+TRAINING_EPOCHS=20 TRAINING_RUN_ID=ce-20-01 \
   ./scripts/run-production-training.sh
 ```
 
@@ -39,7 +114,7 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
   -e ENABLE_QUANTIZATION=false training python -m person_detection.training.pipeline
 ```
 
-Use `TRAINING_MODEL_VARIANT=anchor` to reproduce the baseline or `clean_anchor` to isolate C. The architecture table and detailed anchor walkthrough below describe the selectable anchor baseline.
+Use `TRAINING_MODEL_VARIANT=anchor` to reproduce the baseline or `clean_anchor` to isolate C. When using the production launcher, set all three G loss weights to zero for these anchor variants. The architecture table and detailed anchor walkthrough below describe the selectable anchor baseline.
 
 ## What is implemented
 
@@ -197,17 +272,17 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
 - `USE_AZURITE` (`true` by default) and `DATA_ROOT` for local fallback
 - `ENABLE_QUANTIZATION`, which must remain `false`
 - `TRAINING_MODEL_VARIANT` (CLI default `clean_ltrb`; also `clean_anchor` or `anchor`)
-- `TRAINING_EPOCHS` (default `100`), `TRAINING_BATCH_SIZE` (default `32`),
+- `TRAINING_EPOCHS` (production default `60`; direct Python/development `100`), `TRAINING_BATCH_SIZE` (default `32`),
   `TRAINING_NUM_WORKERS` (default `1`), `TRAINING_INPUT_HEIGHT` (default `360`),
   and `TRAINING_INPUT_WIDTH` (default `640`, which must exceed the height)
-- `TRAINING_AP_EVERY_N_EPOCHS` (default `5`; set `0` to disable), `TRAINING_AP_SCORE_THRESHOLD`
+- `TRAINING_AP_EVERY_N_EPOCHS` (production default `1`; direct Python/development `5`; `0` requires non-AP checkpoint selection), `TRAINING_AP_SCORE_THRESHOLD`
   (default `0.01`), `TRAINING_AP_NMS_THRESHOLD` (default `0.5`),
   `TRAINING_AP_PRE_NMS_TOPK` (default `1000`), `TRAINING_AP_MAX_DETECTIONS`
   (default `100`), and `TRAINING_RECALL_FPPI` (default `0.1`)
 - `TRAINING_TENSORBOARD_ENABLED` (default `true`) and
   `TRAINING_TENSORBOARD_LOG_DIR` (default `tensorboard`, relative to the run directory)
 
-Model and optimizer hyperparameters live in `TrainingConfig`. `last_training_checkpoint.pth` is atomically replaced after every epoch and contains model, optimizer, scheduler, AMP scaler, completed epoch, best loss, best measured AP50:95, last validation metrics, sampler state, and RNG state. A run resumes only when model format, rectangular input, anchors, and immutable dataset provenance match. Training is skipped only when `trainingComplete` is true and `completedEpochs` covers the requested epoch count. `best_model_fp32.pth` remains the minimum-validation-loss export source; `best_model_ap.pth` records the best epoch on which periodic AP was measured.
+Model and optimizer hyperparameters live in `TrainingConfig`. `last_training_checkpoint.pth` is atomically replaced after every epoch and contains model, optimizer, scheduler, AMP scaler, completed epoch, best loss, best measured AP50:95, last validation metrics, sampler state, and RNG state. A run resumes only when model format, rectangular input, anchors, and immutable dataset provenance match. Training is skipped only when `trainingComplete` is true and `completedEpochs` covers the requested epoch count. `best_model_fp32.pth` is the export source selected by `TRAINING_CHECKPOINT_SELECTION` (`ap` in production; `detection_loss` for direct Python/development training). `best_model_ap.pth` and `best_model_loss.pth` independently retain best AP50:95 and best detection loss. Auxiliary losses never enter detection-loss checkpoint selection.
 
 The training pipeline also exports `person_detector_fp32.xml` and `.bin` when OpenVINO is available.
 
@@ -357,7 +432,7 @@ The implemented losses are:
 
 At the end of each epoch, the model is evaluated on the natural, non-augmented validation split using the same loss. Warm-up controls the first three epochs; cosine decay advances afterward. `best_model_fp32.pth` is replaced when validation loss reaches a new minimum. After the final epoch, that checkpoint—not necessarily the last epoch—is reloaded and exported to OpenVINO FP32.
 
-By default, every fifth epoch and the final epoch also decode the same validation forward pass and calculate AP50, AP50:95, and Recall@FPPI=0.10. The evaluator deliberately uses the low `0.01` score floor, filters scores before decoding, caps input to NMS at 1,000 candidates, and retains at most 100 detections per image. `best_model_ap.pth` records the best measured AP50:95 checkpoint. The cadence limits postprocessing overhead; set `TRAINING_AP_EVERY_N_EPOCHS=1` for every epoch or `0` to disable it.
+Production training evaluates AP every epoch. Direct Python/development training defaults to every fifth epoch and the final epoch; both decode the same validation forward pass and calculate AP50, AP50:95, and Recall@FPPI=0.10. The evaluator deliberately uses the low `0.01` score floor, filters scores before decoding, caps input to NMS at 1,000 candidates, and retains at most 100 detections per image. `best_model_ap.pth` records the best measured AP50:95 checkpoint. The cadence limits postprocessing overhead; set `TRAINING_AP_EVERY_N_EPOCHS=1` for every epoch or `0` to disable it.
 
 TensorBoard receives train/validation loss, classification/localization loss, learning rate, epoch duration, and the periodic detection metrics. Resumed runs append to the same run directory and purge overlapping steps. Runs created before this feature have no historical event data, so their dashboard begins at the first newly completed epoch. Full release evaluation remains authoritative because it also produces slices and official CityPersons miss rates.
 
@@ -509,7 +584,7 @@ Interpret common patterns as follows:
 
 `--map-threshold 0.01` is deliberately low so the evaluator receives enough detections to construct the precision-recall curve. It is not the displayed confidence threshold. `--confidence 0.5` controls visualizations, while `--nms-threshold 0.5` removes duplicate boxes before both visualization and evaluation.
 
-The training pipeline chooses export source `best_model_fp32.pth` by minimum validation loss and separately retains `best_model_ap.pth` by periodically measured AP50:95. Release acceptance should require acceptable AP50:95/Recall@FPPI, hard-case slices, and official miss rate from the full release evaluation. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
+The training pipeline chooses export source `best_model_fp32.pth` using the configured checkpoint-selection metric. Full G selects by AP50:95 each epoch; direct Python/development training defaults to detection-loss selection. It separately retains `best_model_ap.pth` and `best_model_loss.pth`. Release acceptance should require acceptable AP50:95/Recall@FPPI, hard-case slices, and official miss rate from the full release evaluation. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
 
 ## Automated model release
 

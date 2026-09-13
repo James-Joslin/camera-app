@@ -130,8 +130,10 @@ class CleanDetectionHead(nn.Module):
             if ltrb:
                 nn.init.normal_(layer.weight, std=0.01)
 
-    def forward(self, x, level):
-        x = self.dropout(self.shared(x, level))
+    def forward(self, x, level, auxiliary_head=None):
+        shared = self.shared(x, level)
+        visible = auxiliary_head(shared) if auxiliary_head is not None else None
+        x = self.dropout(shared)
         index = 0 if self.ltrb else level
         cls = self.cls_outputs[index](self.classification(x, level))
         boxes = self.box_outputs[index](self.regression(x, level))
@@ -140,4 +142,7 @@ class CleanDetectionHead(nn.Module):
         boxes = boxes.permute(0, 2, 3, 1).reshape(batch, -1, 4)
         if self.ltrb:
             boxes = torch.relu(boxes) + 1e-3
+        if visible is not None:
+            visible = visible.permute(0, 2, 3, 1).reshape(batch, -1, 4)
+            return cls, boxes, visible
         return cls, boxes

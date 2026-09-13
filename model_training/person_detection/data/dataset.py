@@ -154,6 +154,7 @@ class CanonicalPersonDetectionDataset(Dataset):
         input_height: int = 360,
         input_width: int = 640,
         augment: bool = True,
+        coarse_dropout: bool = True,
     ):
         self.azurite = azurite_client
         self.config = azurite_client.config
@@ -161,6 +162,7 @@ class CanonicalPersonDetectionDataset(Dataset):
         self.input_height = input_height
         self.input_width = input_width
         self.augment = augment and split == "train"
+        self.coarse_dropout = coarse_dropout
         self._annotation_cache = {}
         self._strata_cache = {}
         bucket = self.config.azurite_data_bucket
@@ -223,7 +225,7 @@ class CanonicalPersonDetectionDataset(Dataset):
         ] if self.augment else []
         appearance = [
             BoxPreservingCoarseDropout(num_holes_range=(1, 6), hole_height_range=(0.02, 0.08),
-                            hole_width_range=(0.02, 0.08), fill=0, p=0.3),
+                            hole_width_range=(0.02, 0.08), fill=0, p=0.3 if self.coarse_dropout else 0.0),
             A.OneOf([
                 A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
                 A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3),

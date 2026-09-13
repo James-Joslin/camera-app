@@ -15,6 +15,7 @@ class AssignmentResult:
     matched_boxes: torch.Tensor
     matched_labels: torch.Tensor
     positive_mask: torch.Tensor
+    matched_gt_indices: torch.Tensor
 
 
 class AnchorAssigner(ABC):
@@ -95,7 +96,8 @@ class ATSSAnchorAssigner(AnchorAssigner):
             labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
             labels[ignored] = -1
             return AssignmentResult(
-                anchor_boxes.new_zeros((num_anchors, 4)), labels, labels > 0
+                anchor_boxes.new_zeros((num_anchors, 4)), labels, labels > 0,
+                torch.full_like(labels, -1)
             )
 
         ious = box_iou(anchor_boxes, ground_truth_boxes)
@@ -183,4 +185,5 @@ class ATSSAnchorAssigner(AnchorAssigner):
         matched_labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
         matched_labels[positive_mask] = ground_truth_labels[best_gt_index[positive_mask]]
         matched_labels[ignored & ~positive_mask] = -1
-        return AssignmentResult(matched_boxes, matched_labels, positive_mask)
+        return AssignmentResult(matched_boxes, matched_labels, positive_mask,
+                                torch.where(positive_mask, best_gt_index, -1))

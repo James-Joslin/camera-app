@@ -40,6 +40,9 @@ from person_detection.data.layout import (
     version_blob,
 )
 from person_detection.data.dataset import CanonicalPersonDetectionDataset
+from person_detection.modeling.occlusion import (
+    OcclusionConfig, OcclusionLoss, occlusion_recipe, auxiliary_scale,
+)
 from person_detection.modeling.assignment import ATSSAnchorAssigner
 from person_detection.modeling.clean_head import (
     DEFAULT_MODEL_VARIANT, CleanDetectionHead, PointReferenceGenerator, box_encoding, model_format,
@@ -76,7 +79,7 @@ except ImportError:
 # ============================================================================
 
 @dataclass
-class TrainingConfig:
+class TrainingConfig(OcclusionConfig):
     """Training configuration with sensible defaults"""
     # Data
     data_root: str = './data'
@@ -1077,6 +1080,7 @@ class SSDPersonDetector(nn.Module):
         input_width: int = 640,
         pretrained: bool = True,
         model_variant: str = DEFAULT_MODEL_VARIANT,
+        visible_auxiliary: bool = False,
     ):
         super().__init__()
         if input_width <= input_height:
@@ -1088,6 +1092,9 @@ class SSDPersonDetector(nn.Module):
             raise ValueError("Person detector requires one quality-aware person logit")
         self.model_variant = model_variant
         self.box_encoding = box_encoding(model_variant)
+        if visible_auxiliary and model_variant != "clean_ltrb":
+            raise ValueError("Visible auxiliary requires clean_ltrb")
+        self.auxiliary_head = nn.Conv2d(128, 4, 3, padding=1) if visible_auxiliary else None
 
         backbone = mobilenet_v3_small(
             weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
@@ -1163,6 +1170,14 @@ class SSDPersonDetector(nn.Module):
         return [(int(feature.shape[-2]), int(feature.shape[-1])) for feature in features]
 
     def forward(self, tensor: torch.Tensor):
+        return self._forward(tensor, auxiliary=False)
+
+    def forward_auxiliary(self, tensor: torch.Tensor):
+        if self.auxiliary_head is None:
+            raise ValueError("No visibility auxiliary configured")
+        return self._forward(tensor, auxiliary=True)
+
+    def _forward(self, tensor: torch.Tensor, auxiliary=False):
         input_shape = tuple(tensor.shape[-2:])
         if not torch.jit.is_tracing() and input_shape != (self.input_height, self.input_width):
             raise ValueError(
@@ -1170,10 +1185,13 @@ class SSDPersonDetector(nn.Module):
                 f"{input_shape[0]}x{input_shape[1]}"
             )
         fpn_features = self.fpn(self._extract_backbone_features(tensor))
-        all_cls, all_bbox = [], []
+        all_cls, all_bbox, all_visible = [], [], []
         for level, feature in enumerate(fpn_features):
             if self.model_variant == "anchor":
                 classification, boxes = self.detection_heads[level](feature)
+            elif auxiliary:
+                classification, boxes, visible = self.detection_heads(feature, level, self.auxiliary_head)
+                all_visible.append(visible)
             else:
                 classification, boxes = self.detection_heads(feature, level)
             all_cls.append(classification)
@@ -1183,6 +1201,12 @@ class SSDPersonDetector(nn.Module):
             distances = boxes * self.distance_scales
             boxes = torch.cat((self.point_centers - distances[..., :2],
                                self.point_centers + distances[..., 2:]), dim=-1)
+        if auxiliary:
+            raw = torch.cat(all_visible, dim=1).float()
+            center = self.point_centers + raw[..., :2] * self.distance_scales
+            size = (nn.functional.softplus(raw[..., 2:]) + 1e-3) * self.distance_scales
+            visible = torch.cat((center - size / 2, center + size / 2), dim=-1)
+            return torch.cat(all_cls, dim=1), boxes, visible
         return torch.cat(all_cls, dim=1), boxes
 
 
@@ -1482,6 +1506,8 @@ class SSDLoss(nn.Module):
         atss_topk: int = 9,
         giou_weight: float = 2.0,
         model_variant: str = DEFAULT_MODEL_VARIANT,
+        occlusion_config: Optional[OcclusionConfig] = None,
+        distance_scales: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         if num_classes != 1:
@@ -1496,6 +1522,8 @@ class SSDLoss(nn.Module):
         self.assigner = ATSSAnchorAssigner(top_k=atss_topk,
                                           point_regression=model_variant == "clean_ltrb")
         self.giou_weight = giou_weight
+        self.occlusion = OcclusionLoss(occlusion_config or OcclusionConfig())
+        self.distance_scales = distance_scales
         self.cls_loss_fn = QualityFocalLoss(focal_alpha, focal_gamma)
 
     def anchor_boxes(self, anchors: torch.Tensor) -> torch.Tensor:
@@ -1586,6 +1614,7 @@ class SSDLoss(nn.Module):
         pred_boxes: torch.Tensor,
         targets: List[Dict],
         anchors: torch.Tensor,
+        visible_predictions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         if pred_cls.ndim != 3 or pred_cls.size(-1) != 1:
             raise ValueError("Quality-aware classification output must have shape [B, N, 1]")
@@ -1596,13 +1625,18 @@ class SSDLoss(nn.Module):
         total_quality = pred_cls.new_zeros(())
         total_pos = 0
         unmatched_gt = 0
+        assignments = []
 
         for batch_index, target in enumerate(targets):
             gt_boxes = target["boxes"].to(device)
             gt_labels = target["labels"].to(device)
             ignore_boxes = target.get("ignore_regions", gt_boxes.new_zeros((0, 4))).to(device)
-            matched_boxes, matched_labels, positive_mask = self.match_anchors(
-                gt_boxes, gt_labels, anchors, ignore_boxes=ignore_boxes
+            assignment = self.assigner.assign(
+                self.anchor_boxes(anchors), self.anchors_per_level, gt_boxes, gt_labels, ignore_boxes
+            )
+            assignments.append(assignment)
+            matched_boxes, matched_labels, positive_mask = (
+                assignment.matched_boxes, assignment.matched_labels, assignment.positive_mask
             )
             unmatched_gt += self.assigner.unmatched_ground_truths
             decoded = self.decode_boxes(pred_boxes[batch_index], anchors)
@@ -1633,8 +1667,14 @@ class SSDLoss(nn.Module):
         normalizer = max(total_pos, 1)
         cls_loss = total_cls_loss / normalizer
         loc_loss = total_loc_loss / normalizer
-        total_loss = cls_loss + loc_loss
+        detection_loss = cls_loss + loc_loss
+        auxiliary_loss, auxiliary_metrics = self.occlusion(
+            pred_boxes, targets, assignments, visible_predictions, self.distance_scales
+        )
+        total_loss = detection_loss + auxiliary_loss
         return total_loss, {
+            **auxiliary_metrics,
+            "detection_loss": detection_loss.item(),
             "cls_loss": cls_loss.item(),
             "loc_loss": loc_loss.item(),
             "mean_quality_target": (total_quality / normalizer).item(),
@@ -2315,6 +2355,16 @@ class WarmupScheduler:
             return True
         return False
 
+def training_forward_loss(model, criterion, images, targets, anchors):
+    if criterion.occlusion.config.visible_loss_weight:
+        cls, boxes, visible = model.forward_auxiliary(images)
+    else:
+        cls, boxes = model(images)
+        visible = None
+    loss, metrics = criterion(cls, boxes, targets, anchors, visible_predictions=visible)
+    return cls, boxes, loss, metrics
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -2328,6 +2378,8 @@ def train_one_epoch(
 ) -> Dict:
     """Train for one epoch with optional mixed precision"""
     model.train()
+    criterion.occlusion.scale = auxiliary_scale(epoch, config.auxiliary_ramp_epochs)
+    component_meters = {}
 
     loss_meter = AverageMeter('Loss')
     cls_meter = AverageMeter('Cls')
@@ -2345,8 +2397,7 @@ def train_one_epoch(
 
         if config.use_amp and scaler is not None:
             with autocast(device_type=config.device):
-                pred_cls, pred_boxes = model(images)
-                loss, loss_dict = criterion(pred_cls, pred_boxes, targets, anchors)
+                pred_cls, pred_boxes, loss, loss_dict = training_forward_loss(model, criterion, images, targets, anchors)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -2355,14 +2406,15 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            pred_cls, pred_boxes = model(images)
-            loss, loss_dict = criterion(pred_cls, pred_boxes, targets, anchors)
+            pred_cls, pred_boxes, loss, loss_dict = training_forward_loss(model, criterion, images, targets, anchors)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
             optimizer.step()
 
+        for name, value in loss_dict.items():
+            component_meters.setdefault(name, AverageMeter(name)).update(value)
         unmatched_gt += loss_dict.get("unmatched_gt", 0)
         loss_meter.update(loss.item())
         cls_meter.update(loss_dict['cls_loss'])
@@ -2386,6 +2438,8 @@ def train_one_epoch(
           f"Loc: {loc_meter.avg:.4f}\n")
 
     return {
+        **{name: (meter.sum if name.endswith(("_count", "_pairs", "_supervised")) else meter.avg)
+           for name, meter in component_meters.items()},
         'loss': loss_meter.avg,
         'cls_loss': cls_meter.avg,
         'loc_loss': loc_meter.avg,
@@ -2461,6 +2515,7 @@ def validate(
         raise ValueError("TrainingConfig is required when validation AP is enabled")
     model.eval()
     loss_meter = AverageMeter('Loss')
+    component_meters = {}
     calculator = (
         MAPCalculator(
             [0.5 + index * 0.05 for index in range(10)],
@@ -2472,15 +2527,18 @@ def validate(
     with torch.no_grad():
         for images, targets in dataloader:
             images = images.to(device)
-            pred_cls, pred_boxes = model(images)
-            loss, _ = criterion(pred_cls, pred_boxes, targets, anchors)
+            pred_cls, pred_boxes, loss, loss_dict = training_forward_loss(model, criterion, images, targets, anchors)
+            for name, value in loss_dict.items():
+                component_meters.setdefault(name, AverageMeter(name)).update(value)
             loss_meter.update(loss.item())
             if calculator is not None:
                 add_validation_map_batch(
                     calculator, pred_cls, pred_boxes, targets, anchors, config
                 )
 
-    results = {'loss': loss_meter.avg}
+    results = {name: (meter.sum if name.endswith(("_count", "_pairs", "_supervised")) else meter.avg)
+           for name, meter in component_meters.items()}
+    results['loss'] = loss_meter.avg
     if calculator is not None:
         results.update(calculator.compute_map(verbose=False))
         results.update({
@@ -2492,6 +2550,23 @@ def validate(
 # ============================================================================
 # MAIN TRAINING PIPELINE
 # ============================================================================
+
+def detector_state_dict(model):
+    return {key: value for key, value in model.state_dict().items()
+            if not key.startswith("auxiliary_head.")}
+
+
+def load_training_state(model, checkpoint):
+    state = dict(checkpoint["model_state_dict"])
+    if model.auxiliary_head is not None:
+        state.update({"auxiliary_head." + key: value
+                      for key, value in checkpoint["auxiliary_state_dict"].items()})
+    load_detector_state_dict(model, state)
+
+
+def checkpoint_is_selected(selection, *, loss_improved, ap_improved, final_epoch):
+    return {"ap": ap_improved, "detection_loss": loss_improved, "final": final_epoch}[selection]
+
 
 def checkpoint_resume_mismatches(
     checkpoint: Dict,
@@ -2529,6 +2604,11 @@ def checkpoint_resume_mismatches(
     compare("anchors", checkpoint.get("anchors"), anchor_specification)
     compare("boxEncoding", checkpoint.get("boxEncoding", "anchor_offsets"), box_encoding(config.model_variant))
 
+    previous_recipe = checkpoint.get("occlusion", occlusion_recipe(TrainingConfig()))
+    compare("occlusion", previous_recipe, occlusion_recipe(config))
+    if config.visible_loss_weight and not checkpoint.get("auxiliary_state_dict"):
+        mismatches["auxiliaryState"] = {"checkpoint": "missing", "current": "required"}
+
     required_state = (
         "model_state_dict",
         "optimizer_state_dict",
@@ -2563,7 +2643,14 @@ def make_training_checkpoint(
         "epoch": epoch,
         "completedEpochs": epoch + 1,
         "trainingComplete": training_complete,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": detector_state_dict(model),
+        "auxiliary_state_dict": (model.auxiliary_head.state_dict()
+                                 if getattr(model, "auxiliary_head", None) is not None else {}),
+        "occlusion": occlusion_recipe(config),
+        "selection": {"metric": config.checkpoint_selection, "epoch": epoch + 1},
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": (np.random.get_state()[0], np.random.get_state()[1].tolist(),
+                            *np.random.get_state()[2:]),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
@@ -2619,6 +2706,10 @@ def log_epoch_to_tensorboard(
     for metric_name, tag in metric_tags.items():
         if metric_name in val_metrics:
             writer.add_scalar(tag, val_metrics[metric_name], epoch_number)
+    for split, metrics in (("train", train_metrics), ("validation", val_metrics)):
+        for name, value in metrics.items():
+            if name.startswith(("visible_", "repgt_", "repbox_", "auxiliary_")) or name == "detection_loss":
+                writer.add_scalar(f"G/{split}/{name}", value, epoch_number)
     writer.flush()
 
 
@@ -2626,12 +2717,22 @@ class DetectorTrainingPipeline:
     """Own the canonical train/validate/checkpoint/export workflow."""
 
     def __init__(self, config: TrainingConfig):
+        config.validate_occlusion()
         self.config = config
 
     @classmethod
     def from_environment(cls) -> "DetectorTrainingPipeline":
         config = TrainingConfig(
             model_variant=os.getenv("TRAINING_MODEL_VARIANT", DEFAULT_MODEL_VARIANT),
+            visible_loss_weight=float(os.getenv("TRAINING_VISIBLE_LOSS_WEIGHT", "0.0")),
+            repgt_loss_weight=float(os.getenv("TRAINING_REPGT_LOSS_WEIGHT", "0.0")),
+            repbox_loss_weight=float(os.getenv("TRAINING_REPBOX_LOSS_WEIGHT", "0.0")),
+            auxiliary_ramp_epochs=int(os.getenv("TRAINING_AUXILIARY_RAMP_EPOCHS", "5")),
+            repgt_sigma=float(os.getenv("TRAINING_REPGT_SIGMA", "0.5")),
+            repbox_sigma=float(os.getenv("TRAINING_REPBOX_SIGMA", "0.0")),
+            repbox_predictions_per_gt=int(os.getenv("TRAINING_REPBOX_PREDICTIONS_PER_GT", "4")),
+            repulsion_chunk_size=int(os.getenv("TRAINING_REPULSION_CHUNK_SIZE", "64")),
+            checkpoint_selection=os.getenv("TRAINING_CHECKPOINT_SELECTION", "detection_loss"),
             azurite_endpoint=os.getenv("AZURITE_BLOB_ENDPOINT", "http://127.0.0.1:10000/devstoreaccount1"),
             azurite_access_key=os.getenv("AZURITE_ACCOUNT_NAME", "devstoreaccount1"),
             azurite_secret_key=os.getenv("AZURITE_ACCOUNT_KEY", ""),
@@ -2671,6 +2772,7 @@ class DetectorTrainingPipeline:
                 "TRAINING_TENSORBOARD_LOG_DIR", "tensorboard"
             ),
         )
+        config.validate_occlusion()
         if config.num_epochs < 1:
             raise ValueError("TRAINING_EPOCHS must be at least 1")
         if config.input_height < 32 or config.input_width < 32:
@@ -2717,6 +2819,7 @@ class DetectorTrainingPipeline:
         print(f"Input canvas: {config.input_height}x{config.input_width} (HxW)")
         print(f"Batch size: {config.batch_size}")
         print(f"Epochs: {config.num_epochs}")
+        print(f"G recipe: {json.dumps(occlusion_recipe(config), sort_keys=True)}")
         print(
             "Validation AP: "
             + (
@@ -2741,6 +2844,7 @@ class DetectorTrainingPipeline:
         exporter = OpenVINOExporter(config)
         best_checkpoint_path = "best_model_fp32.pth"
         best_ap_checkpoint_path = "best_model_ap.pth"
+        best_loss_checkpoint_path = "best_model_loss.pth"
         last_checkpoint_path = "last_training_checkpoint.pth"
         checkpoint_prefix = ("person_detector_ssd" if config.model_variant == "anchor"
                              else f"person_detector_ssd/{config.model_variant}")
@@ -2752,6 +2856,7 @@ class DetectorTrainingPipeline:
             input_height=config.input_height,
             input_width=config.input_width,
             augment=True,
+            coarse_dropout=config.visible_loss_weight == 0,
         )
         val_dataset = CanonicalPersonDetectionDataset(
             azurite_client,
@@ -2799,6 +2904,7 @@ class DetectorTrainingPipeline:
         print("\nInitializing model...")
         model = SSDPersonDetector(
             model_variant=config.model_variant,
+            visible_auxiliary=config.visible_loss_weight > 0,
             num_classes=config.num_classes,
             input_height=config.input_height,
             input_width=config.input_width,
@@ -2821,11 +2927,14 @@ class DetectorTrainingPipeline:
             atss_topk=config.atss_topk,
             giou_weight=config.giou_weight,
             model_variant=config.model_variant,
+            occlusion_config=config,
+            distance_scales=getattr(model, "distance_scales", None),
         )
 
         if config.use_varied_lr:
             optimizer = optim.SGD(
-                [
+                ([{"params": model.auxiliary_head.parameters(), "lr": config.learning_rate}]
+                 if model.auxiliary_head is not None else []) + [
                     {"params": model.features.parameters(), "lr": config.learning_rate * 0.1},
                     {"params": model.fpn.parameters(), "lr": config.learning_rate},
                     {"params": model.extra_layers.parameters(), "lr": config.learning_rate},
@@ -2871,7 +2980,13 @@ class DetectorTrainingPipeline:
                     "Use a fresh training run/directory to preserve the baseline."
                 )
             else:
-                load_detector_state_dict(model, candidate["model_state_dict"])
+                load_training_state(model, candidate)
+                if "python_rng_state" in candidate:
+                    random.setstate(candidate["python_rng_state"])
+                if "numpy_rng_state" in candidate:
+                    numpy_state = candidate["numpy_rng_state"]
+                    np.random.set_state((numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32),
+                                         *numpy_state[2:]))
                 optimizer.load_state_dict(candidate["optimizer_state_dict"])
                 scheduler.load_state_dict(candidate["scheduler_state_dict"])
                 scaler.load_state_dict(candidate["scaler_state_dict"])
@@ -2960,9 +3075,9 @@ class DetectorTrainingPipeline:
                     )
                 print(summary)
 
-                improved = val_metrics["loss"] < best_val_loss
+                improved = val_metrics["detection_loss"] < best_val_loss
                 if improved:
-                    best_val_loss = val_metrics["loss"]
+                    best_val_loss = val_metrics["detection_loss"]
                 measured_map = val_metrics.get("mAP@0.50:0.95")
                 map_improved = measured_map is not None and measured_map > best_val_map
                 if map_improved:
@@ -2986,7 +3101,8 @@ class DetectorTrainingPipeline:
                     best_val_map=best_val_map,
                     last_validation_metrics=val_metrics,
                 )
-                save_training_checkpoint(checkpoint, last_checkpoint_path)
+                save_training_checkpoint({**checkpoint, "selection": {"metric": "latest", "epoch": epoch + 1}},
+                                         last_checkpoint_path)
                 if config.use_azurite:
                     azurite_client.put_object(
                         config.azurite_model_bucket,
@@ -2994,6 +3110,13 @@ class DetectorTrainingPipeline:
                         last_checkpoint_path,
                     )
                 if improved:
+                    save_training_checkpoint({**checkpoint, "selection": {"metric": "detection_loss", "epoch": epoch + 1}},
+                                             best_loss_checkpoint_path)
+                    if config.use_azurite:
+                        azurite_client.put_object(config.azurite_model_bucket,
+                            f"{checkpoint_prefix}/best_model_loss.pth", best_loss_checkpoint_path)
+                if checkpoint_is_selected(config.checkpoint_selection, loss_improved=improved,
+                                          ap_improved=map_improved, final_epoch=epoch + 1 == config.num_epochs):
                     save_training_checkpoint(checkpoint, best_checkpoint_path)
                     if config.use_azurite:
                         azurite_client.put_object(
@@ -3001,9 +3124,10 @@ class DetectorTrainingPipeline:
                             f"{checkpoint_prefix}/best_model_fp32.pth",
                             best_checkpoint_path,
                         )
-                    print(f"✓ Saved best FP32 model (loss: {best_val_loss:.4f})")
+                    print(f"✓ Saved selected FP32 model ({config.checkpoint_selection}, epoch {epoch + 1})")
                 if map_improved:
-                    save_training_checkpoint(checkpoint, best_ap_checkpoint_path)
+                    save_training_checkpoint({**checkpoint, "selection": {"metric": "ap", "epoch": epoch + 1}},
+                                             best_ap_checkpoint_path)
                     if config.use_azurite:
                         azurite_client.put_object(
                             config.azurite_model_bucket,
@@ -3034,6 +3158,9 @@ class DetectorTrainingPipeline:
         )
         if mismatches:
             raise RuntimeError(f"Best checkpoint is incompatible with this run: {mismatches}")
+        model = SSDPersonDetector(model_variant=config.model_variant, num_classes=config.num_classes,
+                                  input_height=config.input_height, input_width=config.input_width,
+                                  pretrained=False).to(config.device).eval()
         load_detector_state_dict(model, checkpoint["model_state_dict"])
         print(
             f"✓ Loaded checkpoint from epoch {checkpoint['epoch']} "
@@ -3056,7 +3183,7 @@ class DetectorTrainingPipeline:
         print("=" * 60)
         print("\nOutput files:")
         print("  - last_training_checkpoint.pth (resumable training state)")
-        print("  - best_model_fp32.pth (best validation-loss weights)")
+        print("  - best_model_fp32.pth (selected detection weights)")
         if os.path.exists(best_ap_checkpoint_path):
             print("  - best_model_ap.pth (best measured validation AP50:95 weights)")
         if config.tensorboard_enabled:
