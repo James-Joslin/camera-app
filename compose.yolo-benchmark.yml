@@ -1,0 +1,34 @@
+services:
+  azurite:
+    command: azurite-blob --blobHost 0.0.0.0 --location /data --disableTelemetry --skipApiVersionCheck
+  yolo-benchmark:
+    image: ${YOLO_BENCHMARK_IMAGE:-camera-software-yolo:benchmark}
+    build:
+      context: ./model_training
+      dockerfile: yolo_benchmark/Dockerfile
+    restart: 'no'
+    environment:
+      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;}
+      AZURITE_DATA_CONTAINER: ${AZURITE_DATA_CONTAINER:-computer-vision-data}
+      CALIBRATION_SAMPLES: ${CALIBRATION_SAMPLES:-300}
+      VALIDATION_SAMPLES: ${VALIDATION_SAMPLES:-500}
+      MAX_ACCURACY_DROP: ${MAX_ACCURACY_DROP:-0.01}
+      BENCHMARK_ITERATIONS: ${BENCHMARK_ITERATIONS:-100}
+      OPENVINO_THREADS: ${OPENVINO_THREADS:-1}
+      BENCHMARK_SCORE_THRESHOLD: ${BENCHMARK_SCORE_THRESHOLD:-0.5}
+      CITYPERSONS_DATASET_VERSION: ${CITYPERSONS_DATASET_VERSION:-}
+      CITYPERSONS_RESUME_UPLOAD: ${CITYPERSONS_RESUME_UPLOAD:-false}
+      YOLO_MODEL: ${YOLO_MODEL:-yolov8n}
+      YOLO_INT8: ${YOLO_INT8:-true}
+      YOLO_RUN_ID: ${YOLO_RUN_ID:-}
+    volumes:
+    - yolo-benchmark-state:/state
+    - ${KAGGLE_JSON_PATH:-./kaggle.json}:/root/.kaggle/kaggle.json:ro
+    depends_on:
+      azurite:
+        condition: service_healthy
+volumes:
+  yolo-benchmark-state: null
