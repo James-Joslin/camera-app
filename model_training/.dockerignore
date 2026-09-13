@@ -16,3 +16,8 @@ validation_preview/
 test_output/
 old/
 .citypersons-official/
+
+output/
+runs/
+legacy/
+benchmark_results/

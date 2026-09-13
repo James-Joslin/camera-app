@@ -15,12 +15,11 @@ Features:
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from torchvision.ops import box_iou, nms
-import cv2
 import numpy as np
 import json
 import os
@@ -33,12 +32,6 @@ from enum import Enum
 from tqdm import tqdm
 import random
 
-from person_detection.data.layout import (
-    TRAINABLE_LABEL_STATUSES,
-    load_citypersons_split,
-    resolve_citypersons_prefix,
-    version_blob,
-)
 from person_detection.data.dataset import CanonicalPersonDetectionDataset
 from person_detection.modeling.occlusion import (
     OcclusionConfig, OcclusionLoss, occlusion_recipe, auxiliary_scale,
@@ -46,18 +39,9 @@ from person_detection.modeling.occlusion import (
 from person_detection.modeling.assignment import ATSSAnchorAssigner
 from person_detection.modeling.clean_head import (
     DEFAULT_MODEL_VARIANT, CleanDetectionHead, PointReferenceGenerator, box_encoding, model_format,
-    mark_openvino_outputs, has_decoded_boxes,
+    mark_openvino_outputs,
 )
 from person_detection.evaluation.metrics import MAPCalculator
-
-# Optional imports with fallbacks
-try:
-    import albumentations as A
-    from albumentations.pytorch import ToTensorV2
-    HAS_ALBUMENTATIONS = True
-except ImportError:
-    HAS_ALBUMENTATIONS = False
-    print("Warning: albumentations not installed. Using basic transforms.")
 
 try:
     from person_detection.data.storage import AzuriteBlobCompat
@@ -124,11 +108,9 @@ class TrainingConfig(OcclusionConfig):
     tensorboard_enabled: bool = True
     tensorboard_log_dir: str = 'tensorboard'
 
-    # Legacy in-training QAT; release INT8 artifacts are built by the optimization pipeline.
+    # Retain the retired-QAT guard for old configurations; INT8 belongs to optimization.
+    export_openvino_after_training: bool = True
     enable_quantization: bool = False
-    qat_epochs: int = 10  # Quantization-aware training epochs
-    qat_learning_rate: float = 1e-4  # Usually 1/10 of original
-    calibration_samples: int = 1000  # Samples for calibration
 
     # Azurite (optional)
     azurite_endpoint: str = ''
@@ -403,408 +385,6 @@ def model_summary(model: nn.Module, model_type: ModelType, input1_size: tuple, i
 
 # ============================================================================
 # DATASET
-# ============================================================================
-
-class LegacyYoloPersonDetectionDataset(Dataset):
-    """
-    Person detection dataset with YOLO format annotations
-
-    YOLO format: class_id center_x center_y width height (normalized 0-1)
-    Example: 0 0.4 0.7 0.3 0.4
-
-    Empty annotation file = no objects in image (valid negative example)
-    """
-
-    def __init__(
-        self,
-        azurite_client: AzuriteClient,
-        split: str = 'train',
-        input_size: int = 320,
-        augment: bool = True
-    ):
-        self.azurite = azurite_client
-        self.config = azurite_client.config
-        self.split = split
-        self.input_size = input_size
-        self.augment = augment and (split == 'train')
-
-        # Find all images
-        self.samples = self._find_samples()
-
-        # Analyze and report dataset structure
-        self._report_dataset_structure()
-
-        # Setup transforms
-        self._setup_transforms()
-
-    def _report_dataset_structure(self):
-        """Report details about the dataset structure"""
-        if not self.samples:
-            print(f"⚠ Warning: No samples found for {self.split} split!")
-            return
-
-        # Extract city folders from paths
-        cities = set()
-        for img_path, _ in self.samples:
-            cities.add(Path(img_path).parent.name)
-
-        print(f"Found {len(self.samples)} images for {self.split} split")
-        print(f"  Cities: {len(cities)} folders")
-        if len(cities) <= 15:
-            print(f"  → {', '.join(sorted(cities))}")
-        else:
-            city_list = sorted(cities)
-            print(f"  → {', '.join(city_list[:10])}... and {len(cities)-10} more")
-
-        # Show example mappings for verification
-        print(f"  Example mappings:")
-        for i, (img_path, label_path) in enumerate(self.samples[:2]):
-            print(f"    Image: {img_path}")
-            print(f"    Label: {label_path}")
-            if i < 1:
-                print()
-
-    def validate_samples(self, num_samples: int = 5) -> bool:
-        """
-        Validate that image-label pairs exist and are correctly mapped
-
-        Args:
-            num_samples: Number of random samples to validate
-
-        Returns:
-            True if validation passes
-        """
-        import random
-
-        if not self.samples:
-            print("✗ No samples to validate")
-            return False
-
-        # Check a few random samples
-        samples_to_check = random.sample(
-            self.samples,
-            min(num_samples, len(self.samples))
-        )
-
-        valid = 0
-        missing_labels = 0
-
-        for img_path, label_path in samples_to_check:
-            # Check if image exists
-            img_data = self.azurite.get_object_bytes(
-                self.config.azurite_data_bucket,
-                img_path
-            )
-
-            if img_data is None:
-                print(f"  ✗ Image not found: {img_path}")
-                continue
-
-            # Check if label exists (empty is OK, missing file is noted)
-            label_data = self.azurite.get_object_bytes(
-                self.config.azurite_data_bucket,
-                label_path
-            )
-
-            if label_data is None:
-                missing_labels += 1
-
-            valid += 1
-
-        print(f"  Validation: {valid}/{len(samples_to_check)} images accessible")
-        if missing_labels > 0:
-            print(f"  ✗ {missing_labels} required labels are missing")
-
-        return valid > 0 and missing_labels == 0
-
-    def _find_samples(self) -> List[Tuple[str, str]]:
-        """
-        Load image-label pairs from the published immutable split manifest.
-
-        Expected Azurite structure:
-            computer-vision-data/
-            └── datasets/citypersons/<version>/
-            ├── images/
-            │   ├── train/
-            │   │   ├── aachen/
-            │   │   │   ├── aachen_000000_000019_leftImg8bit.png
-            │   │   │   └── ...
-            │   │   ├── bochum/
-            │   │   └── ...
-            │   ├── val/
-            │   └── test/
-            └── labels/yolo-person-v1/
-                ├── train/
-                │   ├── aachen/
-                │   │   ├── aachen_000000_000019_leftImg8bit.txt
-                │   │   └── ...
-                │   └── ...
-                └── val/
-        """
-        bucket = self.config.azurite_data_bucket
-        read_blob = lambda name: self.azurite.get_object_bytes(bucket, name)
-        prefix = resolve_citypersons_prefix(read_blob)
-        records = load_citypersons_split(read_blob, prefix, self.split)
-        samples = []
-        for record in records:
-            if record.get("labelStatus") not in TRAINABLE_LABEL_STATUSES:
-                continue
-            image = record.get("image")
-            label = record.get("yoloLabel")
-            if not isinstance(image, str) or not isinstance(label, str):
-                raise RuntimeError(f"Invalid trainable record in {self.split} split")
-            samples.append((version_blob(prefix, image), version_blob(prefix, label)))
-
-        # Sort for reproducibility
-        samples.sort(key=lambda x: x[0])
-
-        return samples
-
-    def _setup_transforms(self):
-        """
-        Setup augmentation pipeline using albumentations native YOLO format
-
-        YOLO format in albumentations: [x_center, y_center, width, height] (all normalized 0-1)
-        This matches our annotation format directly, no conversion needed!
-        """
-        if HAS_ALBUMENTATIONS:
-            if self.augment:
-                self.transform = A.Compose([
-                    # Spatial transforms
-                    A.LongestMaxSize(max_size=int(self.input_size * random.uniform(1.0, 1.5))),
-                    A.PadIfNeeded(
-                        int(self.input_size * 1.1),
-                        int(self.input_size * 1.1),
-                        border_mode=cv2.BORDER_CONSTANT
-                    ),
-                    A.OneOf([
-                        A.RandomCrop(self.input_size, self.input_size),
-                        A.CenterCrop(int(self.input_size * 0.7), int(self.input_size * 0.7)),  # Tight crops
-                    ], p=1.0),
-                    A.Resize(self.input_size, self.input_size),
-                    A.HorizontalFlip(p=0.5),
-                    A.Perspective(scale=(0.05, 0.10), p=0.35),
-                    A.Affine(
-                        translate_percent={"x": (-0.05, 0.05), "y": (-0.12, 0.03)},
-                        scale=(0.85, 1.15),
-                        rotate=(-6, 6),
-                        p=0.3
-                    ),
-
-                    # Occlusion
-                    A.CoarseDropout(
-                        max_holes=6, max_height=40, max_width=40,
-                        min_holes=1, min_height=10, min_width=10,
-                        fill_value=0, p=0.3
-                    ),
-
-                    # Color/lighting
-                    A.OneOf([
-                        A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-                        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3),
-                        A.CLAHE(clip_limit=2.0),
-                        A.ToGray(p=0.15),
-                    ], p=0.5),
-
-                    # Noise/blur
-                    A.OneOf([
-                        A.GaussianBlur(blur_limit=3),
-                        A.MotionBlur(blur_limit=3),
-                        A.GaussNoise(var_limit=(10, 50)),
-                        A.ImageCompression(quality_lower=65, quality_upper=95, p=0.25),
-                    ], p=0.2),
-
-                    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                    ToTensorV2()
-                ], bbox_params=A.BboxParams(
-                    format='yolo',
-                    label_fields=['labels'],
-                    min_area=0.002,
-                    min_visibility=0.3
-                ))
-            else:
-                self.transform = A.Compose([
-                    A.Resize(self.input_size, self.input_size),
-                    A.Normalize(
-                        mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]
-                    ),
-                    ToTensorV2()
-                ], bbox_params=A.BboxParams(
-                    format='yolo',  # Native YOLO format
-                    label_fields=['labels']
-                ))
-        else:
-            self.transform = None
-
-    def _parse_yolo_annotation(self, label_data: Optional[bytes]) -> Tuple[List, List]:
-        """
-        Parse YOLO format annotation
-
-        YOLO format: class_id center_x center_y width height (all normalized 0-1)
-        Example: 0 0.4 0.7 0.3 0.4
-
-        Returns:
-            boxes: List of [cx, cy, w, h] in normalized coordinates (0-1)
-            labels: List of class labels (1 = person, 0 = background)
-        """
-        boxes = []
-        labels = []
-
-        if label_data is None:
-            return boxes, labels
-
-        try:
-            content = label_data.decode('utf-8')
-        except:
-            return boxes, labels
-
-        for line in content.strip().split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-
-            parts = line.split()
-            if len(parts) != 5:
-                continue
-
-            try:
-                yolo_class = int(parts[0])  # 0 = person
-                cx_norm = float(parts[1])
-                cy_norm = float(parts[2])
-                w_norm = float(parts[3])
-                h_norm = float(parts[4])
-            except ValueError:
-                continue
-
-            # Validate normalized coordinates are in valid range
-            if not (0 <= cx_norm <= 1 and 0 <= cy_norm <= 1 and
-                    0 < w_norm <= 1 and 0 < h_norm <= 1):
-                continue
-
-            # Filter out tiny boxes (in normalized coords)
-            # 5 pixels on 320px image = 5/320 = 0.0156
-            # 10 pixels on 320px image = 10/320 = 0.0312
-            min_w_norm = 2 / self.input_size
-            min_h_norm = 4 / self.input_size
-
-            if w_norm < min_w_norm or h_norm < min_h_norm:
-                continue
-
-            # Keep in YOLO format (normalized center format)
-            # Albumentations will handle the transformation
-            boxes.append([cx_norm, cy_norm, w_norm, h_norm])
-
-            # YOLO class 0 -> our class 1 (0 is background)
-            labels.append(yolo_class + 1)
-
-        return boxes, labels
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path, label_path = self.samples[idx]
-
-        # Load image
-        img_data = self.azurite.get_object_bytes(
-            self.config.azurite_data_bucket,
-            img_path
-        )
-        if img_data is None:
-            return self._get_blank_sample(idx)
-
-        # Decode image
-        img_array = np.frombuffer(img_data, np.uint8)
-        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        if image is None:
-            return self._get_blank_sample(idx)
-
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        img_height, img_width = image.shape[:2]
-
-        # Load annotations (returns YOLO format: [cx, cy, w, h] normalized)
-        label_data = self.azurite.get_object_bytes(
-            self.config.azurite_data_bucket,
-            label_path
-        )
-        boxes, labels = self._parse_yolo_annotation(label_data)
-
-        # Apply transforms
-        if self.transform is not None:
-            try:
-                transformed = self.transform(
-                    image=image,
-                    bboxes=boxes if boxes else [],
-                    labels=labels if labels else []
-                )
-                image = transformed['image']
-                boxes = list(transformed['bboxes'])  # Still in YOLO format (normalized)
-                for box in transformed['bboxes']:
-                    cx, cy, w, h = box
-                    assert 0 <= cx <= 1 and 0 <= cy <= 1, f"Invalid center: {box}"
-                    assert 0 < w <= 1 and 0 < h <= 1, f"Invalid size: {box}"
-                labels = list(transformed['labels'])
-            except Exception as e:
-                # Fallback if augmentation fails - apply basic preprocessing
-                image = cv2.resize(image, (self.input_size, self.input_size))
-                image = image.astype(np.float32) / 255.0
-                # Apply ImageNet normalization
-                mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-                std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-                image = (image - mean) / std
-                image = torch.from_numpy(image).permute(2, 0, 1).float()
-                # Boxes stay in YOLO format (already normalized)
-        else:
-            # Basic transform without albumentations - apply same preprocessing
-            image = cv2.resize(image, (self.input_size, self.input_size))
-            image = image.astype(np.float32) / 255.0
-            # Apply ImageNet normalization
-            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-            image = (image - mean) / std
-            image = torch.from_numpy(image).permute(2, 0, 1).float()
-            # Boxes stay in YOLO format (already normalized)
-
-        # Convert boxes from YOLO format (normalized) to pascal_voc format (absolute pixels)
-        # YOLO: [cx, cy, w, h] normalized -> Pascal VOC: [x1, y1, x2, y2] absolute
-        if boxes:
-            converted_boxes = []
-            for box in boxes:
-                cx, cy, w, h = box
-                # Convert to absolute pixel coordinates on the input_size image
-                x1 = (cx - w / 2) * self.input_size
-                y1 = (cy - h / 2) * self.input_size
-                x2 = (cx + w / 2) * self.input_size
-                y2 = (cy + h / 2) * self.input_size
-
-                # Clamp to image bounds
-                x1 = max(0, min(x1, self.input_size))
-                y1 = max(0, min(y1, self.input_size))
-                x2 = max(0, min(x2, self.input_size))
-                y2 = max(0, min(y2, self.input_size))
-
-                converted_boxes.append([x1, y1, x2, y2])
-
-            boxes = torch.as_tensor(converted_boxes, dtype=torch.float32)
-            labels = torch.as_tensor(labels, dtype=torch.int64)
-        else:
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,), dtype=torch.int64)
-
-        return image, {'boxes': boxes, 'labels': labels, 'image_id': idx}
-
-    def _get_blank_sample(self, idx):
-        """Return blank sample for failed loads"""
-        image = torch.zeros(3, self.input_size, self.input_size)
-        return image, {
-            'boxes': torch.zeros((0, 4), dtype=torch.float32),
-            'labels': torch.zeros((0,), dtype=torch.int64),
-            'image_id': idx
-        }
-
-# ============================================================================
-# ANCHOR GENERATOR
 # ============================================================================
 
 class PersonAnchorGenerator:
@@ -1258,221 +838,6 @@ def load_detector_state_dict(
 # LOSS FUNCTION
 # ============================================================================
 
-class FocalLoss(nn.Module):
-    """Focal Loss for addressing class imbalance"""
-
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        ce_loss = nn.functional.cross_entropy(pred, target, reduction='none')
-        pt = torch.exp(-ce_loss)
-        alpha_t = torch.where(target == 0, 1 - self.alpha, self.alpha)
-        focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss
-
-class LegacySSDLoss(nn.Module):
-    """SSD Loss with hard negative mining and focal loss option"""
-
-    def __init__(
-        self,
-        num_classes: int = 2,
-        neg_pos_ratio: int = 3,
-        use_focal_loss: bool = True,
-        focal_alpha: float = 0.35,
-        focal_gamma: float = 1.5,
-        input_size: int = 320
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        self.neg_pos_ratio = neg_pos_ratio
-        self.use_focal_loss = use_focal_loss
-        self.input_size = input_size
-
-        if use_focal_loss:
-            self.cls_loss_fn = FocalLoss(focal_alpha, focal_gamma)
-        else:
-            self.cls_loss_fn = None
-
-    def encode_boxes(self, gt_boxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
-        gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2 / self.input_size
-        gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2 / self.input_size
-        gt_w = (gt_boxes[:, 2] - gt_boxes[:, 0]) / self.input_size
-        gt_h = (gt_boxes[:, 3] - gt_boxes[:, 1]) / self.input_size
-
-        dx = (gt_cx - anchors[:, 0]) / (anchors[:, 2] + 1e-6)
-        dy = (gt_cy - anchors[:, 1]) / (anchors[:, 3] + 1e-6)
-        dw = torch.log(gt_w / (anchors[:, 2] + 1e-6) + 1e-6)
-        dh = torch.log(gt_h / (anchors[:, 3] + 1e-6) + 1e-6)
-
-        return torch.stack([dx, dy, dw, dh], dim=1)
-
-    @staticmethod
-    def anchors_overlapping_ignore(anchor_boxes: torch.Tensor, ignore_boxes: torch.Tensor,
-                                   threshold: float = 0.5) -> torch.Tensor:
-        """Mask anchors whose area is substantially covered by an ignore region."""
-        if ignore_boxes.numel() == 0:
-            return torch.zeros(anchor_boxes.size(0), dtype=torch.bool, device=anchor_boxes.device)
-        top_left = torch.maximum(anchor_boxes[:, None, :2], ignore_boxes[None, :, :2])
-        bottom_right = torch.minimum(anchor_boxes[:, None, 2:], ignore_boxes[None, :, 2:])
-        intersection = (bottom_right - top_left).clamp(min=0).prod(dim=2)
-        anchor_area = ((anchor_boxes[:, 2] - anchor_boxes[:, 0]).clamp(min=1e-6) *
-                       (anchor_boxes[:, 3] - anchor_boxes[:, 1]).clamp(min=1e-6))
-        return (intersection / anchor_area[:, None]).amax(dim=1) >= threshold
-
-    def match_anchors(
-        self,
-        gt_boxes: torch.Tensor,
-        gt_labels: torch.Tensor,
-        anchors: torch.Tensor,
-        ignore_boxes: Optional[torch.Tensor] = None,
-        iou_threshold: float = 0.45,
-        iou_threshold_neg: float = 0.35
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_anchors = anchors.size(0)
-        device = anchors.device
-        anchor_boxes = torch.zeros_like(anchors)
-        anchor_boxes[:, 0] = (anchors[:, 0] - anchors[:, 2] / 2) * self.input_size
-        anchor_boxes[:, 1] = (anchors[:, 1] - anchors[:, 3] / 2) * self.input_size
-        anchor_boxes[:, 2] = (anchors[:, 0] + anchors[:, 2] / 2) * self.input_size
-        anchor_boxes[:, 3] = (anchors[:, 1] + anchors[:, 3] / 2) * self.input_size
-        ignored = self.anchors_overlapping_ignore(
-            anchor_boxes,
-            ignore_boxes if ignore_boxes is not None else anchor_boxes.new_zeros((0, 4)),
-        )
-
-        if gt_boxes.size(0) == 0:
-            matched_labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
-            matched_labels[ignored] = -1
-            return (
-                torch.zeros(num_anchors, 4, device=device),
-                matched_labels,
-                torch.zeros(num_anchors, dtype=torch.bool, device=device),
-            )
-
-        ious = box_iou(anchor_boxes, gt_boxes)
-
-        best_gt_iou, best_gt_idx = ious.max(dim=1)
-        best_anchor_iou, best_anchor_idx = ious.max(dim=0)
-
-        for gt_idx, anchor_idx in enumerate(best_anchor_idx):
-            best_gt_iou[anchor_idx] = 2.0
-            best_gt_idx[anchor_idx] = gt_idx
-
-        matched_labels = gt_labels[best_gt_idx]
-        matched_boxes = gt_boxes[best_gt_idx]
-
-        matched_labels[best_gt_iou < iou_threshold] = 0
-
-        ignore_mask = (best_gt_iou >= iou_threshold_neg) & (best_gt_iou < iou_threshold)
-        matched_labels[ignore_mask] = -1
-        matched_labels[ignored & (matched_labels == 0)] = -1
-
-        positive_mask = matched_labels > 0
-
-        return matched_boxes, matched_labels, positive_mask
-
-    def hard_negative_mining(
-        self,
-        cls_loss: torch.Tensor,
-        labels: torch.Tensor,
-        pos_mask: torch.Tensor
-    ) -> torch.Tensor:
-        num_pos = pos_mask.sum().item()
-        num_neg = int(self.neg_pos_ratio * num_pos)
-
-        if num_neg == 0:
-            num_neg = 100
-
-        neg_mask = labels == 0
-
-        neg_loss = cls_loss.clone()
-        neg_loss[~neg_mask] = -float('inf')
-
-        _, neg_indices = neg_loss.sort(descending=True)
-        hard_neg_mask = torch.zeros_like(neg_mask)
-        hard_neg_mask[neg_indices[:num_neg]] = True
-        hard_neg_mask = hard_neg_mask & neg_mask
-
-        return pos_mask | hard_neg_mask
-
-    def forward(
-        self,
-        pred_cls: torch.Tensor,
-        pred_boxes: torch.Tensor,
-        targets: List[Dict],
-        anchors: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict]:
-        device = pred_cls.device
-        batch_size = pred_cls.size(0)
-        anchors = anchors.to(device)
-
-        total_cls_loss = 0
-        total_loc_loss = 0
-        total_pos = 0
-
-        for i in range(batch_size):
-            gt_boxes = targets[i]['boxes'].to(device)
-            gt_labels = targets[i]['labels'].to(device)
-            ignore_boxes = targets[i].get('ignore_regions', gt_boxes.new_zeros((0, 4))).to(device)
-
-            matched_boxes, matched_labels, pos_mask = self.match_anchors(
-                gt_boxes, gt_labels, anchors, ignore_boxes=ignore_boxes
-            )
-
-            valid_mask = matched_labels >= 0
-
-            if self.use_focal_loss:
-                cls_loss_per_anchor = self.cls_loss_fn(
-                    pred_cls[i][valid_mask],
-                    matched_labels[valid_mask]
-                )
-                cls_loss = cls_loss_per_anchor.sum()
-            else:
-                cls_loss_per_anchor = nn.functional.cross_entropy(
-                    pred_cls[i], matched_labels.clamp(min=0),
-                    reduction='none'
-                )
-                selected_mask = self.hard_negative_mining(
-                    cls_loss_per_anchor, matched_labels, pos_mask
-                )
-                cls_loss = cls_loss_per_anchor[selected_mask].sum()
-
-            total_cls_loss += cls_loss
-
-            num_pos = pos_mask.sum().item()
-            if num_pos > 0:
-                encoded_gt = self.encode_boxes(
-                    matched_boxes[pos_mask],
-                    anchors[pos_mask]
-                )
-
-                loc_loss = nn.functional.smooth_l1_loss(
-                    pred_boxes[i][pos_mask],
-                    encoded_gt,
-                    reduction='sum'
-                )
-                total_loc_loss += loc_loss
-
-            total_pos += num_pos
-
-        num_pos_total = max(total_pos, 1)
-        cls_loss = total_cls_loss / num_pos_total
-        loc_loss = total_loc_loss / num_pos_total
-
-        total_loss = cls_loss + loc_loss
-
-        loss_dict = {
-            'cls_loss': cls_loss.item(),
-            'loc_loss': loc_loss if isinstance(loc_loss, float) else loc_loss.item(),
-            'num_pos': total_pos
-        }
-
-        return total_loss, loss_dict
-
-
 class QualityFocalLoss(nn.Module):
     """Binary Quality Focal Loss with continuous IoU targets for positives."""
 
@@ -1580,6 +945,30 @@ class SSDLoss(nn.Module):
         )
         return result.matched_boxes, result.matched_labels, result.positive_mask
 
+    def hard_negative_mining(
+        self,
+        cls_loss: torch.Tensor,
+        labels: torch.Tensor,
+        pos_mask: torch.Tensor
+    ) -> torch.Tensor:
+        num_pos = pos_mask.sum().item()
+        num_neg = int(self.neg_pos_ratio * num_pos)
+
+        if num_neg == 0:
+            num_neg = 100
+
+        neg_mask = labels == 0
+
+        neg_loss = cls_loss.clone()
+        neg_loss[~neg_mask] = -float('inf')
+
+        _, neg_indices = neg_loss.sort(descending=True)
+        hard_neg_mask = torch.zeros_like(neg_mask)
+        hard_neg_mask[neg_indices[:num_neg]] = True
+        hard_neg_mask = hard_neg_mask & neg_mask
+
+        return pos_mask | hard_neg_mask
+
     @staticmethod
     def aligned_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         top_left = torch.maximum(boxes1[:, :2], boxes2[:, :2])
@@ -1658,8 +1047,8 @@ class SSDLoss(nn.Module):
             if self.use_focal_loss:
                 total_cls_loss += losses[valid_mask].sum()
             else:
-                selected = LegacySSDLoss.hard_negative_mining(
-                    self, losses, matched_labels, positive_mask
+                selected = self.hard_negative_mining(
+                    losses, matched_labels, positive_mask
                 )
                 total_cls_loss += losses[selected & valid_mask].sum()
             total_pos += int(positive_mask.sum())
@@ -1720,98 +1109,8 @@ def decode_boxes(
 
     return torch.stack([x1, y1, x2, y2], dim=1)
 
-def apply_nms(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-    iou_threshold: float = 0.5,
-    score_threshold: float = 0.05,
-    max_detections: int = 100
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Apply class-wise NMS."""
-    from torchvision.ops import nms
-
-    keep_boxes, keep_scores, keep_labels = [], [], []
-
-    for class_id in labels.unique():
-        if class_id == 0:  # Skip background
-            continue
-
-        class_mask = labels == class_id
-        class_boxes = boxes[class_mask]
-        class_scores = scores[class_mask]
-
-        # Score threshold
-        score_mask = class_scores > score_threshold
-        class_boxes = class_boxes[score_mask]
-        class_scores = class_scores[score_mask]
-
-        if len(class_boxes) == 0:
-            continue
-
-        # NMS
-        keep_idx = nms(class_boxes, class_scores, iou_threshold)
-
-        keep_boxes.append(class_boxes[keep_idx])
-        keep_scores.append(class_scores[keep_idx])
-        keep_labels.append(torch.full((len(keep_idx),), class_id, dtype=torch.long))
-
-    if keep_boxes:
-        boxes_out = torch.cat(keep_boxes)
-        scores_out = torch.cat(keep_scores)
-        labels_out = torch.cat(keep_labels)
-
-        # Limit total detections
-        if len(boxes_out) > max_detections:
-            _, top_idx = scores_out.topk(max_detections)
-            boxes_out = boxes_out[top_idx]
-            scores_out = scores_out[top_idx]
-            labels_out = labels_out[top_idx]
-
-        return boxes_out, scores_out, labels_out
-    else:
-        return torch.empty(0, 4), torch.empty(0), torch.empty(0, dtype=torch.long)
-
-def compute_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
-    """Compute IoU matrix between two sets of boxes."""
-    x1 = np.maximum(boxes1[:, None, 0], boxes2[None, :, 0])
-    y1 = np.maximum(boxes1[:, None, 1], boxes2[None, :, 1])
-    x2 = np.minimum(boxes1[:, None, 2], boxes2[None, :, 2])
-    y2 = np.minimum(boxes1[:, None, 3], boxes2[None, :, 3])
-
-    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-
-    union = area1[:, None] + area2[None, :] - inter
-
-    return inter / (union + 1e-10)
-
-def calculate_ap_voc(recalls: np.ndarray, precisions: np.ndarray) -> float:
-    """Calculate AP using VOC 2010+ method (all-point interpolation)."""
-    # Prepend sentinel values
-    recalls = np.concatenate([[0], recalls, [1]])
-    precisions = np.concatenate([[0], precisions, [0]])
-
-    # Make precision monotonically decreasing
-    for i in range(len(precisions) - 2, -1, -1):
-        precisions[i] = max(precisions[i], precisions[i + 1])
-
-    # Find points where recall changes
-    recall_changes = np.where(recalls[1:] != recalls[:-1])[0]
-
-    # Sum (delta recall) * precision
-    ap = np.sum((recalls[recall_changes + 1] - recalls[recall_changes]) * precisions[recall_changes + 1])
-
-    return ap
-
-# ============================================================================
-# OPENVINO EXPORT WITH mAP EVALUATION
-# ============================================================================
-
 class OpenVINOExporter:
-    """Export models to OpenVINO IR format, benchmark performance, and calculate mAP"""
+    """Standalone FP32 export; release optimization owns evaluation and benchmarking."""
 
     def __init__(self, config: TrainingConfig):
         self.config = config
@@ -1862,455 +1161,7 @@ class OpenVINOExporter:
             return output_path
 
         except Exception as e:
-            print(f"✗ Export failed: {e}")
-            return None
-
-    def run_inference(
-        self,
-        model_path: str,
-        dataloader: DataLoader,
-        anchors: torch.Tensor,
-        input_height: int,
-        input_width: int,
-        device: str = 'CPU',
-        score_threshold: float = 0.05,
-        nms_threshold: float = 0.5,
-        pre_nms_topk: int = 1000,
-    ) -> Tuple[List[Dict], List[Dict]]:
-        """
-        Run inference on OpenVINO model and collect predictions.
-
-        Returns:
-            all_predictions: List of prediction dicts
-            all_ground_truths: List of ground truth dicts
-        """
-        if not HAS_OPENVINO:
-            return [], []
-
-        # Load and compile model
-        model = self.core.read_model(model_path)
-        compiled_model = self.core.compile_model(model, device)
-
-        output_layers = compiled_model.outputs
-        output_cls = next(
-            output for output in output_layers if int(output.shape[-1]) in (1, 2)
-        )
-        output_box = next(
-            output for output in output_layers if int(output.shape[-1]) == 4
-        )
-
-        all_predictions = []
-        all_ground_truths = []
-        anchors_torch = anchors
-
-        for images, targets in tqdm(dataloader, desc=f"Inference ({Path(model_path).stem})"):
-            batch_size = images.size(0)
-
-            for i in range(batch_size):
-                image_np = images[i:i+1].numpy()
-                image_id = targets[i]['image_id']
-
-                # Run inference
-                result = compiled_model([image_np])
-                pred_cls = result[output_cls][0]  # [num_anchors, num_classes]
-                pred_boxes = result[output_box][0]  # [num_anchors, 4]
-
-                # Convert to torch for post-processing
-                pred_cls_torch = torch.from_numpy(pred_cls)
-                pred_boxes_torch = torch.from_numpy(pred_boxes)
-
-                max_scores = person_scores_from_logits(pred_cls_torch)
-                selected = torch.where(max_scores >= score_threshold)[0]
-                if len(selected) > pre_nms_topk:
-                    selected = selected[max_scores[selected].topk(pre_nms_topk).indices]
-                selected_scores = max_scores[selected]
-                boxes = decode_boxes(
-                    pred_boxes_torch[selected], anchors_torch[selected],
-                    input_height, input_width,
-                    encoding="xyxy_pixels" if has_decoded_boxes(output_layers) else "anchor_offsets",
-                )
-                pred_labels = torch.ones_like(selected_scores, dtype=torch.long)
-
-                nms_boxes, nms_scores, nms_labels = apply_nms(
-                    boxes, selected_scores, pred_labels,
-                    iou_threshold=nms_threshold,
-                    score_threshold=0.0,
-                )
-
-                # Store predictions
-                for j in range(len(nms_boxes)):
-                    all_predictions.append({
-                        'image_id': image_id,
-                        'class_id': nms_labels[j].item(),
-                        'score': nms_scores[j].item(),
-                        'box': nms_boxes[j].numpy()
-                    })
-
-                # Store ground truths
-                gt_boxes = targets[i]['boxes'].numpy()
-                gt_labels = targets[i]['labels'].numpy()
-
-                for j in range(len(gt_boxes)):
-                    all_ground_truths.append({
-                        'image_id': image_id,
-                        'class_id': int(gt_labels[j]),
-                        'box': gt_boxes[j]
-                    })
-
-        return all_predictions, all_ground_truths
-
-    def calculate_map(
-        self,
-        predictions: List[Dict],
-        ground_truths: List[Dict],
-        iou_thresholds: List[float] = [0.5],
-        verbose: bool = True
-    ) -> Dict:
-        """
-        Calculate mAP from predictions and ground truths.
-
-        Args:
-            predictions: List of {'image_id', 'class_id', 'score', 'box'}
-            ground_truths: List of {'image_id', 'class_id', 'box'}
-            iou_thresholds: IoU thresholds for evaluation
-            verbose: Print per-class results
-
-        Returns:
-            Dictionary with mAP metrics
-        """
-        if not predictions or not ground_truths:
-            print("  No predictions or ground truths to evaluate")
-            return {'mAP@0.50': 0.0}
-
-        results = {}
-        classes = sorted(set(gt['class_id'] for gt in ground_truths))
-
-        for iou_thresh in iou_thresholds:
-            aps = []
-
-            for class_id in classes:
-                if class_id == 0:  # Skip background
-                    continue
-
-                # Get predictions and GTs for this class
-                class_preds = [p for p in predictions if p['class_id'] == class_id]
-                class_gts = [g for g in ground_truths if g['class_id'] == class_id]
-
-                if len(class_gts) == 0:
-                    continue
-
-                # Sort predictions by score (descending)
-                class_preds.sort(key=lambda x: x['score'], reverse=True)
-
-                # Group GTs by image
-                gt_by_image = {}
-                for gt in class_gts:
-                    img_id = gt['image_id']
-                    if img_id not in gt_by_image:
-                        gt_by_image[img_id] = []
-                    gt_by_image[img_id].append(gt['box'])
-
-                # Track which GTs have been matched (per image)
-                gt_matched = {img_id: [False] * len(boxes) for img_id, boxes in gt_by_image.items()}
-
-                tp = np.zeros(len(class_preds))
-                fp = np.zeros(len(class_preds))
-
-                for pred_idx, pred in enumerate(class_preds):
-                    pred_box = pred['box']
-                    pred_img_id = pred['image_id']
-
-                    if pred_img_id not in gt_by_image:
-                        fp[pred_idx] = 1
-                        continue
-
-                    img_gt_boxes = np.array(gt_by_image[pred_img_id])
-
-                    # Compute IoU with all GTs in this image
-                    ious = compute_iou_matrix(pred_box[None, :], img_gt_boxes)[0]
-
-                    # Find best matching GT
-                    best_iou_idx = np.argmax(ious)
-                    best_iou = ious[best_iou_idx]
-
-                    if best_iou >= iou_thresh and not gt_matched[pred_img_id][best_iou_idx]:
-                        tp[pred_idx] = 1
-                        gt_matched[pred_img_id][best_iou_idx] = True
-                    else:
-                        fp[pred_idx] = 1
-
-                # Calculate precision and recall
-                tp_cumsum = np.cumsum(tp)
-                fp_cumsum = np.cumsum(fp)
-
-                recalls = tp_cumsum / len(class_gts)
-                precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-10)
-
-                # Calculate AP
-                ap = calculate_ap_voc(recalls, precisions)
-                aps.append(ap)
-
-                if verbose:
-                    print(f"    Class {class_id}: AP@{iou_thresh:.2f} = {ap:.4f} "
-                          f"(TP={int(tp.sum())}, FP={int(fp.sum())}, GT={len(class_gts)}, "
-                          f"Preds={len(class_preds)})")
-
-            mean_ap = np.mean(aps) if aps else 0.0
-            results[f'mAP@{iou_thresh:.2f}'] = mean_ap
-
-        # COCO-style mAP (average over IoU thresholds)
-        if len(iou_thresholds) > 1:
-            results['mAP@0.50:0.95'] = np.mean([results[f'mAP@{t:.2f}'] for t in iou_thresholds])
-
-        return results
-
-    def benchmark_model(
-        self,
-        model_path: str,
-        device: str = 'CPU',
-        duration_seconds: int = 15,
-        num_threads: int = None
-    ) -> Dict:
-        """Benchmark OpenVINO model performance."""
-        if not HAS_OPENVINO:
-            return {}
-
-        print(f"\n  Benchmarking latency on {device}...")
-
-        try:
-            model = self.core.read_model(model_path)
-
-            config = {}
-            if num_threads is not None:
-                config["INFERENCE_NUM_THREADS"] = str(num_threads)
-                config["NUM_STREAMS"] = "1"
-
-            compiled_model = self.core.compile_model(model, device, config)
-
-            input_layer = compiled_model.input(0)
-            input_shape = input_layer.shape
-            dummy_input = np.random.randn(*input_shape).astype(np.float32)
-
-            # Warmup
-            for _ in range(10):
-                compiled_model([dummy_input])
-
-            # Benchmark
-            start_time = time.time()
-            iterations = 0
-
-            while time.time() - start_time < duration_seconds:
-                compiled_model([dummy_input])
-                iterations += 1
-
-            elapsed_time = time.time() - start_time
-            fps = iterations / elapsed_time
-            latency_ms = (elapsed_time / iterations) * 1000
-
-            results = {
-                'fps': fps,
-                'latency_ms': latency_ms,
-                'iterations': iterations,
-                'device': device,
-                'threads': num_threads or 'auto'
-            }
-
-            print(f"    Threads: {num_threads or 'auto'}")
-            print(f"    Throughput: {fps:.2f} FPS")
-            print(f"    Latency: {latency_ms:.2f} ms")
-
-            return results
-
-        except Exception as e:
-            print(f"  ✗ Benchmark failed: {e}")
-            return {}
-
-    def evaluate_model(
-        self,
-        model_path: str,
-        dataloader: DataLoader,
-        anchors: torch.Tensor,
-        input_height: int,
-        input_width: int,
-        device: str = 'CPU',
-        iou_thresholds: List[float] = [0.5]
-    ) -> Dict:
-        """
-        Run full evaluation: inference + mAP calculation.
-
-        Args:
-            model_path: Path to OpenVINO .xml file
-            dataloader: Validation dataloader
-            anchors: Anchor boxes
-            input_height/input_width: Model canvas dimensions
-            device: OpenVINO device
-            iou_thresholds: IoU thresholds for mAP
-
-        Returns:
-            Dictionary with mAP results
-        """
-        print(f"\n  Running evaluation on {Path(model_path).stem}...")
-
-        # Run inference
-        predictions, ground_truths = self.run_inference(
-            model_path, dataloader, anchors, input_height, input_width, device
-        )
-
-        print(f"    Collected {len(predictions)} predictions, {len(ground_truths)} ground truths")
-
-        # Calculate mAP
-        map_results = self.calculate_map(predictions, ground_truths, iou_thresholds)
-
-        return map_results
-
-    def compare_models(
-        self,
-        fp32_path: str,
-        int8_path: str,
-        dataloader: DataLoader = None,
-        anchors: torch.Tensor = None,
-        input_height: int = 360,
-        input_width: int = 640,
-        device: str = 'CPU',
-        thread_counts: List[int] = None,
-        evaluate_accuracy: bool = True,
-        iou_thresholds: List[float] = None
-    ) -> Dict:
-        """
-        Compare FP32 and INT8 models for both speed and accuracy.
-
-        Args:
-            fp32_path: Path to FP32 OpenVINO model
-            int8_path: Path to INT8 OpenVINO model
-            dataloader: Validation dataloader (required if evaluate_accuracy=True)
-            anchors: Anchor boxes (required if evaluate_accuracy=True)
-            input_height/input_width: Model canvas dimensions
-            device: OpenVINO device
-            thread_counts: List of thread counts to benchmark
-            evaluate_accuracy: Whether to calculate mAP
-            iou_thresholds: IoU thresholds for mAP (default: [0.5] and COCO range)
-
-        Returns:
-            Dictionary with comparison results
-        """
-        print("\n" + "=" * 70)
-        print("Model Performance & Accuracy Comparison")
-        print("=" * 70)
-
-        if thread_counts is None:
-            thread_counts = [None]
-
-        if iou_thresholds is None:
-            iou_thresholds = [0.5]  # Just mAP@0.50 by default
-
-        results = {
-            'fp32': {'speed': [], 'accuracy': {}},
-            'int8': {'speed': [], 'accuracy': {}},
-            'comparison': {}
-        }
-
-        # ====================================================================
-        # Speed Benchmarking
-        # ====================================================================
-        print("\n" + "-" * 70)
-        print("SPEED BENCHMARKING")
-        print("-" * 70)
-
-        for threads in thread_counts:
-            thread_label = threads or 'auto'
-            print(f"\n[Threads: {thread_label}]")
-
-            print("\n  FP32 Model:")
-            fp32_speed = self.benchmark_model(fp32_path, device, num_threads=threads)
-            results['fp32']['speed'].append({'threads': thread_label, **fp32_speed})
-
-            print("\n  INT8 Model:")
-            int8_speed = self.benchmark_model(int8_path, device, num_threads=threads)
-            results['int8']['speed'].append({'threads': thread_label, **int8_speed})
-
-            if fp32_speed and int8_speed:
-                speedup = int8_speed['fps'] / fp32_speed['fps']
-                print(f"\n  → INT8 Speedup: {speedup:.2f}x")
-
-        # ====================================================================
-        # Accuracy Evaluation (mAP)
-        # ====================================================================
-        if evaluate_accuracy and dataloader is not None and anchors is not None:
-            print("\n" + "-" * 70)
-            print("ACCURACY EVALUATION (mAP)")
-            print("-" * 70)
-
-            # Evaluate FP32
-            print("\n  FP32 Model:")
-            fp32_map = self.evaluate_model(
-                fp32_path, dataloader, anchors, input_height, input_width, device, iou_thresholds
-            )
-            results['fp32']['accuracy'] = fp32_map
-
-            for key, value in fp32_map.items():
-                print(f"    {key}: {value:.4f}")
-
-            # Evaluate INT8
-            print("\n  INT8 Model:")
-            int8_map = self.evaluate_model(
-                int8_path, dataloader, anchors, input_height, input_width, device, iou_thresholds
-            )
-            results['int8']['accuracy'] = int8_map
-
-            for key, value in int8_map.items():
-                print(f"    {key}: {value:.4f}")
-
-            # Calculate accuracy drop
-            print("\n  Accuracy Comparison:")
-            for key in fp32_map.keys():
-                if key in int8_map:
-                    drop = fp32_map[key] - int8_map[key]
-                    drop_pct = (drop / fp32_map[key] * 100) if fp32_map[key] > 0 else 0
-                    results['comparison'][f'{key}_drop'] = drop
-                    results['comparison'][f'{key}_drop_pct'] = drop_pct
-                    print(f"    {key}: FP32={fp32_map[key]:.4f} → INT8={int8_map[key]:.4f} "
-                          f"(Δ={drop:+.4f}, {drop_pct:+.2f}%)")
-
-        # ====================================================================
-        # Summary Table
-        # ====================================================================
-        print("\n" + "=" * 70)
-        print("SUMMARY")
-        print("=" * 70)
-
-        # Speed summary
-        print("\nSpeed (best thread configuration):")
-        if results['fp32']['speed'] and results['int8']['speed']:
-            best_fp32 = max(results['fp32']['speed'], key=lambda x: x.get('fps', 0))
-            best_int8 = max(results['int8']['speed'], key=lambda x: x.get('fps', 0))
-            speedup = best_int8['fps'] / best_fp32['fps'] if best_fp32['fps'] > 0 else 0
-
-            print(f"  FP32: {best_fp32['fps']:.2f} FPS ({best_fp32['latency_ms']:.2f} ms) @ {best_fp32['threads']} threads")
-            print(f"  INT8: {best_int8['fps']:.2f} FPS ({best_int8['latency_ms']:.2f} ms) @ {best_int8['threads']} threads")
-            print(f"  Speedup: {speedup:.2f}x")
-
-            results['comparison']['best_speedup'] = speedup
-
-        # Accuracy summary
-        if evaluate_accuracy and results['fp32']['accuracy']:
-            print("\nAccuracy:")
-            main_metric = 'mAP@0.50'
-            if main_metric in results['fp32']['accuracy']:
-                fp32_map = results['fp32']['accuracy'][main_metric]
-                int8_map = results['int8']['accuracy'].get(main_metric, 0)
-                drop = fp32_map - int8_map
-
-                print(f"  FP32 {main_metric}: {fp32_map:.4f}")
-                print(f"  INT8 {main_metric}: {int8_map:.4f}")
-                print(f"  Accuracy Drop: {drop:+.4f} ({drop/fp32_map*100:+.2f}%)" if fp32_map > 0 else "  N/A")
-
-        print("\n" + "=" * 70)
-
-        return results
-
-# ============================================================================
-# TRAINING UTILITIES
-# ============================================================================
+            raise RuntimeError(f"OpenVINO export failed: {output_path}") from e
 
 def collate_fn(batch):
     """Custom collate for variable number of boxes"""
@@ -2709,7 +1560,7 @@ def log_epoch_to_tensorboard(
     for split, metrics in (("train", train_metrics), ("validation", val_metrics)):
         for name, value in metrics.items():
             if name.startswith(("visible_", "repgt_", "repbox_", "auxiliary_")) or name == "detection_loss":
-                writer.add_scalar(f"G/{split}/{name}", value, epoch_number)
+                writer.add_scalar(f"Occlusion/{split}/{name}", value, epoch_number)
     writer.flush()
 
 
@@ -2723,6 +1574,7 @@ class DetectorTrainingPipeline:
     @classmethod
     def from_environment(cls) -> "DetectorTrainingPipeline":
         config = TrainingConfig(
+            export_openvino_after_training=os.getenv("TRAINING_EXPORT_OPENVINO", "true").lower() == "true",
             model_variant=os.getenv("TRAINING_MODEL_VARIANT", DEFAULT_MODEL_VARIANT),
             visible_loss_weight=float(os.getenv("TRAINING_VISIBLE_LOSS_WEIGHT", "0.0")),
             repgt_loss_weight=float(os.getenv("TRAINING_REPGT_LOSS_WEIGHT", "0.0")),
@@ -2819,7 +1671,7 @@ class DetectorTrainingPipeline:
         print(f"Input canvas: {config.input_height}x{config.input_width} (HxW)")
         print(f"Batch size: {config.batch_size}")
         print(f"Epochs: {config.num_epochs}")
-        print(f"G recipe: {json.dumps(occlusion_recipe(config), sort_keys=True)}")
+        print(f"Occlusion training settings: {json.dumps(occlusion_recipe(config), sort_keys=True)}")
         print(
             "Validation AP: "
             + (
@@ -3143,6 +1995,10 @@ class DetectorTrainingPipeline:
 
         if writer is not None:
             writer.close()
+
+        if not config.export_openvino_after_training:
+            print(f"Training complete; selected checkpoint: {Path(best_checkpoint_path).resolve()}")
+            return
 
         print("\n" + "=" * 60)
         print("Loading best FP32 checkpoint...")

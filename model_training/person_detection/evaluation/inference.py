@@ -117,6 +117,7 @@ class InferenceConfig:
     use_azurite: bool = True
 
     # Visualization settings
+    save_visualizations: bool = True
     box_color: Tuple[int, int, int] = (0, 255, 0)  # Green in BGR
     gt_box_color: Tuple[int, int, int] = (255, 0, 0)  # Blue for ground truth
     box_thickness: int = 2
@@ -1114,20 +1115,21 @@ class DetectionEvaluationWorkflow:
             if num_dets > 0:
                 images_with_detections += 1
 
-            # Draw detections
-            image_with_boxes = draw_detections(
-                image,
-                detections_for_viz,
-                config,
-                ground_truths=gt_boxes if config.draw_ground_truth else None
-            )
+            if config.save_visualizations:
+                # Draw detections
+                image_with_boxes = draw_detections(
+                    image,
+                    detections_for_viz,
+                    config,
+                    ground_truths=gt_boxes if config.draw_ground_truth else None
+                )
 
-            # Create output filename
-            safe_name = img_path.replace('/', '_').replace('\\', '_')
-            output_filename = output_path / safe_name
+                # Create output filename
+                safe_name = img_path.replace('/', '_').replace('\\', '_')
+                output_filename = output_path / safe_name
 
-            # Save image
-            cv2.imwrite(str(output_filename), image_with_boxes)
+                # Save image
+                cv2.imwrite(str(output_filename), image_with_boxes)
 
         # Print summary
         print("\n" + "=" * 70)
@@ -1293,6 +1295,8 @@ def main():
                         help='Local data root (if not using Azurite)')
 
     # Visualization settings
+    parser.add_argument('--no-visualizations', action='store_true',
+                        help='Write metrics/reports without rendering every validation image')
     parser.add_argument('--draw-gt', action='store_true',
                         help='Draw ground truth boxes alongside predictions')
 
@@ -1320,6 +1324,7 @@ def main():
 
     # Create config
     config = InferenceConfig(
+        save_visualizations=not args.no_visualizations,
         model_path=args.model_path,
         model_type=args.model_type,
         input_height=args.input_height,

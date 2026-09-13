@@ -19,6 +19,7 @@ services:
       AZURITE_MODEL_REMOTE_ROOT: ${AZURITE_MODEL_REMOTE_ROOT:-person_detector_ssd/releases}
       AZURITE_MODEL_CURRENT_POINTER: ${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/current.json}
       USE_AZURITE: "true"
+      TRAINING_STATE_ROOT: /state
       TRAINING_MODEL_VARIANT: ${TRAINING_MODEL_VARIANT:-clean_ltrb}
       TRAINING_VISIBLE_LOSS_WEIGHT: ${TRAINING_VISIBLE_LOSS_WEIGHT:-0.25}
       TRAINING_REPGT_LOSS_WEIGHT: ${TRAINING_REPGT_LOSS_WEIGHT:-0.05}
@@ -60,7 +61,7 @@ services:
       TRAINING_RUN_ID: ${TRAINING_RUN_ID:-}
       MODEL_RELEASE_ID: ${MODEL_RELEASE_ID:-}
     volumes:
-      - training-state:/state
+      - ${MODEL_OUTPUT_DIR:-./model_training/output}:/state
       - ${KAGGLE_JSON_PATH:-./kaggle.json}:/root/.kaggle/kaggle.json:ro
     depends_on:
       azurite:
@@ -78,7 +79,4 @@ services:
     ports:
       - "${TENSORBOARD_BIND_ADDRESS:-127.0.0.1}:${TENSORBOARD_HOST_PORT:-6006}:6006"
     volumes:
-      - training-state:/state:ro
-
-volumes:
-  training-state:
+      - ${MODEL_OUTPUT_DIR:-./model_training/output}:/state:ro

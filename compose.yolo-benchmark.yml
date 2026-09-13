@@ -21,14 +21,14 @@ services:
       BENCHMARK_SCORE_THRESHOLD: ${BENCHMARK_SCORE_THRESHOLD:-0.5}
       CITYPERSONS_DATASET_VERSION: ${CITYPERSONS_DATASET_VERSION:-}
       CITYPERSONS_RESUME_UPLOAD: ${CITYPERSONS_RESUME_UPLOAD:-false}
+      TRAINED_MODELS_DIR: /trained-models
       YOLO_MODEL: ${YOLO_MODEL:-yolov8n}
       YOLO_INT8: ${YOLO_INT8:-true}
       YOLO_RUN_ID: ${YOLO_RUN_ID:-}
     volumes:
-    - yolo-benchmark-state:/state
+    - ${MODEL_OUTPUT_DIR:-./model_training/output}/benchmarks/yolo:/state
+    - ${TRAINED_MODELS_DIR:-${MODEL_OUTPUT_DIR:-./model_training/output}/active-models}:/trained-models:ro
     - ${KAGGLE_JSON_PATH:-./kaggle.json}:/root/.kaggle/kaggle.json:ro
     depends_on:
       azurite:
         condition: service_healthy
-volumes:
-  yolo-benchmark-state: null

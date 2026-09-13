@@ -139,6 +139,8 @@ def write_json(path, payload):
 
 
 def main():
+    from person_detection.core.artifacts import require_detector_artifacts
+    require_detector_artifacts(os.getenv('TRAINED_MODELS_DIR', '/trained-models'), read_models=True)
     model_name = os.getenv('YOLO_MODEL', 'yolov8n')
     if model_name not in WEIGHTS_URLS:
         raise ValueError(f'YOLO_MODEL must be one of {list(WEIGHTS_URLS)}')

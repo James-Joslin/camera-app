@@ -7,6 +7,8 @@ case "$YOLO_MODEL" in yolov8n|yolo26n) ;; *) echo 'YOLO_MODEL must be yolov8n or
 export YOLO_MODEL
 RUN_ID="${YOLO_RUN_ID:-$YOLO_MODEL-v$(date -u +%Y-%m-%dT%H%M%SZ)}"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo 'Invalid YOLO_RUN_ID' >&2; exit 2; }
+python -m person_detection.core.artifacts \
+    --models-dir "${TRAINED_MODELS_DIR:-/trained-models}" --read-models
 export YOLO_RUN_DIR="$STATE_ROOT/runs/$RUN_ID"
 mkdir -p "$STATE_ROOT/runs"
 mkdir "$YOLO_RUN_DIR" # Never overwrite a previous benchmark.

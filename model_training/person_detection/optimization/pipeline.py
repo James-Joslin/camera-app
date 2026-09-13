@@ -31,6 +31,7 @@ from person_detection.data.dataset import (
     select_stratified_indices,
     size_slice,
 )
+from person_detection.core.artifacts import require_detector_artifacts
 from person_detection.core.contracts import ModelOptimizationPipeline
 from person_detection.modeling.clean_head import (
     checkpoint_variant, mark_openvino_outputs, has_decoded_boxes,
@@ -504,7 +505,7 @@ def parse_args() -> argparse.Namespace:
         description="Manifest-driven, accuracy-controlled OpenVINO optimization"
     )
     parser.add_argument("--checkpoint", type=Path, default=Path("best_model_fp32.pth"))
-    parser.add_argument("--output-dir", type=Path, default=Path("optimized"))
+    parser.add_argument("--output-dir", type=Path, default=Path("output/models"))
     parser.add_argument("--input-height", type=int)
     parser.add_argument("--input-width", type=int)
     parser.add_argument("--data-root", default="./data")
@@ -764,6 +765,8 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
         mark_openvino_outputs(quantized_model, model.model_variant)
         ov.save_model(quantized_model, int8_path, compress_to_fp16=False)
 
+        # Fail before ANY latency measurement if a precision is missing or unreadable.
+        require_detector_artifacts(args.output_dir, read_models=True)
         variants = {}
         representative_input = calibration_records[0].input_tensor()
         for name, model_path in (("fp32", fp32_path), ("fp16", fp16_path), ("int8", int8_path)):
@@ -969,6 +972,19 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
         }
         report_path = args.output_dir / "optimization_report.json"
         write_json(report_path, report)
+        benchmark_dir = args.output_dir.parent / "benchmarks"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        write_json(benchmark_dir / "benchmark.json", {
+            "checkpoint": report["checkpoint"],
+            "configuration": report["benchmarkConfiguration"],
+            "variants": {name: {key: value[key] for key in
+                         ("coreLatency", "endToEndLatency", "rawFrameLatency")}
+                         for name, value in variants.items()},
+        })
+        for name, values in variants.items():
+            evaluation_dir = args.output_dir.parent / "evaluation" / name
+            evaluation_dir.mkdir(parents=True, exist_ok=True)
+            write_json(evaluation_dir / "optimization_metrics.json", values["accuracy"])
         print(json.dumps(report, indent=2, sort_keys=True))
         if not release_accepted:
             reasons = []

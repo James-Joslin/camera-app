@@ -10,6 +10,7 @@ services:
     working_dir: /workspace
     shm_size: 16g
     environment:
+      TRAINING_STATE_ROOT: /workspace/output
       TRAINING_MODEL_VARIANT: ${TRAINING_MODEL_VARIANT:-clean_ltrb}
       TRAINING_VISIBLE_LOSS_WEIGHT: ${TRAINING_VISIBLE_LOSS_WEIGHT:-0}
       TRAINING_REPGT_LOSS_WEIGHT: ${TRAINING_REPGT_LOSS_WEIGHT:-0}
@@ -29,6 +30,7 @@ services:
       AZURITE_DATA_CONTAINER: ${AZURITE_DATA_CONTAINER:-computer-vision-data}
     volumes:
       - ./model_training:/workspace
+      - ${MODEL_OUTPUT_DIR:-./model_training/output}:/workspace/output
       - ./kaggle.json:/root/.kaggle/kaggle.json:ro
     depends_on:
       azurite:

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_ROOT="${TRAINING_STATE_ROOT:-/state}"
+STATE_ROOT="${TRAINING_STATE_ROOT:-$SCRIPT_DIR/output}"
 DEFAULT_STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 RUN_ID="${TRAINING_RUN_ID:-v$DEFAULT_STAMP}"
 RELEASE_ID="${MODEL_RELEASE_ID:-$RUN_ID}"
@@ -36,17 +36,19 @@ Usage: ./runProductionTraining.sh
 One-shot production job:
   1. Fully validate the current CityPersons dataset in Azurite.
   2. Download, build, upload, validate, and publish it when validation fails.
-  3. Train C+E with full training-only G, select best AP50:95, and export FP32.
-  4. Export/evaluate FP32 and FP16, calibrate/evaluate INT8, and enforce the
-     configured INT8 accuracy gate.
+  3. Train the shared-head, anchor-free person detector with visible-box supervision
+     and crowd-repulsion losses together. Keep the checkpoint with the highest
+     validation detection accuracy (AP50:95).
+  4. Evaluate the checkpoint, export FP32/FP16, calibrate INT8, verify all six
+     XML/BIN files before benchmarking, and evaluate each exported precision.
   5. Publish a checksum-verified immutable model release and current pointer.
 
 Configuration is supplied through environment variables. Common settings:
-  TRAINING_MODEL_VARIANT      clean_ltrb (C+E, default), clean_anchor, or anchor
+  TRAINING_MODEL_VARIANT      clean_ltrb (shared-head, anchor-free; default), clean_anchor, or anchor
   TRAINING_VISIBLE_LOSS_WEIGHT  Training-only visible boxes (default: 0.25; set 0 to disable)
   TRAINING_REPGT_LOSS_WEIGHT    Neighbor-GT repulsion (default: 0.05; set 0 to disable)
   TRAINING_REPBOX_LOSS_WEIGHT   Cross-person prediction repulsion (default: 0.01; set 0 to disable)
-  TRAINING_AUXILIARY_RAMP_EPOCHS  Zero to full G weight over this many epochs (default: 5)
+  TRAINING_AUXILIARY_RAMP_EPOCHS  Zero to full occlusion-loss weight over this many epochs (default: 5)
   TRAINING_REPGT_SIGMA          RepGT smoothing threshold (default: 0.5)
   TRAINING_REPBOX_SIGMA         RepBox smoothing threshold (default: 0)
   TRAINING_REPBOX_PREDICTIONS_PER_GT  Maximum predictions per person for RepBox (default: 4)
@@ -118,8 +120,11 @@ fi
 
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export ENABLE_QUANTIZATION=false
-# Full G is the normal production recipe, including direct script invocation.
+# Visibility supervision and crowd repulsion are enabled in normal production training.
 export TRAINING_EPOCHS="$EPOCHS"
+export TRAINING_BATCH_SIZE="$BATCH_SIZE"
+export TRAINING_NUM_WORKERS="$NUM_WORKERS"
+export TRAINING_EXPORT_OPENVINO=false
 export TRAINING_VISIBLE_LOSS_WEIGHT="${TRAINING_VISIBLE_LOSS_WEIGHT:-0.25}"
 export TRAINING_REPGT_LOSS_WEIGHT="${TRAINING_REPGT_LOSS_WEIGHT:-0.05}"
 export TRAINING_REPBOX_LOSS_WEIGHT="${TRAINING_REPBOX_LOSS_WEIGHT:-0.01}"
@@ -129,12 +134,19 @@ export TRAINING_INPUT_HEIGHT="$INPUT_HEIGHT"
 export TRAINING_INPUT_WIDTH="$INPUT_WIDTH"
 
 RUN_DIR="${STATE_ROOT%/}/runs/$RUN_ID"
-DATASET_VALIDATION_DIR="${STATE_ROOT%/}/dataset-validation/$RUN_ID"
+CHECKPOINT_DIR="$RUN_DIR/checkpoints"
+LOG_DIR="$RUN_DIR/logs"
+export TRAINING_TENSORBOARD_LOG_DIR="$RUN_DIR/tensorboard"
+DATASET_VALIDATION_DIR="$RUN_DIR/dataset-validation"
 RELEASE_ROOT="${STATE_ROOT%/}/releases"
-RELEASE_EVALUATION_ROOT="${STATE_ROOT%/}/release-evaluations"
 ACTIVE_MODEL_DIR="${STATE_ROOT%/}/active-models"
-OFFICIAL_DIR="${STATE_ROOT%/}/citypersons-official"
-mkdir -p "$RUN_DIR" "$DATASET_VALIDATION_DIR"
+OFFICIAL_DIR="${STATE_ROOT%/}/cache/citypersons-official"
+# Existing flat runs must not silently restart when the layout changes.
+if [[ -f "$RUN_DIR/last_training_checkpoint.pth" || -f "$RUN_DIR/best_model_fp32.pth" ]]; then
+    echo "Old flat run layout found at $RUN_DIR. Use a new TRAINING_RUN_ID; existing checkpoints are preserved." >&2
+    exit 2
+fi
+mkdir -p "$CHECKPOINT_DIR" "$LOG_DIR" "$DATASET_VALIDATION_DIR"
 
 validate_current_dataset() {
     python -m scripts.data.validate_citypersons_azurite \
@@ -153,11 +165,11 @@ echo "State: $RUN_DIR"
 echo "============================================================"
 
 echo "Checking the current CityPersons dataset in Azurite..."
-if validate_current_dataset 2>&1 | tee "$RUN_DIR/dataset-validation.log"; then
+if validate_current_dataset 2>&1 | tee "$LOG_DIR/dataset-validation.log"; then
     echo "CityPersons is complete and valid; using the published version."
 else
     DATASET_VERSION="${CITYPERSONS_DATASET_VERSION:-v$(date -u +%F).production$(date -u +%Y%m%dT%H%M%SZ)}"
-    DATASET_WORK_DIR="${STATE_ROOT%/}/dataset-bootstrap/$DATASET_VERSION"
+    DATASET_WORK_DIR="${STATE_ROOT%/}/cache/dataset-bootstrap/$DATASET_VERSION"
     echo "No complete, valid current CityPersons dataset was found."
     echo "Bootstrapping immutable dataset version: $DATASET_VERSION"
     CITYPERSONS_DATASET_VERSION="$DATASET_VERSION" \
@@ -165,20 +177,20 @@ else
     CITYPERSONS_PREVIEW_DIR="$DATASET_VALIDATION_DIR/bootstrap" \
     CITYPERSONS_PREVIEW_COUNT="$PREVIEW_COUNT" \
     CITYPERSONS_VERIFY_REMOTE_CHECKSUMS=true \
-        "$SCRIPT_DIR/getCityPersons.sh" 2>&1 | tee "$RUN_DIR/dataset-bootstrap.log"
+        "$SCRIPT_DIR/getCityPersons.sh" 2>&1 | tee "$LOG_DIR/dataset-bootstrap.log"
 
     echo "Re-validating the newly published CityPersons version..."
-    validate_current_dataset 2>&1 | tee "$RUN_DIR/dataset-revalidation.log"
+    validate_current_dataset 2>&1 | tee "$LOG_DIR/dataset-revalidation.log"
 fi
 
-echo "Starting FP32 training and OpenVINO export..."
+echo "Starting training and AP-based checkpoint selection..."
 (
-    cd "$RUN_DIR"
+    cd "$CHECKPOINT_DIR"
     python -m person_detection.training.pipeline
-) 2>&1 | tee "$RUN_DIR/training.log"
+) 2>&1 | tee "$LOG_DIR/training.log"
 
-for artifact in best_model_fp32.pth person_detector_fp32.xml person_detector_fp32.bin; do
-    if [[ ! -s "$RUN_DIR/$artifact" ]]; then
+for artifact in best_model_fp32.pth last_training_checkpoint.pth; do
+    if [[ ! -s "$CHECKPOINT_DIR/$artifact" ]]; then
         echo "Training did not create a non-empty $artifact" >&2
         exit 1
     fi
@@ -187,7 +199,7 @@ done
 echo "Starting optimization, evaluation, release verification, and publication..."
 RELEASE_ARGS=(
     --release-id "$RELEASE_ID"
-    --checkpoint "$RUN_DIR/best_model_fp32.pth"
+    --checkpoint "$CHECKPOINT_DIR/best_model_fp32.pth"
     --input-height "$INPUT_HEIGHT"
     --input-width "$INPUT_WIDTH"
     --release-status "$RELEASE_STATUS"
@@ -209,11 +221,10 @@ if [[ -n "$CAMERA_METRICS" ]]; then
     RELEASE_ARGS+=(--camera-metrics "$CAMERA_METRICS")
 fi
 PERSON_DETECTOR_RELEASE_ROOT="$RELEASE_ROOT" \
-PERSON_DETECTOR_EVALUATION_ROOT="$RELEASE_EVALUATION_ROOT" \
 PERSON_DETECTOR_ACTIVE_MODEL_DIR="$ACTIVE_MODEL_DIR" \
 CITYPERSONS_OFFICIAL_DIR="$OFFICIAL_DIR" \
     "$SCRIPT_DIR/releasePersonDetector.sh" "${RELEASE_ARGS[@]}" \
-        2>&1 | tee "$RUN_DIR/release.log"
+        2>&1 | tee "$LOG_DIR/release.log"
 
 echo "============================================================"
 echo "Production training job completed successfully."

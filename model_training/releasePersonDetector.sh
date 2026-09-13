@@ -4,6 +4,8 @@ shopt -s nullglob
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+OUTPUT_ROOT="${TRAINING_STATE_ROOT:-$SCRIPT_DIR/output}"
 
 CHECKPOINT="best_model_fp32.pth"
 RELEASE_ID="v$(date -u +%Y-%m-%dT%H%M%SZ)"
@@ -24,10 +26,9 @@ THREADS=1
 MODEL_CONTAINER="${AZURITE_MODEL_CONTAINER:-computer-vision-models}"
 REMOTE_ROOT="person_detector_ssd/releases"
 CURRENT_POINTER="${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/current.json}"
-RELEASE_ROOT="${PERSON_DETECTOR_RELEASE_ROOT:-$SCRIPT_DIR/releases}"
-EVALUATION_ROOT="${PERSON_DETECTOR_EVALUATION_ROOT:-$SCRIPT_DIR/release_evaluations}"
-ACTIVE_MODEL_DIR="${PERSON_DETECTOR_ACTIVE_MODEL_DIR:-$SCRIPT_DIR/optimized}"
-OFFICIAL_DIR="${CITYPERSONS_OFFICIAL_DIR:-$SCRIPT_DIR/.citypersons-official}"
+RELEASE_ROOT="${PERSON_DETECTOR_RELEASE_ROOT:-$OUTPUT_ROOT/releases}"
+ACTIVE_MODEL_DIR="${PERSON_DETECTOR_ACTIVE_MODEL_DIR:-$OUTPUT_ROOT/active-models}"
+OFFICIAL_DIR="${CITYPERSONS_OFFICIAL_DIR:-$OUTPUT_ROOT/cache/citypersons-official}"
 
 usage() {
     cat <<'EOF'
@@ -208,8 +209,7 @@ fi
 
 RELEASE_DIR="${RELEASE_ROOT%/}/$RELEASE_ID"
 MODELS_DIR="$RELEASE_DIR/models"
-EVALUATION_DIR="${EVALUATION_ROOT%/}/$RELEASE_ID/fp32"
-EVALUATION_REPORT_DIR="$RELEASE_DIR/evaluation/fp32"
+EVALUATION_DIR="$RELEASE_DIR/evaluation"
 REMOTE_PREFIX="${REMOTE_ROOT%/}/$RELEASE_ID"
 
 if [[ -e "$RELEASE_DIR" ]]; then
@@ -218,7 +218,29 @@ if [[ -e "$RELEASE_DIR" ]]; then
     exit 2
 fi
 
-mkdir -p "$MODELS_DIR" "$EVALUATION_DIR" "$EVALUATION_REPORT_DIR" "$RELEASE_DIR/checkpoint"
+mkdir -p "$MODELS_DIR" "$EVALUATION_DIR" "$RELEASE_DIR/checkpoint"
+cp "$CHECKPOINT" "$RELEASE_DIR/checkpoint/best_model_fp32.pth"
+CHECKPOINT="$RELEASE_DIR/checkpoint/best_model_fp32.pth"
+
+if [[ ! -d "$OFFICIAL_DIR/evaluation/eval_script" ]]; then
+    echo "Downloading the checksum-pinned official CityPersons evaluator..."
+    python -m scripts.data.download_citypersons_annotations --output "$OFFICIAL_DIR"
+fi
+
+evaluate_variant() {
+    local precision="$1" model_path="$2" model_type="$3"
+    echo "Evaluating $precision with project and official CityPersons metrics..."
+    python -m person_detection.evaluation.inference \
+        --model-path "$model_path" --model-type "$model_type" \
+        --input-height "$INPUT_HEIGHT" --input-width "$INPUT_WIDTH" \
+        --pre-nms-topk "$PRE_NMS_TOPK" --coco-map --map-threshold 0.01 --no-visualizations \
+        --nms-threshold 0.5 --recall-fppi 0.1 --max-images "$VALIDATION_SAMPLES" \
+        --official-evaluator-dir "$OFFICIAL_DIR/evaluation/eval_script" \
+        --output-dir "$EVALUATION_DIR/$precision"
+}
+
+# Establish checkpoint accuracy before any precision conversion.
+evaluate_variant pytorch "$CHECKPOINT" pytorch
 
 echo "Creating FP32, FP16, and INT8 variants for release $RELEASE_ID..."
 OPTIMIZATION_ARGS=(
@@ -246,35 +268,10 @@ if [[ -n "$CAMERA_METRICS" ]]; then
 fi
 python -m person_detection.optimization.pipeline "${OPTIMIZATION_ARGS[@]}"
 
-if [[ ! -d "$OFFICIAL_DIR/evaluation/eval_script" ]]; then
-    echo "Downloading the checksum-pinned official CityPersons evaluator..."
-    python -m scripts.data.download_citypersons_annotations --output "$OFFICIAL_DIR"
-fi
-
-echo "Running complete FP32 project and official CityPersons evaluation..."
-python -m person_detection.evaluation.inference \
-    --model-path "$MODELS_DIR/person_detector_fp32.xml" \
-    --model-type openvino \
-    --input-height "$INPUT_HEIGHT" \
-    --input-width "$INPUT_WIDTH" \
-    --pre-nms-topk "$PRE_NMS_TOPK" \
-    --coco-map \
-    --map-threshold 0.01 \
-    --nms-threshold 0.5 \
-    --recall-fppi 0.1 \
-    --max-images 100000 \
-    --official-evaluator-dir "$OFFICIAL_DIR/evaluation/eval_script" \
-    --output-dir "$EVALUATION_DIR"
-
-cp "$CHECKPOINT" "$RELEASE_DIR/checkpoint/best_model_fp32.pth"
-for report in \
-    "$EVALUATION_DIR/evaluation_metrics.json" \
-    "$EVALUATION_DIR/map_results.txt" \
-    "$EVALUATION_DIR"/citypersons_official_*.json \
-    "$EVALUATION_DIR"/citypersons_official_*.txt; do
-    if [[ -f "$report" ]]; then
-        cp "$report" "$EVALUATION_REPORT_DIR/"
-    fi
+# Optimization must produce every model pair before evaluation/benchmark consumers proceed.
+python -m person_detection.core.artifacts --models-dir "$MODELS_DIR" --read-models
+for precision in fp32 fp16 int8; do
+    evaluate_variant "$precision" "$MODELS_DIR/person_detector_$precision.xml" openvino
 done
 
 echo "Publishing and checksum-verifying the immutable Azurite release..."

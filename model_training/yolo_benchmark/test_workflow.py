@@ -18,7 +18,10 @@ class WorkflowTests(unittest.TestCase):
             python = root / 'python'
             python.write_text('''#!/usr/bin/env bash
 set -eu
-if [[ "$*" == *validate_citypersons_azurite* ]]; then
+if [[ "$*" == *person_detection.core.artifacts* ]]; then
+    echo preflight >> "$CALL_LOG"
+    [[ "$TEST_MODE" != incomplete ]] || exit 1
+elif [[ "$*" == *validate_citypersons_azurite* ]]; then
     echo validate >> "$CALL_LOG"
     if [[ "$TEST_MODE" == missing && ! -f "$BOOTSTRAP_MARKER" || "$TEST_MODE" == broken ]]; then exit 1; fi
 else
@@ -43,15 +46,20 @@ touch "$BOOTSTRAP_MARKER"
             return result.returncode, log.read_text().splitlines() if log.exists() else []
 
     def test_existing_data_skips_bootstrap(self):
-        self.assertEqual(self.run_workflow('valid'), (0, ['validate', 'benchmark']))
+        self.assertEqual(self.run_workflow('valid'), (0, ['preflight', 'validate', 'benchmark']))
 
     def test_missing_data_bootstraps_then_revalidates(self):
-        self.assertEqual(self.run_workflow('missing'), (0, ['validate', 'bootstrap', 'validate', 'benchmark']))
+        self.assertEqual(self.run_workflow('missing'), (0, ['preflight', 'validate', 'bootstrap', 'validate', 'benchmark']))
 
     def test_failed_revalidation_prevents_benchmark(self):
         code, calls = self.run_workflow('broken')
         self.assertNotEqual(code, 0)
-        self.assertEqual(calls, ['validate', 'bootstrap', 'validate'])
+        self.assertEqual(calls, ['preflight', 'validate', 'bootstrap', 'validate'])
+
+    def test_incomplete_trained_models_prevent_dataset_access(self):
+        code, calls = self.run_workflow('incomplete')
+        self.assertNotEqual(code, 0)
+        self.assertEqual(calls, ['preflight'])
 
     def test_invalid_run_id_stops_before_data_access(self):
         self.assertEqual(self.run_workflow('valid', '../bad'), (2, []))

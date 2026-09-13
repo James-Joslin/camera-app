@@ -14,12 +14,20 @@ YOLO_MODEL=yolov8n (default) or yolo26n
 VALIDATION_SAMPLES=500 CALIBRATION_SAMPLES=300 BENCHMARK_ITERATIONS=100
 OPENVINO_THREADS=1 MAX_ACCURACY_DROP=0.01 YOLO_INT8=true YOLO_RUN_ID=<unique ID>
 Set YOLO_INT8=false to skip INT8 calibration. KAGGLE_JSON_PATH is needed only
-when the canonical dataset needs downloading. Results persist in the separate
-yolo-benchmark-state volume under /state/runs/<run ID>/report.json.
+when the canonical dataset needs downloading. Results persist under
+model_training/output/benchmarks/yolo/runs/<run ID>/report.json.
+All trained-detector FP32/FP16/INT8 XML/BIN pairs are required before launch.
+TRAINED_MODELS_DIR overrides the default output/active-models directory.
 EOF
     exit 0
 fi
 [[ $# == 0 ]] || { echo "Unknown argument: $1" >&2; exit 2; }
+OUTPUT_ROOT="${MODEL_OUTPUT_DIR:-$ROOT_DIR/model_training/output}"
+[[ "$OUTPUT_ROOT" = /* ]] || OUTPUT_ROOT="$ROOT_DIR/$OUTPUT_ROOT"
+MODELS_DIR="${TRAINED_MODELS_DIR:-$OUTPUT_ROOT/active-models}"
+[[ "$MODELS_DIR" = /* ]] || MODELS_DIR="$ROOT_DIR/$MODELS_DIR"
+PYTHONPATH="$ROOT_DIR/model_training${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m person_detection.core.artifacts --models-dir "$MODELS_DIR"
 "${COMPOSE[@]}" up -d --wait azurite
 "${COMPOSE[@]}" build yolo-benchmark
 "${COMPOSE[@]}" run --rm --no-deps yolo-benchmark

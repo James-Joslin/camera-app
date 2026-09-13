@@ -129,17 +129,9 @@ Full detector results, official CityPersons miss rates and software versions: [d
 
 ## Results
 
-The separate Compose volume `yolo-benchmark-state` stores weights, image cache,
-bootstrap files, and `/state/runs/<run-id>/` with `benchmark.log`, dataset
-validation output, FP32/INT8 `.xml`/`.bin`, `summary.md` and `report.json`. No trained detector
-artifacts are overwritten. To copy a run to the host, from the repository root:
+Results are host-visible under `model_training/output/benchmarks/yolo/runs/<run-id>/`, including `benchmark.log`, validation outputs, exported YOLO models, `summary.md` and `report.json`. Weights and image caches live alongside the runs under `output/benchmarks/yolo/`. `MODEL_OUTPUT_DIR` overrides the shared output root; historical Docker volumes and prior results are retained.
 
-```bash
-mkdir -p model_training/yolo_benchmark/results
-docker compose -f docker-compose.yml -f compose.yolo-benchmark.yml run --rm --no-deps \
-  --entrypoint cp -v "$PWD/model_training/yolo_benchmark/results:/results" yolo-benchmark \
-  -r /state/runs/yolov8n-baseline /results/
-```
+Before launching, all trained-detector FP32, FP16 and INT8 `.xml` and `.bin` files must exist and be nonempty in `output/active-models/`. The container also verifies that OpenVINO can read each pair. Missing/invalid files stop benchmarking before dataset downloads. Set `TRAINED_MODELS_DIR` to the host path of a particular release's `models/` directory to benchmark against that artifact set. This preflight does not rerun the trained detector or change historical comparison rows.
 
 Dependencies are pinned to Ultralytics 8.4.0 (supports both models) and the project's OpenVINO/NNCF/
 Torch versions. The historical YOLOv8n run above used Ultralytics 8.3.200.

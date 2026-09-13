@@ -107,7 +107,7 @@ services:
       - "${FASTAPI_PORT:-8102}:8000"
     volumes:
       - ./fastapi:/app
-      - ./project/optimized:/models:ro
+      - ${MODEL_OUTPUT_DIR:-./model_training/output}/active-models:/models:ro
     depends_on:
       migrations:
         condition: service_completed_successfully

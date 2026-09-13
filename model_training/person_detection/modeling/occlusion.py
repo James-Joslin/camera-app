@@ -1,4 +1,4 @@
-"""Training-only G losses; dense-head adaptations of Repulsion Loss (CVPR 2018)."""
+"""Training-only visibility and crowd-repulsion losses; dense-head adaptations of Repulsion Loss (CVPR 2018)."""
 from dataclasses import dataclass, asdict
 import math
 
@@ -10,7 +10,7 @@ from torchvision.ops import box_iou, generalized_box_iou_loss
 
 @dataclass
 class OcclusionConfig:
-    # Library defaults preserve plain C+E. The documented full-G recipe opts in.
+    # Library defaults preserve detector-only training; production enables the auxiliary losses.
     visible_loss_weight: float = 0.0
     repgt_loss_weight: float = 0.0
     repbox_loss_weight: float = 0.0
@@ -24,9 +24,9 @@ class OcclusionConfig:
     def validate_occlusion(self):
         weights = (self.visible_loss_weight, self.repgt_loss_weight, self.repbox_loss_weight)
         if any(not math.isfinite(w) or w < 0 for w in weights):
-            raise ValueError("G loss weights must be finite and nonnegative")
+            raise ValueError("Occlusion loss weights must be finite and nonnegative")
         if any(weights) and self.model_variant != "clean_ltrb":
-            raise ValueError("G requires clean_ltrb")
+            raise ValueError("Visibility and crowd-repulsion training require the clean_ltrb detector")
         if self.auxiliary_ramp_epochs < 0:
             raise ValueError("auxiliary_ramp_epochs must be nonnegative")
         if not all(0 <= s < 1 for s in (self.repgt_sigma, self.repbox_sigma)):

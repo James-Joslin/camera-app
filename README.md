@@ -30,7 +30,7 @@ When opening the development UI from another device, set `NEXT_ALLOWED_DEV_ORIGI
 
 ## Model optimization
 
-`./scripts/optimize-model.sh` is the complete post-training release workflow. It starts the Azurite and training services, creates and accuracy-checks FP32, FP16, and INT8 OpenVINO variants from `model_training/best_model_fp32.pth`, runs the full FP32 project and official CityPersons evaluation, uploads an immutable checksum-verified release to Azurite, and refreshes `model_training/optimized/` for the FastAPI service.
+`./scripts/optimize-model.sh` is the complete post-training release workflow. It starts the Azurite and training services, creates and accuracy-checks FP32, FP16, and INT8 OpenVINO variants from `model_training/output/runs/<run-id>/checkpoints/best_model_fp32.pth`, runs PyTorch, FP32, FP16 and INT8 project and official CityPersons evaluations, uploads an immutable checksum-verified release to Azurite, and refreshes `model_training/output/active-models/` for the FastAPI service.
 
 Choose a meaningful immutable release ID when preparing a release:
 
@@ -41,9 +41,9 @@ Choose a meaningful immutable release ID when preparing a release:
   --validation-samples 500
 ```
 
-The complete local release is stored at `model_training/releases/<release-id>/`. Evaluation previews remain at `model_training/release_evaluations/<release-id>/fp32/`. The immutable remote release is stored in the `computer-vision-models` container below `person_detector_ssd/releases/<release-id>/`; every uploaded file is read back and SHA-256 verified. See [the model-training release documentation](model_training/README.md#automated-model-release) for the exact layout and all overrides.
+The complete local release is stored at `model_training/output/releases/<release-id>/`. Per-precision evaluation reports and latency benchmarks are stored in the release’s `evaluation/` and `benchmarks/` subdirectories. The immutable remote release is stored in the `computer-vision-models` container below `person_detector_ssd/releases/<release-id>/`; every uploaded file is read back and SHA-256 verified. See [the model-training release documentation](model_training/README.md#automated-model-release) for the exact layout and all overrides.
 
-The lightweight FastAPI service mounts `model_training/optimized` read-only at `/models` and selects `person_detector_int8.xml` by default. Recreate the FastAPI service after a successful release so it loads the newly promoted model:
+The lightweight FastAPI service mounts `model_training/output/active-models` read-only at `/models` and selects `person_detector_int8.xml` by default. Recreate the FastAPI service after a successful release so it loads the newly promoted model:
 
 ```bash
 docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate fastapi
@@ -59,7 +59,7 @@ Run the complete, self-contained training job with:
 TRAINING_EPOCHS=100 ./scripts/run-production-training.sh
 ```
 
-It fully validates CityPersons in Azurite, runs `getCityPersons.sh` when a complete published dataset is unavailable, trains with PyTorch 2.8 and `torch.compile`, exports FP32, exports/evaluates FP16 and INT8 with an accuracy gate, runs the official evaluation, and publishes only a successful checksum-verified release. The immutable model files are saved in the `computer-vision-models` container at `person_detector_ssd/releases/<release-id>/`; `person_detector_ssd/current.json` points the rest of the application to the latest complete FP32, FP16, and INT8 XML/BIN pairs. Persistent logs, compiler cache, checkpoints, TensorBoard events, and local release files live in the Compose `training-state` volume. Validation AP50/AP50:95 and Recall@FPPI are measured every five epochs by default, and the launcher exposes TensorBoard at `http://127.0.0.1:6006`. See [the production training documentation](model_training/README.md#production-one-shot-training-container) for settings and recovery behavior.
+It fully validates CityPersons in Azurite, runs `getCityPersons.sh` when a complete published dataset is unavailable, trains the shared-head, anchor-free detector with visibility supervision and crowd-repulsion losses using PyTorch 2.8, evaluates the selected checkpoint, exports FP32/FP16 and calibrates INT8 with an accuracy gate, verifies all six XML/BIN files before benchmarking, and evaluates all three exported precisions, and publishes only a successful checksum-verified release. The immutable model files are saved in the `computer-vision-models` container at `person_detector_ssd/releases/<release-id>/`; `person_detector_ssd/current.json` points the rest of the application to the latest complete FP32, FP16, and INT8 XML/BIN pairs. Logs, checkpoints, TensorBoard events, model files and per-precision reports live under the host-visible `model_training/output/` directory (`MODEL_OUTPUT_DIR` overrides it). Existing old artifacts and volumes are retained. Validation AP50/AP50:95 and Recall@FPPI are measured every epoch by default during the 60-epoch occlusion-training run, and the launcher exposes TensorBoard at `http://127.0.0.1:6006`. See [the production training documentation](model_training/README.md#production-one-shot-training-container) for settings and recovery behavior.
 
 ## Storage and migrations
 

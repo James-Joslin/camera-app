@@ -96,7 +96,7 @@ services:
         condition: service_healthy
 
     volumes:
-      - ./model_training/optimized:/models:ro
+      - ${MODEL_OUTPUT_DIR:-./model_training/output}/active-models:/models:ro
 
   frontend:
     image: ${CAMERA_IMAGE_PREFIX:-camera-software}-frontend:${CAMERA_IMAGE_TAG:-latest}

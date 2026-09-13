@@ -24,7 +24,11 @@ REQUIRED_ARTIFACTS = (
     "models/person_detector_int8.bin",
     "models/calibration_manifest.json",
     "models/optimization_report.json",
+    "evaluation/pytorch/evaluation_metrics.json",
     "evaluation/fp32/evaluation_metrics.json",
+    "evaluation/fp16/evaluation_metrics.json",
+    "evaluation/int8/evaluation_metrics.json",
+    "benchmarks/benchmark.json",
 )
 
 
@@ -46,7 +50,7 @@ def build_release_manifest(
     missing = [
         relative_name
         for relative_name in REQUIRED_ARTIFACTS
-        if not (release_dir / relative_name).is_file()
+        if not (release_dir / relative_name).is_file() or (release_dir / relative_name).stat().st_size == 0
     ]
     if missing:
         raise RuntimeError(f"Release is missing required artifacts: {missing}")

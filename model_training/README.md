@@ -3,19 +3,19 @@
 This directory owns the CityPersons binary-person detector from immutable dataset ingestion through FP32 training, metric evaluation, and accuracy-controlled OpenVINO INT8 release. The exported model has one quality-aware person logit per prediction; canonical source labels remain available for sampling and metrics but are not exported as extra heads.
 
 
-## Full training-only G: visibility and repulsion
+## Training with visibility supervision and crowd repulsion
 
-G keeps the `clean_ltrb` deployment graph and its two outputs unchanged. Training adds a shared visible-box projection plus RepGT and RepBox losses. The auxiliary projection is absent from the model constructed for OpenVINO export, evaluation and calibration. Camera adaptation (H) is out of scope.
+Visibility supervision and crowd-repulsion losses train the same `clean_ltrb` detector together in one run, keeping its deployment graph and two outputs unchanged. Training adds a shared visible-box projection plus RepGT and RepBox losses. The auxiliary projection is absent from the model constructed for OpenVINO export, evaluation and calibration. Camera adaptation is out of scope.
 
-From the repository root, start a **fresh 60-epoch full-G run** with:
+From the repository root, start a **fresh 60-epoch run with visibility supervision and crowd repulsion** with:
 
 ```bash
 ./scripts/run-production-training.sh
 ```
 
-The normal production pipeline creates a timestamped run ID, enables all three losses, measures validation AP every epoch, and selects `best_model_fp32.pth` by highest AP50:95 (earliest epoch wins ties). The workflow is: build the training image, train, export, evaluate/quantize, and publish through the existing release gates. It starts in the background; follow the log command printed by the launcher. Nothing resumes your previous C+E run unless you explicitly reuse its ID, which G compatibility checks reject.
+The normal production pipeline creates a timestamped run ID, enables all three losses, measures validation AP every epoch, and selects `best_model_fp32.pth` by highest AP50:95 (earliest epoch wins ties). The workflow is: build the training image, train, export, evaluate/quantize, and publish through the existing release gates. It starts in the background; follow the log command printed by the launcher. Nothing resumes your previous detector-only run unless you explicitly reuse its ID, which the training-configuration compatibility checks reject.
 
-To resume the same G run after interruption, supply its original `TRAINING_RUN_ID` and the same recipe. The 60-epoch run is performed by the user; unit/integration tests use tiny synthetic batches.
+To resume the same training run after interruption, supply its original `TRAINING_RUN_ID` and the same recipe. The 60-epoch run is performed by the user; unit/integration tests use tiny synthetic batches.
 
 | Environment variable | Production default | Direct Python/development default |
 | --- | ---: | ---: |
@@ -31,7 +31,7 @@ To resume the same G run after interruption, supply its original `TRAINING_RUN_I
 | `TRAINING_AP_EVERY_N_EPOCHS` | 1 | 5 |
 | `TRAINING_EPOCHS` | 60 | 100 |
 
-All settings are independently overridable. Setting a loss weight to zero disables that component. For a G-disabled, AP-selected 60-epoch run:
+All settings are independently overridable. Setting a loss weight to zero disables that component. For a 60-epoch run without visibility supervision or crowd-repulsion losses, still selecting the best AP checkpoint:
 
 ```bash
 TRAINING_VISIBLE_LOSS_WEIGHT=0 TRAINING_REPGT_LOSS_WEIGHT=0 \
@@ -45,7 +45,7 @@ TRAINING_VISIBLE_LOSS_WEIGHT=0.25 TRAINING_REPGT_LOSS_WEIGHT=0.05 \
 TRAINING_REPBOX_LOSS_WEIGHT=0.01 TRAINING_CHECKPOINT_SELECTION=ap \
 TRAINING_AP_EVERY_N_EPOCHS=1 TRAINING_EPOCHS=60 \
 docker compose -f docker-compose.yml -f compose.training.yml run --rm training \
-  bash -lc 'mkdir -p /workspace/runs/g-dev-01 && cd /workspace/runs/g-dev-01 && PYTHONPATH=/workspace python -m person_detection.training.pipeline'
+  bash -lc 'mkdir -p /workspace/runs/occlusion-dev-01 && cd /workspace/runs/occlusion-dev-01 && PYTHONPATH=/workspace python -m person_detection.training.pipeline'
 ```
 
 Use a new directory for a new experiment. Existing checkpoint mismatches fail rather than overwrite another recipe. `final` is also supported for checkpoint selection; AP selection requires AP evaluation to be enabled.
@@ -62,36 +62,45 @@ Use a new directory for a new experiment. Existing checkpoint mismatches fail ra
 
 ### Checkpoints, monitoring and comparison
 
-`last_training_checkpoint.pth` saves separate detector/auxiliary state dictionaries, optimizer, scheduler, scaler, sampling and RNG state, the G recipe and augmentation policy. `best_model_ap.pth`, `best_model_loss.pth` and selected `best_model_fp32.pth` retain their own selection metric/epoch. Resume checks reject changed G settings. Existing detector checkpoints remain loadable. Release metadata carries selection and G provenance.
+`last_training_checkpoint.pth` saves separate detector/auxiliary state dictionaries, optimizer, scheduler, scaler, sampling and RNG state, the occlusion training configuration and augmentation policy. `best_model_ap.pth`, `best_model_loss.pth` and selected `best_model_fp32.pth` retain their own selection metric/epoch. Resume checks reject changed occlusion training settings. Existing detector checkpoints remain loadable. Release metadata carries checkpoint-selection and occlusion-training provenance.
 
-TensorBoard `G/train/*` and `G/validation/*` report each raw and weighted auxiliary loss, detection loss, ramp multiplier, visible valid/skipped/noncontained pair counts, supervised location counts and repulsion counts. Count fields are totals over the epoch's sampled batches; loss fields are batch means. Plain validation detection metrics still use only person scores and full boxes.
+TensorBoard `Occlusion/train/*` and `Occlusion/validation/*` report each raw and weighted auxiliary loss, detection loss, ramp multiplier, visible valid/skipped/noncontained pair counts, supervised location counts and repulsion counts. Count fields are totals over the epoch's sampled batches; loss fields are batch means. Plain validation detection metrics still use only person scores and full boxes.
 
-Compare all **500 validation images** and **300 calibration training images**, retaining the recorded calibration manifest where available. Keep the same 640×360 canvas, evaluator/NMS settings and i3-13100 CPU protocol (batch 1, one stream/thread, 8 warmups, 100 iterations). Report FP32 and INT8 AP50, AP50:95, Recall@FPPI 0.1, existing size/visibility slices and core/E2E latency. The changed AP checkpoint selection and disabled CoarseDropout must be recorded alongside the comparison to the previous loss-selected C+E run.
+Compare all **500 validation images** and **300 calibration training images**, retaining the recorded calibration manifest where available. Keep the same 640×360 canvas, evaluator/NMS settings and i3-13100 CPU protocol (batch 1, one stream/thread, 8 warmups, 100 iterations). Report FP32 and INT8 AP50, AP50:95, Recall@FPPI 0.1, existing size/visibility slices and core/E2E latency. The changed AP checkpoint selection and disabled CoarseDropout must be recorded alongside the comparison to the previous loss-selected detector-only run.
 
-Run the G regression tests in the training environment with:
+Run the occlusion-training regression tests in the training environment with:
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest tests.test_occlusion -v
 ```
 
 
-## C + E training variant
+## Shared-head, anchor-free detector architecture
 
-New training commands default to `TRAINING_MODEL_VARIANT=clean_ltrb` (C+E). Three variants are available:
+The names describe parts of one model and one training run:
+
+- **Shared detection head:** reuses detection-tower weights across feature levels to keep the model compact.
+- **Anchor-free box prediction:** predicts four distances to each person's box edges at each feature location.
+- **Visible-box supervision:** teaches shared features where the visible part of an occluded person is; its extra prediction branch is removed for export.
+- **Crowd-repulsion losses:** discourage predictions from drifting toward neighboring people or merging different people's boxes.
+
+All enabled losses train the detector together. After training, the highest-scoring validation checkpoint is selected for export.
+
+New training commands default to `TRAINING_MODEL_VARIANT=clean_ltrb` (shared detection towers and anchor-free box prediction). Three variants are available:
 
 | Variant | Neck/head | Regression | Format |
 | --- | --- | --- | --- |
 | `anchor` | Original dense FPN and per-level attention heads | Multiple anchor offsets; baseline comparison | v3 |
-| `clean_anchor` | Separable FPN and clean shared towers | Original multiple anchor offsets; C ablation | v4 |
-| `clean_ltrb` | Separable FPN and clean shared towers | One direct LTRB prediction per location; C+E | v4 |
+| `clean_anchor` | Separable FPN and clean shared towers | Original multiple anchor offsets; shared-head comparison | v4 |
+| `clean_ltrb` | Separable FPN and clean shared towers | One direct left/top/right/bottom distance prediction per location | v4 |
 
-C keeps 128 channels and the five existing strides (8–128). Tower convolution weights are shared across levels, with separate BatchNorm statistics per level and separate classification/regression branches. The duplicate normalization/activation and head attention are removed. Dropout remains training-only. Backbone, input, QFL-style classification, and GIoU are retained.
+The shared-head architecture keeps 128 channels and the five existing strides (8–128). Tower convolution weights are shared across levels, with separate BatchNorm statistics per level and separate classification/regression branches. The duplicate normalization/activation and head attention are removed. Dropout remains training-only. Backbone, input, QFL-style classification, and GIoU are retained.
 
-E produces **4,835 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and FastAPI serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
+Anchor-free box prediction produces **4,835 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and FastAPI serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
 
-ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. Stride-4 and DFL remain outside this variant. Training-only G (visible-box supervision, RepGT and RepBox) is enabled by default in the production pipeline; camera adaptation is out of scope.
+ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. Stride-4 and DFL remain outside this variant. Training-only visible-box supervision and crowd-repulsion losses (RepGT and RepBox) is enabled by default in the production pipeline; camera adaptation is out of scope.
 
-Use a **fresh run ID/directory** for C+E. Incompatible checkpoints fail without being overwritten; the previous v3 model remains evaluable. C/E cloud checkpoint uploads use variant-specific prefixes. Python `TrainingConfig()`, `SSDPersonDetector()`, and `SSDLoss()` also default to `clean_ltrb`. Existing checkpoints are loaded using their recorded variant; v3 checkpoints without a variant are still interpreted as the anchor baseline.
+Use a **fresh run ID/directory** for this architecture. Incompatible checkpoints fail without being overwritten; the previous v3 model remains evaluable. Cloud checkpoint uploads use variant-specific prefixes. Python `TrainingConfig()`, `SSDPersonDetector()`, and `SSDLoss()` also default to `clean_ltrb`. Existing checkpoints are loaded using their recorded variant; v3 checkpoints without a variant are still interpreted as the anchor baseline.
 
 For the existing production training workflow, from the repository root:
 
@@ -102,7 +111,7 @@ TRAINING_EPOCHS=20 TRAINING_RUN_ID=ce-20-01 \
   ./scripts/run-production-training.sh
 ```
 
-This workflow trains, evaluates, optimizes, and publishes an experimental release using the normal release gates. No trained C+E checkpoint is included with the code change. Compare its exact mAP metric and precision against the 0.2688 baseline at 20 epochs, and measure INT8 core latency against 14.7749 ms mean / 15.2730 ms p95 under identical runtime settings.
+This workflow trains, evaluates, optimizes, and publishes an experimental release using the normal release gates. No trained shared-head, anchor-free checkpoint is included with the code change. Compare its exact mAP metric and precision against the 0.2688 baseline at 20 epochs, and measure INT8 core latency against 14.7749 ms mean / 15.2730 ms p95 under identical runtime settings.
 
 For training/export only in the development container, use a fresh working directory:
 
@@ -114,7 +123,7 @@ docker compose -f docker-compose.yml -f compose.training.yml exec \
   -e ENABLE_QUANTIZATION=false training python -m person_detection.training.pipeline
 ```
 
-Use `TRAINING_MODEL_VARIANT=anchor` to reproduce the baseline or `clean_anchor` to isolate C. When using the production launcher, set all three G loss weights to zero for these anchor variants. The architecture table and detailed anchor walkthrough below describe the selectable anchor baseline.
+Use `TRAINING_MODEL_VARIANT=anchor` to reproduce the baseline or `clean_anchor` to test the shared-head architecture with anchors. When using the production launcher, set all three occlusion loss weights to zero for these anchor variants. The architecture table and detailed anchor walkthrough below describe the selectable anchor baseline.
 
 ## What is implemented
 
@@ -154,7 +163,6 @@ model_training/
 ├── scripts/
 │   └── data/
 ├── tests/
-├── legacy/
 ├── tools/
 └── getCityPersons.sh
 ```
@@ -169,11 +177,10 @@ model_training/
 | `person_detection/optimization/` | `ManifestDrivenOpenVINOOptimizer` release pipeline |
 | `scripts/data/` | Dataset download, conversion, versioning, upload, and validation implementations |
 | `tests/` | Unit and integration regressions |
-| `legacy/` | Retained pre-canonical training implementation; it is not imported by the current pipeline |
 
 Abstract classes are used only where implementations are genuinely interchangeable: anchor assignment, manifest selection, inference backends, evaluation backends, and optimization pipelines.
 
-Place new implementation code in the responsibility-specific package and invoke it with `python -m package.module`. Checkpoints, OpenVINO outputs, reports, and validation previews remain at their existing paths and are not part of the Python package.
+Place new implementation code in the responsibility-specific package and invoke it with `python -m package.module`. Generated checkpoints, OpenVINO models, reports and logs are centralized under `model_training/output/` and excluded from source control and production-image builds. The unused pre-canonical training scripts, YOLO-label dataset, old SSD loss and duplicate training-side evaluation/benchmark code have been removed. Existing checkpoint decoding remains supported.
 
 ## Model architecture — anchor baseline
 
@@ -301,7 +308,7 @@ From the repository root, start the self-contained production job with:
 ./scripts/run-production-training.sh
 ```
 
-The image contains the training source and has no source-code bind mount. It uses the NNCF-compatible PyTorch 2.8.0/torchvision 0.23.0 pair and includes the C++ compiler required by TorchInductor. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` plus a TensorBoard sidecar in detached mode. The command returns after startup, and the stopped training container remains available for status and log inspection. A separate persistent `training-state` volume retains downloads, checkpoints, reports, compiler artifacts, TensorBoard events, and logs between container runs. TensorBoard is available at `http://127.0.0.1:6006` by default; change `TENSORBOARD_BIND_ADDRESS` and `TENSORBOARD_HOST_PORT` when remote access is intentionally required.
+The image contains the training source and has no source-code bind mount. It uses the NNCF-compatible PyTorch 2.8.0/torchvision 0.23.0 pair and includes the C++ compiler required by TorchInductor. The launcher reuses the main Compose project's Azurite service and persistent `azurite-data` volume, builds the production training image, and starts the one-shot `training-job` plus a TensorBoard sidecar in detached mode. The command returns after startup, and the stopped training container remains available for status and log inspection. A host bind mount from `model_training/output/` to `/state` retains checkpoints, reports, caches, TensorBoard events and logs between container runs. Set `MODEL_OUTPUT_DIR` to change this host directory for training, serving and benchmarks together. TensorBoard is available at `http://127.0.0.1:6006` by default; change `TENSORBOARD_BIND_ADDRESS` and `TENSORBOARD_HOST_PORT` when remote access is intentionally required.
 
 Check the detached job with:
 
@@ -347,18 +354,35 @@ MAX_ACCURACY_DROP=0.01 \
 
 Each invocation gets a timestamped run and release ID. Set `TRAINING_RUN_ID` to reuse a persisted compatible checkpoint after an interrupted run, or `MODEL_RELEASE_ID` to choose an explicit immutable model release name. A partially uploaded dataset bootstrap can be resumed with the same `CITYPERSONS_DATASET_VERSION` and `CITYPERSONS_RESUME_UPLOAD=true`.
 
-Inside the Compose `training-state` volume, job output is retained at:
+All generated production outputs are under one host directory (mounted at `/state`):
 
 ```text
-/state/runs/<run-id>/
-├── last_training_checkpoint.pth
-├── best_model_fp32.pth
-├── best_model_ap.pth
-└── tensorboard/
-/state/releases/<release-id>/
-/state/release-evaluations/<release-id>/
-/state/active-models/
+model_training/output/
+├── runs/<run-id>/
+│   ├── checkpoints/          # last, best AP, best loss, selected FP32 .pth
+│   ├── tensorboard/
+│   ├── logs/                 # dataset validation, training, release
+│   └── dataset-validation/
+├── releases/<release-id>/
+│   ├── checkpoint/best_model_fp32.pth
+│   ├── models/               # all six XML/BIN files + calibration and optimization reports
+│   ├── evaluation/
+│   │   ├── pytorch/
+│   │   ├── fp32/
+│   │   ├── fp16/
+│   │   └── int8/
+│   ├── benchmarks/benchmark.json
+│   └── release_manifest.json
+├── active-models/            # accepted model set used by FastAPI and benchmark preflight
+├── benchmarks/yolo/runs/<benchmark-id>/
+└── cache/                   # dataset bootstrap and pinned official evaluator
 ```
+
+The normal command remains `./scripts/run-production-training.sh`. In the production container, `runProductionTraining.sh` trains into `checkpoints/`, evaluates the selected PyTorch checkpoint, converts/calibrates all three OpenVINO precisions, validates all six nonempty/readable files **before latency benchmarking**, then evaluates each precision and publishes only after successful evaluation and release gates. Standalone release evaluation writes metrics and official reports without rendering/uploading every validation image; interactive evaluation still renders images by default.
+
+The separate YOLO benchmark also checks the trained model set before dataset access or downloads. `TRAINED_MODELS_DIR` can select a particular release's `models/` directory instead of `active-models/`. Missing, empty or unreadable model pairs stop execution with the relevant paths.
+
+Existing root-level artifacts, historical result directories and old Docker volumes are **not deleted or automatically moved**. New production jobs use the central host directory. Use a fresh run ID for this layout; the script rejects flat checkpoints found directly under a reused run directory. To recover a run from the previous named volume, first copy its checkpoint files into `output/runs/<run-id>/checkpoints/` and its TensorBoard directory into the matching run directory, retaining the original copy. Resume with that ID and the same occlusion training configuration. If a release attempt failed, use a new `MODEL_RELEASE_ID` while retaining `TRAINING_RUN_ID`; completed training is reused and existing release directories remain immutable.
 
 The successful model release is stored in Azurite at:
 
@@ -584,32 +608,34 @@ Interpret common patterns as follows:
 
 `--map-threshold 0.01` is deliberately low so the evaluator receives enough detections to construct the precision-recall curve. It is not the displayed confidence threshold. `--confidence 0.5` controls visualizations, while `--nms-threshold 0.5` removes duplicate boxes before both visualization and evaluation.
 
-The training pipeline chooses export source `best_model_fp32.pth` using the configured checkpoint-selection metric. Full G selects by AP50:95 each epoch; direct Python/development training defaults to detection-loss selection. It separately retains `best_model_ap.pth` and `best_model_loss.pth`. Release acceptance should require acceptable AP50:95/Recall@FPPI, hard-case slices, and official miss rate from the full release evaluation. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
+The training pipeline chooses export source `best_model_fp32.pth` using the configured checkpoint-selection metric. Production training with visibility supervision and crowd repulsion selects by AP50:95 each epoch; direct Python/development training defaults to detection-loss selection. It separately retains `best_model_ap.pth` and `best_model_loss.pth`. Release acceptance should require acceptable AP50:95/Recall@FPPI, hard-case slices, and official miss rate from the full release evaluation. INT8 is accepted only when its absolute AP50:95 drop from FP32 is no greater than the configured `--max-accuracy-drop` (0.01 by default).
 
 ## Automated model release
 
 Run the complete post-training workflow from the repository root:
 
 ```bash
-./scripts/optimize-model.sh --release-id v2026-09-10.release1
+./scripts/optimize-model.sh --release-id v2026-09-10.release1 \
+  --checkpoint output/runs/YOUR_RUN_ID/checkpoints/best_model_fp32.pth
 ```
 
 Alternatively, invoke it in the existing training container:
 
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \
-  ./releasePersonDetector.sh --release-id v2026-09-10.release1
+  ./releasePersonDetector.sh --release-id v2026-09-10.release1 \
+  --checkpoint output/runs/YOUR_RUN_ID/checkpoints/best_model_fp32.pth
 ```
 
 The release script:
 
-1. Loads `best_model_fp32.pth` and verifies its immutable dataset provenance.
+1. Copies the selected checkpoint into the release, evaluates it with PyTorch, and verifies its immutable dataset provenance during optimization.
 2. Exports matching OpenVINO FP32 and FP16 XML/BIN pairs.
 3. Calibrates INT8, measures all three variants on the same validation records, and rejects the release if the configured AP50:95 drop is exceeded.
-4. Runs the complete FP32 project and pinned official CityPersons evaluation.
+4. Verifies all six XML/BIN files are nonempty/readable before benchmarking and runs project/official evaluations separately for FP32, FP16 and INT8.
 5. Builds a release containing the checkpoint, three OpenVINO model pairs, calibration manifest, optimization report, and evaluation reports.
 6. Uploads the release to an empty Azurite prefix and reads every blob back to verify its SHA-256.
-7. Updates `person_detector_ssd/current.json` only after verification, then copies the accepted model pairs and reports to `model_training/optimized/`, which FastAPI mounts read-only at `/models`.
+7. Updates `person_detector_ssd/current.json` only after verification, then copies the accepted model pairs and reports to `model_training/output/active-models/`, which FastAPI mounts read-only at `/models`.
 
 The default release ID is a UTC timestamp. Supplying `--release-id` is recommended for a named release. Reusing an existing local or remote release ID fails instead of overwriting it.
 
@@ -618,7 +644,7 @@ Useful overrides include:
 ```bash
 ./scripts/optimize-model.sh \
   --release-id v2026-09-10.release1 \
-  --checkpoint best_model_fp32.pth \
+  --checkpoint output/runs/YOUR_RUN_ID/checkpoints/best_model_fp32.pth \
   --input-height 360 \
   --input-width 640 \
   --release-status experimental \
@@ -636,7 +662,7 @@ Useful overrides include:
 For release ID `v2026-09-10.release1`, local artifacts are written to:
 
 ```text
-model_training/releases/v2026-09-10.release1/
+model_training/output/releases/v2026-09-10.release1/
 ├── checkpoint/best_model_fp32.pth
 ├── models/
 │   ├── person_detector_fp32.xml
@@ -647,18 +673,15 @@ model_training/releases/v2026-09-10.release1/
 │   ├── person_detector_int8.bin
 │   ├── calibration_manifest.json
 │   └── optimization_report.json
-├── evaluation/fp32/
+├── evaluation/{pytorch,fp32,fp16,int8}/
 │   ├── evaluation_metrics.json
 │   ├── map_results.txt
 │   └── citypersons_official_*
+├── benchmarks/benchmark.json
 └── release_manifest.json
 ```
 
-Rendered evaluation images remain local at:
-
-```text
-model_training/release_evaluations/v2026-09-10.release1/fp32/
-```
+Production release evaluation writes reports only. Omit `--no-visualizations` when invoking the evaluator separately to render validation images into your chosen output directory.
 
 The release is stored remotely at:
 
@@ -670,7 +693,7 @@ Current pointer: person_detector_ssd/current.json
 
 Set `AZURITE_MODEL_CONTAINER` or pass `--model-container` to use a different container. Pass `--remote-root` to change `person_detector_ssd/releases`, and `--current-pointer` to change the discovery blob. The XML contains the OpenVINO graph and references its matching BIN weights; always retain and deploy both files with the same basename.
 
-After a successful release, recreate FastAPI to load `model_training/optimized/person_detector_int8.xml`:
+After a successful release, recreate FastAPI to load `model_training/output/active-models/person_detector_int8.xml`:
 
 ```bash
 docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate fastapi
@@ -681,7 +704,7 @@ docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate
 ```bash
 docker compose -f docker-compose.yml -f compose.training.yml exec training \
   python -m person_detection.optimization.pipeline \
-    --checkpoint best_model_fp32.pth \
+    --checkpoint output/runs/YOUR_RUN_ID/checkpoints/best_model_fp32.pth \
     --output-dir optimized \
     --input-height 360 \
     --input-width 640 \

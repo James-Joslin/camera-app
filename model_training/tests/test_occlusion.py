@@ -234,8 +234,8 @@ class OcclusionTests(unittest.TestCase):
                        visible_loss=.1, repgt_overlap_count=2, duration_seconds=1.)
         log_epoch_to_tensorboard(writer, 1, metrics, metrics, .001)
         tags = [call.args[0] for call in writer.add_scalar.call_args_list]
-        self.assertIn('G/train/visible_loss', tags)
-        self.assertIn('G/validation/repgt_overlap_count', tags)
+        self.assertIn('Occlusion/train/visible_loss', tags)
+        self.assertIn('Occlusion/validation/repgt_overlap_count', tags)
 
 
 class OcclusionIntegrationTests(unittest.TestCase):
