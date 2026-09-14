@@ -7,7 +7,7 @@ updates:
     directory: /frontend
     schedule: { interval: weekly }
   - package-ecosystem: pip
-    directory: /fastapi
+    directory: /api/tests
     schedule: { interval: weekly }
   - package-ecosystem: pip
     directory: /migrations
@@ -17,9 +17,6 @@ updates:
     schedule: { interval: weekly }
   - package-ecosystem: docker
     directory: /api
-    schedule: { interval: monthly }
-  - package-ecosystem: docker
-    directory: /fastapi
     schedule: { interval: monthly }
   - package-ecosystem: docker
     directory: /frontend

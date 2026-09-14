@@ -10,12 +10,16 @@ export async function proxy(
     if (authorization) headers.set("authorization", authorization);
     if (contentType) headers.set("content-type", contentType);
     const hasBody = !["GET", "HEAD"].includes(request.method);
-    const response = await fetch(`${baseUrl}${path}`, {
-      method: request.method,
-      headers,
-      body: hasBody ? await request.arrayBuffer() : undefined,
-      cache: "no-store",
-    });
+    const response = await fetch(
+      `${baseUrl}${path}${new URL(request.url).search}`,
+      {
+        method: request.method,
+        headers,
+        body: hasBody ? request.body : undefined,
+        ...(hasBody ? { duplex: "half" } : {}),
+        cache: "no-store",
+      },
+    );
     return new Response(response.body, {
       status: response.status,
       headers: {

@@ -1,4 +1,4 @@
-# Final Dockerfile: ML + FastAPI + .NET + utilities
+# Final Dockerfile: ML + .NET + utilities
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -110,11 +110,7 @@ RUN apt-get update && apt-get install -y git-lfs && rm -rf /var/lib/apt/lists/* 
 # --------------------
 RUN pip3 install --no-cache-dir \
     kaggle \
-    fastapi \
-    uvicorn[standard] \
-    python-multipart \
     pydantic \
-    starlette \
     numpy \
     pandas \
     scikit-learn \
@@ -151,27 +147,10 @@ RUN pip3 install --no-cache-dir \
 # RUN pip3 install --no-cache-dir openvino openvino-dev  
 
 # --------------------
-# Create project dirs and default FastAPI scaffold
+# Create ML workspace directories
 # --------------------
 WORKDIR /root/project
-RUN mkdir -p /root/project/api /root/project/models /root/project/grpc /root/project/data
-
-# Minimal API scaffold (keeps small; you can expand later)
-RUN cat > /root/project/api/main.py <<'PY'
-from fastapi import FastAPI, UploadFile
-from PIL import Image
-import io
-
-app = FastAPI()
-
-@app.get('/')
-def root():
-    return {'status':'ok'}
-
-@app.post('/ping')
-async def ping():
-    return {'msg':'pong'}
-PY
+RUN mkdir -p /root/project/models /root/project/grpc /root/project/data
 
 # Example backbone module (user can replace later)
 RUN cat > /root/project/models/backbone.py <<'PY'
@@ -252,15 +231,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # --------------------
-# Expose common ports (FastAPI, JupyterLab, TensorBoard, .NET WebAPI)
+# Expose common ports (JupyterLab, TensorBoard, .NET WebAPI)
 # --------------------
-EXPOSE 8000 8888 6006 5000 5001
+EXPOSE 8888 6006 5000 5001
 
 # ENTRYPOINT runs the startup script which will finish by executing the CMD
 ENTRYPOINT ["/usr/local/bin/startup.sh"]
 
 # Default command: keep shell so user can run services interactively.
-# For automatic server start, override CMD to: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 # Set up the environment for interactive bash use
 RUN echo "PS1='\w\$ '" > /root/.bashrc
 

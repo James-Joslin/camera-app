@@ -55,6 +55,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       CAMERA_CREDENTIAL_KEY: ${CAMERA_CREDENTIAL_KEY:?set CAMERA_CREDENTIAL_KEY}
+      MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
+      MODEL_DIR: /models
+      OPENVINO_THREADS: ${OPENVINO_THREADS:-1}
+      INFERENCE_REQUESTS: ${INFERENCE_REQUESTS:-1}
+      INFERENCE_QUEUE_LIMIT: ${INFERENCE_QUEUE_LIMIT:-2}
+      INFERENCE_MAX_UPLOAD_BYTES: ${INFERENCE_MAX_UPLOAD_BYTES:-20971520}
+      MODEL_PRE_NMS_TOPK: ${MODEL_PRE_NMS_TOPK:-1000}
       STREAM_ROOT: /app/streams
       AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
       AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:?set AZURITE_ACCOUNT_NAME}
@@ -67,36 +74,8 @@ services:
         condition: service_healthy
 
     volumes:
-      - camera-streams:/app/streams
-
-  fastapi:
-    image: ${CAMERA_IMAGE_PREFIX:-camera-software}-fastapi:${CAMERA_IMAGE_TAG:-latest}
-    build:
-      context: ./fastapi
-      dockerfile: Dockerfile
-    environment:
-      POSTGRES_HOST: db
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-      AZURITE_BLOB_ENDPOINT: http://azurite:10000/devstoreaccount1
-      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:?set AZURITE_ACCOUNT_NAME}
-      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:?set AZURITE_ACCOUNT_KEY}
-      AZURITE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:?set AZURITE_CONNECTION_STRING}
-      MODEL_DIR: /models
-      MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
-      OPENVINO_DEVICE: ${OPENVINO_DEVICE:-CPU}
-      OPENVINO_PERFORMANCE_HINT: ${OPENVINO_PERFORMANCE_HINT:-LATENCY}
-      MODEL_PRE_NMS_TOPK: ${MODEL_PRE_NMS_TOPK:-1000}
-    depends_on:
-      migrations:
-        condition: service_completed_successfully
-      azurite:
-        condition: service_healthy
-
-    volumes:
       - ${MODEL_OUTPUT_DIR:-./model_training/output}/active-models:/models:ro
+      - camera-streams:/app/streams
 
   frontend:
     image: ${CAMERA_IMAGE_PREFIX:-camera-software}-frontend:${CAMERA_IMAGE_TAG:-latest}
@@ -105,13 +84,11 @@ services:
       dockerfile: Dockerfile
     environment:
       CAMERA_API_URL: http://api:8080
-      INFERENCE_API_URL: http://fastapi:8000
+      INFERENCE_API_URL: ${INFERENCE_API_URL:-http://api:8080}
     ports:
       - "${APP_PORT:-3201}:3000"
     depends_on:
       api:
-        condition: service_started
-      fastapi:
         condition: service_started
 
   ml-api:

@@ -96,7 +96,7 @@ New training commands default to `TRAINING_MODEL_VARIANT=clean_ltrb` (shared det
 
 The shared-head architecture keeps 128 channels. The default clean_ltrb model uses six strides (4–128); anchor variants retain five (8–128). Tower convolution weights are shared across levels, with separate BatchNorm statistics per level and separate classification/regression branches. The duplicate normalization/activation and head attention are removed. Dropout remains training-only. Backbone, input, QFL-style classification, and GIoU are retained.
 
-Anchor-free box prediction produces **19,235 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and FastAPI serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
+Anchor-free box prediction produces **19,235 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and C# API serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
 
 ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. Stride 4 is enabled by default; DFL remains outside this variant. Training-only visible-box supervision and crowd-repulsion losses (RepGT and RepBox) is enabled by default in the production pipeline; camera adaptation is out of scope.
 
@@ -373,7 +373,7 @@ model_training/output/
 │   │   └── int8/
 │   ├── benchmarks/benchmark.json
 │   └── release_manifest.json
-├── active-models/            # accepted model set used by FastAPI and benchmark preflight
+├── active-models/            # accepted model set used by the C# API and benchmark preflight
 ├── benchmarks/yolo/runs/<benchmark-id>/
 └── cache/                   # dataset bootstrap and pinned official evaluator
 ```
@@ -635,7 +635,7 @@ The release script:
 4. Verifies all six XML/BIN files are nonempty/readable before benchmarking and runs project/official evaluations separately for FP32, FP16 and INT8.
 5. Builds a release containing the checkpoint, three OpenVINO model pairs, calibration manifest, optimization report, and evaluation reports.
 6. Uploads the release to an empty Azurite prefix and reads every blob back to verify its SHA-256.
-7. Updates `person_detector_ssd/current.json` only after verification, then copies the accepted model pairs and reports to `model_training/output/active-models/`, which FastAPI mounts read-only at `/models`.
+7. Updates `person_detector_ssd/current.json` only after verification, then copies the accepted model pairs and reports to `model_training/output/active-models/`, which the C# API mounts read-only at `/models`.
 
 The default release ID is a UTC timestamp. Supplying `--release-id` is recommended for a named release. Reusing an existing local or remote release ID fails instead of overwriting it.
 
@@ -693,10 +693,10 @@ Current pointer: person_detector_ssd/current.json
 
 Set `AZURITE_MODEL_CONTAINER` or pass `--model-container` to use a different container. Pass `--remote-root` to change `person_detector_ssd/releases`, and `--current-pointer` to change the discovery blob. The XML contains the OpenVINO graph and references its matching BIN weights; always retain and deploy both files with the same basename.
 
-After a successful release, recreate FastAPI to load `model_training/output/active-models/person_detector_int8.xml`:
+After a successful release, recreate the C# API to load `model_training/output/active-models/person_detector_int8.xml`:
 
 ```bash
-docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate fastapi
+docker compose --env-file .env -f compose.dev.yml up -d --build --force-recreate api
 ```
 
 ## Manual export, calibration, validation, and benchmarking

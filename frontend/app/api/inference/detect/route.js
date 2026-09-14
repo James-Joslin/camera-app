@@ -5,6 +5,6 @@ export async function POST(request) {
   return proxy(
     request,
     "/api/inference/detect",
-    process.env.INFERENCE_API_URL || "http://fastapi:8000",
+    process.env.INFERENCE_API_URL || "http://api:8080",
   );
 }

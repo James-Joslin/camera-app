@@ -5,7 +5,10 @@ using CameraSoftware.Api.Streaming;
 using Microsoft.Extensions.FileProviders;
 using Npgsql;
 
+using CameraSoftware.Api.Inference;
+
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton<InferenceService>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -59,6 +62,7 @@ app.MapGet("/status/ready", async (NpgsqlDataSource dataSource, CancellationToke
     }
 });
 
+app.MapInferenceEndpoints();
 app.MapUserEndpoints();
 app.MapCameraEndpoints();
 app.MapStreamEndpoints();

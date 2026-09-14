@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.13' }
-      - run: pip install -r fastapi/requirements-dev.txt
-      - run: PYTHONPATH=fastapi pytest -q fastapi/tests
-      - run: python -m compileall -q fastapi/app project/azurite_compat.py project/optimize_model.py project/test_inference.py project/upload_to_azurite.py
+        with: { python-version: '3.12' }
+      - run: pip install -r api/tests/requirements.txt
+      - run: PYTHONPATH=api/tests pytest -q api/tests/test_reference_runtime.py
+      - run: python -m compileall -q api/tests model_training/person_detection migrations
 
   dotnet-quality:
     runs-on: ubuntu-latest
@@ -55,9 +55,6 @@ jobs:
           - name: api
             context: api
             dockerfile: api/Dockerfile
-          - name: fastapi
-            context: fastapi
-            dockerfile: fastapi/Dockerfile
           - name: frontend
             context: frontend
             dockerfile: frontend/Dockerfile

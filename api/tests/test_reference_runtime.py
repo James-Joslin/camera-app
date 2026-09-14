@@ -1,6 +1,6 @@
 import numpy as np
 
-from app.model_runtime import (
+from reference_runtime import (
     classification_scores,
     generate_anchors,
     map_box_from_letterbox,
@@ -49,7 +49,7 @@ def test_serving_anchors_match_current_person_detector() -> None:
 def test_serving_accepts_named_decoded_boxes_without_anchors(tmp_path) -> None:
     import openvino as ov
     from openvino import opset13 as ops
-    from app.model_runtime import OpenVinoPersonDetector
+    from reference_runtime import OpenVinoPersonDetector
 
     image = ops.parameter([1, 3, 72, 128], np.float32)
     # Keep an input-dependent graph while supplying known pixel box geometry.

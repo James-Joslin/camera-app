@@ -7,7 +7,7 @@ body:
     id: area
     attributes:
       label: Area
-      options: [Frontend, ASP.NET API, FastAPI, ML/inference, Azurite, PostgreSQL, DevOps]
+      options: [Frontend, ASP.NET API, ML/inference, Azurite, PostgreSQL, DevOps]
     validations: { required: true }
   - type: textarea
     id: problem

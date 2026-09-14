@@ -1,3 +1,4 @@
+"""Test-only Python oracle for C# preprocessing and detection parity. No HTTP service."""
 import os
 import threading
 import time
@@ -108,47 +109,6 @@ class OpenVinoPersonDetector:
                 }
             )
         return detections, inference_ms
-
-
-class ModelService:
-    def __init__(self):
-        configured = os.getenv("MODEL_PATH")
-        candidates = [
-            Path(configured) if configured else None,
-            Path("/models/person_detector_int8.xml"),
-            Path("/models/person_detector_fp16.xml"),
-        ]
-        self.model_path = next((path for path in candidates if path and path.exists()), None)
-        self.runtime: OpenVinoPersonDetector | None = None
-        self.error: str | None = None
-        self.lock = threading.Lock()
-
-    def status(self) -> dict:
-        return {
-            "ready": self.model_path is not None and self.error is None,
-            "loaded": self.runtime is not None,
-            "model": self.model_path.name if self.model_path else None,
-            "device": os.getenv("OPENVINO_DEVICE", "CPU"),
-            "error": self.error,
-        }
-
-    def predict(self, image: np.ndarray, threshold: float) -> tuple[list[dict], float]:
-        runtime = self._runtime()
-        return runtime.predict(image, threshold)
-
-    def _runtime(self) -> OpenVinoPersonDetector:
-        if self.runtime is not None:
-            return self.runtime
-        if self.model_path is None:
-            raise RuntimeError("No optimized OpenVINO model found. Run scripts/optimize-model.sh first.")
-        with self.lock:
-            if self.runtime is None:
-                try:
-                    self.runtime = OpenVinoPersonDetector(self.model_path)
-                except Exception as exc:
-                    self.error = str(exc)
-                    raise
-        return self.runtime
 
 
 def preprocess(
