@@ -45,7 +45,7 @@ One-shot production job:
 
 Configuration is supplied through environment variables. Common settings:
   TRAINING_BACKBONE           mobilenetv3_small (default) or mobilenetv4_conv_small
-  TRAINING_USE_STRIDE4        true (default); false for legacy stride-8 clean_ltrb
+  TRAINING_USE_STRIDE4        false (default); true opts into stride-4 clean_ltrb
   TRAINING_MODEL_VARIANT      clean_ltrb (shared-head, anchor-free; default), clean_anchor, or anchor
   TRAINING_VISIBLE_LOSS_WEIGHT  Training-only visible boxes (default: 0.25; set 0 to disable)
   TRAINING_REPGT_LOSS_WEIGHT    Neighbor-GT repulsion (default: 0.05; set 0 to disable)

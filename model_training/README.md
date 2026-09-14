@@ -94,11 +94,11 @@ New training commands default to `TRAINING_MODEL_VARIANT=clean_ltrb` (shared det
 | `clean_anchor` | Separable FPN and clean shared towers | Original multiple anchor offsets; shared-head comparison | v4 |
 | `clean_ltrb` | Separable FPN and clean shared towers | One direct left/top/right/bottom distance prediction per location | v4 |
 
-The shared-head architecture keeps 128 channels. The default clean_ltrb model uses six strides (4–128); anchor variants retain five (8–128). Tower convolution weights are shared across levels, with separate BatchNorm statistics per level and separate classification/regression branches. The duplicate normalization/activation and head attention are removed. Dropout remains training-only. Backbone, input, QFL-style classification, and GIoU are retained.
+The shared-head architecture keeps 128 channels. The default clean_ltrb model and anchor variants use five strides (8–128). Tower convolution weights are shared across levels, with separate BatchNorm statistics per level and separate classification/regression branches. The duplicate normalization/activation and head attention are removed. Dropout remains training-only. Backbone, input, QFL-style classification, and GIoU are retained.
 
-Anchor-free box prediction produces **19,235 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and C# API serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
+Anchor-free box prediction produces **4,835 predictions** at 360×640, compared with the baseline's 29,235. Four positive distances are predicted in nominal-stride units and decoded inside the graph into canvas-pixel XYXY boxes. The output is explicitly named `boxes_xyxy_pixels`; evaluation, INT8 optimization and C# API serving recognize it. No external anchors are needed to decode that output. Pixel boxes remain unclipped in the model for regression; inference clips them to the canvas.
 
-ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. Stride 4 is enabled by default; DFL remains outside this variant. Training-only visible-box supervision and crowd-repulsion losses (RepGT and RepBox) is enabled by default in the production pipeline; camera adaptation is out of scope.
+ATSS uses one virtual square reference box per location (side 8×stride) for training only. Point centers follow the canvas/actual-feature-shape grid, including odd feature heights. Positives must be inside their assigned full box. Conflict repair attempts to preserve one positive per representable person; unassigned ground truths are reported in training logs and TensorBoard as `Assignment/unmatched_gt`. Negative points inside ignore regions are neutral, while valid positives take precedence. Stride 4 is disabled by default; DFL remains outside this variant. Training-only visible-box supervision and crowd-repulsion losses (RepGT and RepBox) is enabled by default in the production pipeline; camera adaptation is out of scope.
 
 Use a **fresh run ID/directory** for this architecture. Incompatible checkpoints fail without being overwritten; the previous v3 model remains evaluable. Cloud checkpoint uploads use variant-specific prefixes. Python `TrainingConfig()`, `SSDPersonDetector()`, and `SSDLoss()` also default to `clean_ltrb`. Existing checkpoints are loaded using their recorded variant; v3 checkpoints without a variant are still interpreted as the anchor baseline.
 
@@ -754,12 +754,12 @@ New training runs default to **MobileNetV3 Small**, using torchvision ImageNet w
 Set `TRAINING_BACKBONE=mobilenetv4_conv_small` to use the pinned timm
 `mobilenetv4_conv_small.e2400_r224_in1k` ImageNet pretrained weights.
 Set `TRAINING_BACKBONE=mobilenetv3_small` to use the original torchvision
-MobileNetV3 Small backbone. Both expose stride-4/8/16/32 features to the
+MobileNetV3 Small backbone. Both expose stride-8/16/32 features to the
 128-channel feature pyramid, shared detection head and training-only occlusion
-losses. The default anchor-free 640×360 detector has 19,235 locations and two outputs.
-Stride 4 uses an earlier backbone feature fused through the FPN; the existing
-strides 8–128 remain. Set `TRAINING_USE_STRIDE4=false` for the legacy 4,835-location
-architecture. Anchor variants retain their original five levels.
+losses. The default anchor-free 640×360 detector has 4,835 locations and two outputs,
+using strides 8, 16, 32, 64 and 128. `TRAINING_USE_STRIDE4=false` is the default.
+The optional `TRAINING_USE_STRIDE4=true` adds an earlier backbone feature through
+the FPN, producing 19,235 locations. Anchor variants retain their five levels.
 
 Changing the pyramid requires a fresh training run with a new run ID. Existing
 checkpoints without `use_stride4` still load as five-level models for evaluation

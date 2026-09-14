@@ -76,7 +76,7 @@ class TrainingConfig(OcclusionConfig):
     num_classes: int = 1  # one sigmoid localization-quality logit per prediction
     model_variant: str = DEFAULT_MODEL_VARIANT
     backbone: str = "mobilenetv3_small"
-    use_stride4: bool = True
+    use_stride4: bool = False
 
     # Training
     num_epochs: int = 100
@@ -664,7 +664,7 @@ class SSDPersonDetector(nn.Module):
         model_variant: str = DEFAULT_MODEL_VARIANT,
         visible_auxiliary: bool = False,
         backbone: str = "mobilenetv3_small",
-        use_stride4: bool = True,
+        use_stride4: bool = False,
     ):
         super().__init__()
         if input_width <= input_height:
@@ -1616,7 +1616,7 @@ class DetectorTrainingPipeline:
         config = TrainingConfig(
             export_openvino_after_training=os.getenv("TRAINING_EXPORT_OPENVINO", "true").lower() == "true",
             backbone=os.getenv("TRAINING_BACKBONE", "mobilenetv3_small"),
-            use_stride4=os.getenv("TRAINING_USE_STRIDE4", "true").lower() == "true",
+            use_stride4=os.getenv("TRAINING_USE_STRIDE4", "false").lower() == "true",
             model_variant=os.getenv("TRAINING_MODEL_VARIANT", DEFAULT_MODEL_VARIANT),
             visible_loss_weight=float(os.getenv("TRAINING_VISIBLE_LOSS_WEIGHT", "0.0")),
             repgt_loss_weight=float(os.getenv("TRAINING_REPGT_LOSS_WEIGHT", "0.0")),
