@@ -75,6 +75,7 @@ class TrainingConfig(OcclusionConfig):
     # Model
     num_classes: int = 1  # one sigmoid localization-quality logit per prediction
     model_variant: str = DEFAULT_MODEL_VARIANT
+    backbone: str = "mobilenetv4_conv_small"
 
     # Training
     num_epochs: int = 100
@@ -661,6 +662,7 @@ class SSDPersonDetector(nn.Module):
         pretrained: bool = True,
         model_variant: str = DEFAULT_MODEL_VARIANT,
         visible_auxiliary: bool = False,
+        backbone: str = "mobilenetv4_conv_small",
     ):
         super().__init__()
         if input_width <= input_height:
@@ -676,14 +678,28 @@ class SSDPersonDetector(nn.Module):
             raise ValueError("Visible auxiliary requires clean_ltrb")
         self.auxiliary_head = nn.Conv2d(128, 4, 3, padding=1) if visible_auxiliary else None
 
-        backbone = mobilenet_v3_small(
-            weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        )
-        self.features = backbone.features
-        self.feature_indices = [3, 6, 12]
+        if backbone not in ("mobilenetv3_small", "mobilenetv4_conv_small"):
+            raise ValueError(f"Unknown backbone: {backbone!r}")
+        self.backbone_name = backbone
+        if backbone == "mobilenetv3_small":
+            network = mobilenet_v3_small(
+                weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+            )
+            self.features = network.features
+            self.feature_indices = [3, 6, 12]
+            channels = [24, 40, 576]
+        else:
+            import timm
+            self.features = timm.create_model(
+                "mobilenetv4_conv_small.e2400_r224_in1k", pretrained=pretrained,
+                features_only=True, out_indices=(2, 3, 4),
+            )
+            channels = self.features.feature_info.channels()
+            if self.features.feature_info.reduction() != [8, 16, 32]:
+                raise ValueError("Backbone must provide strides 8, 16 and 32")
         self.extra_layers = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(576, 128, kernel_size=1),
+                nn.Conv2d(channels[-1], 128, kernel_size=1),
                 nn.BatchNorm2d(128),
                 nn.SiLU(inplace=True),
                 nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
@@ -700,7 +716,7 @@ class SSDPersonDetector(nn.Module):
             ),
         ])
 
-        backbone_channels = [24, 40, 576, 256, 128]
+        backbone_channels = channels + [256, 128]
         fpn_channels = 128
         self.fpn = FPN(backbone_channels, out_channels=fpn_channels,
                        separable=model_variant != "anchor")
@@ -729,11 +745,15 @@ class SSDPersonDetector(nn.Module):
             ])
 
     def _extract_backbone_features(self, tensor: torch.Tensor) -> List[torch.Tensor]:
-        features = []
-        for index, layer in enumerate(self.features):
-            tensor = layer(tensor)
-            if index in self.feature_indices:
-                features.append(tensor)
+        if self.backbone_name == "mobilenetv4_conv_small":
+            features = list(self.features(tensor))
+            tensor = features[-1]
+        else:
+            features = []
+            for index, layer in enumerate(self.features):
+                tensor = layer(tensor)
+                if index in self.feature_indices:
+                    features.append(tensor)
         for extra_layer in self.extra_layers:
             tensor = extra_layer(tensor)
             features.append(tensor)
@@ -1163,6 +1183,18 @@ class OpenVINOExporter:
         except Exception as e:
             raise RuntimeError(f"OpenVINO export failed: {output_path}") from e
 
+def initialize_loader_worker(worker_id: int) -> None:
+    """Avoid one retained file descriptor per tensor storage in worker batches.
+
+    Targets contain several independent tensors per image. The default
+    file_descriptor transport can exhaust a worker's descriptor limit, causing
+    the parent's resource_sharer receive to fail with EOFError. Set this in each
+    worker so it also applies when multiprocessing uses spawn.
+    """
+    del worker_id
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
+
 def collate_fn(batch):
     """Custom collate for variable number of boxes"""
     images = torch.stack([item[0] for item in batch])
@@ -1444,6 +1476,7 @@ def checkpoint_resume_mismatches(
         compare("inputWidth", checkpoint_config.get("input_width"), config.input_width)
         compare("numClasses", checkpoint_config.get("num_classes"), config.num_classes)
         compare("modelVariant", checkpoint_config.get("model_variant", "anchor"), config.model_variant)
+        compare("backbone", checkpoint_config.get("backbone", "mobilenetv3_small"), config.backbone)
 
     checkpoint_dataset = checkpoint.get("dataset")
     for key in ("versionPrefix", "manifestSha256", "schemaVersion"):
@@ -1575,6 +1608,7 @@ class DetectorTrainingPipeline:
     def from_environment(cls) -> "DetectorTrainingPipeline":
         config = TrainingConfig(
             export_openvino_after_training=os.getenv("TRAINING_EXPORT_OPENVINO", "true").lower() == "true",
+            backbone=os.getenv("TRAINING_BACKBONE", "mobilenetv4_conv_small"),
             model_variant=os.getenv("TRAINING_MODEL_VARIANT", DEFAULT_MODEL_VARIANT),
             visible_loss_weight=float(os.getenv("TRAINING_VISIBLE_LOSS_WEIGHT", "0.0")),
             repgt_loss_weight=float(os.getenv("TRAINING_REPGT_LOSS_WEIGHT", "0.0")),
@@ -1654,6 +1688,8 @@ class DetectorTrainingPipeline:
 
     def run(self) -> None:
         config = self.config
+        if config.backbone not in ("mobilenetv3_small", "mobilenetv4_conv_small"):
+            raise ValueError(f"Unknown TRAINING_BACKBONE: {config.backbone!r}")
         box_encoding(config.model_variant)  # Validate before loading data.
         if config.enable_quantization:
             raise RuntimeError(
@@ -1665,6 +1701,7 @@ class DetectorTrainingPipeline:
 
         print("=" * 60)
         print("SSD Person Detection Training Pipeline")
+        print(f"Backbone: {config.backbone}")
         print(f"Variant: {config.model_variant}; ATSS + quality-aware binary classification")
         print("=" * 60)
         print(f"Device: {config.device}")
@@ -1740,6 +1777,7 @@ class DetectorTrainingPipeline:
             shuffle=train_sampler is None,
             sampler=train_sampler,
             num_workers=config.num_workers,
+            worker_init_fn=initialize_loader_worker,
             collate_fn=collate_fn,
             pin_memory=config.device == "cuda",
             drop_last=True,
@@ -1749,12 +1787,14 @@ class DetectorTrainingPipeline:
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
+            worker_init_fn=initialize_loader_worker,
             collate_fn=collate_fn,
             pin_memory=config.device == "cuda",
         )
 
         print("\nInitializing model...")
         model = SSDPersonDetector(
+            backbone=config.backbone,
             model_variant=config.model_variant,
             visible_auxiliary=config.visible_loss_weight > 0,
             num_classes=config.num_classes,
@@ -2014,7 +2054,7 @@ class DetectorTrainingPipeline:
         )
         if mismatches:
             raise RuntimeError(f"Best checkpoint is incompatible with this run: {mismatches}")
-        model = SSDPersonDetector(model_variant=config.model_variant, num_classes=config.num_classes,
+        model = SSDPersonDetector(backbone=config.backbone, model_variant=config.model_variant, num_classes=config.num_classes,
                                   input_height=config.input_height, input_width=config.input_width,
                                   pretrained=False).to(config.device).eval()
         load_detector_state_dict(model, checkpoint["model_state_dict"])

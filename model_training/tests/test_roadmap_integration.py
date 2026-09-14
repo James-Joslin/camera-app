@@ -226,7 +226,7 @@ class AssignmentAndHeadTests(unittest.TestCase):
 
 class ResumeContractTests(unittest.TestCase):
     def test_complete_resume_contract_matches_rectangular_run(self):
-        config = TrainingConfig(model_variant="anchor", input_height=360, input_width=640)
+        config = TrainingConfig(backbone="mobilenetv3_small", model_variant="anchor", input_height=360, input_width=640)
         dataset = {
             "versionPrefix": "datasets/citypersons/v1",
             "manifestSha256": "a" * 64,

@@ -154,7 +154,7 @@ class OptimizerArtifactTests(unittest.TestCase):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 checkpoint = root / "model.pth"
-                torch.save({"config": {"model_variant": "clean_ltrb", "input_height": 72, "input_width": 128},
+                torch.save({"config": {"model_variant": "clean_ltrb", "backbone": model.backbone_name, "input_height": 72, "input_width": 128},
                             "model_state_dict": model.state_dict(), "modelFormatVersion": 4,
                             "boxEncoding": "xyxy_pixels", "anchors": model.anchor_generator.specification()}, checkpoint)
                 with patch.object(sys, 'argv', ['optimize', '--checkpoint', str(checkpoint),

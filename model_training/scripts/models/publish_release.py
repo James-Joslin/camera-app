@@ -91,6 +91,7 @@ def build_release_manifest(
         "preprocessing": optimization_report.get("preprocessing"),
         "anchors": optimization_report.get("anchors"),
         "modelVariant": optimization_report.get("modelVariant", "anchor"),
+        "backbone": optimization_report.get("backbone", "mobilenetv3_small"),
         "boxEncoding": optimization_report.get("boxEncoding", "anchor_offsets"),
         "accuracyControl": accuracy_control,
         "topKValidation": optimization_report.get("topKValidation"),

@@ -44,6 +44,7 @@ One-shot production job:
   5. Publish a checksum-verified immutable model release and current pointer.
 
 Configuration is supplied through environment variables. Common settings:
+  TRAINING_BACKBONE           mobilenetv4_conv_small (default) or mobilenetv3_small
   TRAINING_MODEL_VARIANT      clean_ltrb (shared-head, anchor-free; default), clean_anchor, or anchor
   TRAINING_VISIBLE_LOSS_WEIGHT  Training-only visible boxes (default: 0.25; set 0 to disable)
   TRAINING_REPGT_LOSS_WEIGHT    Neighbor-GT repulsion (default: 0.05; set 0 to disable)

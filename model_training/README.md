@@ -747,3 +747,42 @@ The roadmap regressions cover sampling and slices, ATSS and ignore regions, qual
 - Quality targets are cast to the classification-logit dtype before indexed assignment, so CUDA BF16 autocast does not fail when IoU math remains FP32.
 - Validation is never oversampled. Slice metrics neutralize out-of-slice people instead of counting valid people as background false positives.
 - Legacy two-logit checkpoints are migrated to a one-logit head as person-minus-background log odds. New checkpoints use model format version 2.
+
+## Backbone selection
+
+New training runs default to **MobileNetV4 Conv Small**, using the pinned timm
+`mobilenetv4_conv_small.e2400_r224_in1k` ImageNet pretrained weights.
+Set `TRAINING_BACKBONE=mobilenetv3_small` to use the original torchvision
+MobileNetV3 Small backbone. Both expose stride-8/16/32 features to the existing
+128-channel feature pyramid, shared detection head and training-only occlusion
+losses. The 640×360 detection contract remains 4,835 locations and two outputs.
+The backbone and its connecting layers change deployed computation; latency and
+accuracy must be measured independently.
+
+From the repository root, launch these **sequentially**, waiting for one job to
+finish before starting the other (the launcher replaces the training container):
+
+```bash
+TRAINING_BACKBONE=mobilenetv4_conv_small TRAINING_RUN_ID=backbone-v4-01 ./scripts/run-production-training.sh
+# After that run completes:
+TRAINING_BACKBONE=mobilenetv3_small TRAINING_RUN_ID=backbone-v3-01 ./scripts/run-production-training.sh
+```
+
+Use fresh, distinct run IDs and identical data, training and calibration settings.
+Outputs are under `model_training/output/runs/<run-id>` and
+`model_training/output/releases/<run-id>`. The development Compose path accepts
+the same environment variable; recreate its container after changing it.
+Production builds install `timm==1.0.19` automatically. Pretrained V4 weights are
+fetched on first use, so the initial training launch needs download access.
+
+Checkpoint configuration records `backbone`; optimization, evaluation and release
+metadata preserve it. Checkpoints created before backbone selection are treated
+as MobileNetV3 Small. To resume those, explicitly select `mobilenetv3_small` and
+reuse their run ID. A backbone mismatch is rejected rather than partially loading
+weights. Changing backbone requires a fresh training run.
+
+Data-loader workers use PyTorch's `file_system` tensor sharing strategy to avoid
+exhausting open-file limits when transmitting the multiple annotation tensors per
+image. This fixes the observed worker `Too many open files` failure that surfaced
+as `EOFError` in the parent process. `TRAINING_NUM_WORKERS=0` remains available
+for synchronous loading and diagnosing unrelated dataset errors.

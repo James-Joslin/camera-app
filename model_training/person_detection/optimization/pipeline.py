@@ -159,6 +159,7 @@ def load_checkpoint_model(
     if (config.get("input_height"), config.get("input_width")) != (input_height, input_width):
         raise RuntimeError("Checkpoint input dimensions do not match the requested export canvas")
     model = SSDPersonDetector(
+        backbone=config.get("backbone", "mobilenetv3_small"),
         model_variant=checkpoint_variant(checkpoint),
         num_classes=1,
         input_height=input_height,
@@ -897,6 +898,7 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
                 "inputWidth": input_width,
             },
             "modelVariant": model.model_variant,
+            "backbone": model.backbone_name,
             "boxEncoding": model.box_encoding,
             "anchors": anchor_specification,
             "accuracyControl": {
