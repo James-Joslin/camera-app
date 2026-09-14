@@ -75,7 +75,8 @@ class TrainingConfig(OcclusionConfig):
     # Model
     num_classes: int = 1  # one sigmoid localization-quality logit per prediction
     model_variant: str = DEFAULT_MODEL_VARIANT
-    backbone: str = "mobilenetv4_conv_small"
+    backbone: str = "mobilenetv3_small"
+    use_stride4: bool = True
 
     # Training
     num_epochs: int = 100
@@ -662,7 +663,8 @@ class SSDPersonDetector(nn.Module):
         pretrained: bool = True,
         model_variant: str = DEFAULT_MODEL_VARIANT,
         visible_auxiliary: bool = False,
-        backbone: str = "mobilenetv4_conv_small",
+        backbone: str = "mobilenetv3_small",
+        use_stride4: bool = True,
     ):
         super().__init__()
         if input_width <= input_height:
@@ -680,23 +682,25 @@ class SSDPersonDetector(nn.Module):
 
         if backbone not in ("mobilenetv3_small", "mobilenetv4_conv_small"):
             raise ValueError(f"Unknown backbone: {backbone!r}")
+        self.use_stride4 = use_stride4 and model_variant == "clean_ltrb"
         self.backbone_name = backbone
         if backbone == "mobilenetv3_small":
             network = mobilenet_v3_small(
                 weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
             )
             self.features = network.features
-            self.feature_indices = [3, 6, 12]
-            channels = [24, 40, 576]
+            self.feature_indices = [1, 3, 6, 12] if self.use_stride4 else [3, 6, 12]
+            channels = [16, 24, 40, 576] if self.use_stride4 else [24, 40, 576]
         else:
             import timm
             self.features = timm.create_model(
                 "mobilenetv4_conv_small.e2400_r224_in1k", pretrained=pretrained,
-                features_only=True, out_indices=(2, 3, 4),
+                features_only=True, out_indices=(1, 2, 3, 4) if self.use_stride4 else (2, 3, 4),
             )
             channels = self.features.feature_info.channels()
-            if self.features.feature_info.reduction() != [8, 16, 32]:
-                raise ValueError("Backbone must provide strides 8, 16 and 32")
+            expected_strides = [4, 8, 16, 32] if self.use_stride4 else [8, 16, 32]
+            if self.features.feature_info.reduction() != expected_strides:
+                raise ValueError(f"Backbone must provide strides {expected_strides}")
         self.extra_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(channels[-1], 128, kernel_size=1),
@@ -723,12 +727,13 @@ class SSDPersonDetector(nn.Module):
         feature_map_shapes = self._infer_feature_map_shapes()
         generator_type = PointReferenceGenerator if model_variant == "clean_ltrb" else PersonAnchorGenerator
         self.anchor_generator = generator_type(
-            input_height, input_width, feature_map_shapes
+            input_height, input_width, feature_map_shapes,
+            **({"strides": [4, 8, 16, 32, 64, 128]} if self.use_stride4 else {}),
         )
         if model_variant != "anchor":
             self.detection_heads = CleanDetectionHead(
                 fpn_channels,
-                [self.anchor_generator.get_num_anchors_per_location(level) for level in range(5)],
+                [self.anchor_generator.get_num_anchors_per_location(level) for level in range(len(feature_map_shapes))],
                 ltrb=model_variant == "clean_ltrb",
             )
             if model_variant == "clean_ltrb":
@@ -741,7 +746,7 @@ class SSDPersonDetector(nn.Module):
                     self.anchor_generator.get_num_anchors_per_location(level),
                     num_classes,
                 )
-                for level in range(5)
+                for level in range(len(feature_map_shapes))
             ])
 
     def _extract_backbone_features(self, tensor: torch.Tensor) -> List[torch.Tensor]:
@@ -1477,6 +1482,8 @@ def checkpoint_resume_mismatches(
         compare("numClasses", checkpoint_config.get("num_classes"), config.num_classes)
         compare("modelVariant", checkpoint_config.get("model_variant", "anchor"), config.model_variant)
         compare("backbone", checkpoint_config.get("backbone", "mobilenetv3_small"), config.backbone)
+        compare("use_stride4", checkpoint_config.get("use_stride4", False) and checkpoint_config.get("model_variant") == "clean_ltrb",
+                config.use_stride4 and config.model_variant == "clean_ltrb")
 
     checkpoint_dataset = checkpoint.get("dataset")
     for key in ("versionPrefix", "manifestSha256", "schemaVersion"):
@@ -1608,7 +1615,8 @@ class DetectorTrainingPipeline:
     def from_environment(cls) -> "DetectorTrainingPipeline":
         config = TrainingConfig(
             export_openvino_after_training=os.getenv("TRAINING_EXPORT_OPENVINO", "true").lower() == "true",
-            backbone=os.getenv("TRAINING_BACKBONE", "mobilenetv4_conv_small"),
+            backbone=os.getenv("TRAINING_BACKBONE", "mobilenetv3_small"),
+            use_stride4=os.getenv("TRAINING_USE_STRIDE4", "true").lower() == "true",
             model_variant=os.getenv("TRAINING_MODEL_VARIANT", DEFAULT_MODEL_VARIANT),
             visible_loss_weight=float(os.getenv("TRAINING_VISIBLE_LOSS_WEIGHT", "0.0")),
             repgt_loss_weight=float(os.getenv("TRAINING_REPGT_LOSS_WEIGHT", "0.0")),
@@ -1794,7 +1802,7 @@ class DetectorTrainingPipeline:
 
         print("\nInitializing model...")
         model = SSDPersonDetector(
-            backbone=config.backbone,
+            backbone=config.backbone, use_stride4=config.use_stride4,
             model_variant=config.model_variant,
             visible_auxiliary=config.visible_loss_weight > 0,
             num_classes=config.num_classes,
@@ -2054,7 +2062,7 @@ class DetectorTrainingPipeline:
         )
         if mismatches:
             raise RuntimeError(f"Best checkpoint is incompatible with this run: {mismatches}")
-        model = SSDPersonDetector(backbone=config.backbone, model_variant=config.model_variant, num_classes=config.num_classes,
+        model = SSDPersonDetector(backbone=config.backbone, use_stride4=config.use_stride4, model_variant=config.model_variant, num_classes=config.num_classes,
                                   input_height=config.input_height, input_width=config.input_width,
                                   pretrained=False).to(config.device).eval()
         load_detector_state_dict(model, checkpoint["model_state_dict"])

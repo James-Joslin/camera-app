@@ -28,7 +28,7 @@ class CleanModelTests(unittest.TestCase):
         with torch.no_grad():
             for name, model in models.items():
                 cls, boxes = model(torch.zeros(1, 3, 360, 640))
-                count = 4835 if name == "clean_ltrb" else 29235
+                count = 19235 if name == "clean_ltrb" else 29235
                 self.assertEqual(tuple(cls.shape), (1, count, 1))
                 self.assertEqual(tuple(boxes.shape), (1, count, 4))
         baseline_params = sum(p.numel() for p in models["anchor"].parameters())
@@ -48,7 +48,7 @@ class CleanModelTests(unittest.TestCase):
         torch.testing.assert_close(boxes[0, :, :2], model.point_centers - expected_distances)
         torch.testing.assert_close(boxes[0, :, 2:], model.point_centers + expected_distances)
         # Odd-sized stride-16 map uses 360/23 grid spacing, not 16.
-        self.assertAlmostEqual(model.point_centers[3600, 1].item(), 360 / 23 / 2, places=5)
+        self.assertAlmostEqual(model.point_centers[18000, 1].item(), 360 / 23 / 2, places=5)
 
     def test_backward_with_mixed_precision_and_empty_image(self):
         model = SSDPersonDetector(pretrained=False, input_height=72, input_width=128,
@@ -109,7 +109,10 @@ class CleanModelTests(unittest.TestCase):
     def test_new_training_defaults_to_ce(self):
         from unittest.mock import patch
         with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(DetectorTrainingPipeline.from_environment().config.model_variant, "clean_ltrb")
+            config = DetectorTrainingPipeline.from_environment().config
+            self.assertEqual(config.model_variant, "clean_ltrb")
+            self.assertEqual(config.backbone, "mobilenetv3_small")
+            self.assertTrue(config.use_stride4)
 
 
 class PointAssignmentTests(unittest.TestCase):
@@ -169,7 +172,7 @@ class OpenVINOContractTests(unittest.TestCase):
             self.assertTrue(has_decoded_boxes(compiled.outputs))
             result = compiled([records[0]])
             boxes = result[compiled.output("boxes_xyxy_pixels")]
-            self.assertEqual(boxes.shape, (1, 201, 4))
+            self.assertEqual(boxes.shape, (1, 777, 4))
             self.assertTrue(np.isfinite(boxes).all())
             self.assertTrue((boxes[..., 2:] > boxes[..., :2]).all())
 

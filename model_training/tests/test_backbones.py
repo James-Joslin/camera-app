@@ -13,15 +13,17 @@ from person_detection.optimization.pipeline import load_checkpoint_model
 
 class BackboneTests(unittest.TestCase):
     def test_defaults_and_both_backbones_round_trip(self):
-        self.assertEqual(TrainingConfig().backbone, "mobilenetv4_conv_small")
+        self.assertEqual(TrainingConfig().backbone, "mobilenetv3_small")
         for backbone in ("mobilenetv3_small", "mobilenetv4_conv_small"):
             with self.subTest(backbone=backbone):
                 model = SSDPersonDetector(backbone=backbone, pretrained=False).eval()
+                self.assertEqual(model.anchor_generator.strides, [4, 8, 16, 32, 64, 128])
+                self.assertEqual(model.anchor_generator.feature_map_shapes[0], (90, 160))
                 sample = torch.zeros(1, 3, 360, 640)
                 with torch.no_grad():
                     expected = model(sample)
-                self.assertEqual(expected[0].shape, (1, 4835, 1))
-                self.assertEqual(expected[1].shape, (1, 4835, 4))
+                self.assertEqual(expected[0].shape, (1, 19235, 1))
+                self.assertEqual(expected[1].shape, (1, 19235, 4))
                 config = vars(TrainingConfig(backbone=backbone)).copy()
                 if backbone == "mobilenetv3_small":
                     del config["backbone"]  # Real pre-selection checkpoint contract.
@@ -36,6 +38,22 @@ class BackboneTests(unittest.TestCase):
                 other = "mobilenetv3_small" if backbone.endswith("conv_small") else "mobilenetv4_conv_small"
                 mismatches = checkpoint_resume_mismatches(checkpoint, TrainingConfig(backbone=other), {}, {})
                 self.assertIn("backbone", mismatches)
+
+    def test_legacy_five_level_checkpoints_still_load(self):
+        for backbone in ("mobilenetv3_small", "mobilenetv4_conv_small"):
+            with self.subTest(backbone=backbone):
+                model = SSDPersonDetector(backbone=backbone, use_stride4=False, pretrained=False).eval()
+                config = vars(TrainingConfig(backbone=backbone)).copy()
+                del config["use_stride4"]
+                checkpoint = {"config": config, "model_state_dict": model.state_dict(),
+                              "modelFormatVersion": 4, "boxEncoding": "xyxy_pixels"}
+                restored = load_checkpoint_model(checkpoint, 360, 640)
+                self.assertFalse(restored.use_stride4)
+                with torch.no_grad():
+                    actual = restored(torch.zeros(1, 3, 360, 640))
+                self.assertEqual(actual[0].shape, (1, 4835, 1))
+                self.assertIn("use_stride4", checkpoint_resume_mismatches(
+                    checkpoint, TrainingConfig(backbone=backbone), {}, {}))
 
     def test_unknown_backbone_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unknown backbone"):

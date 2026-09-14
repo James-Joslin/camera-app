@@ -53,13 +53,13 @@ class PointReferenceGenerator:
     The reference side is 8 nominal strides, as in single-reference ATSS.
     """
 
-    def __init__(self, input_height, input_width, feature_map_shapes):
+    def __init__(self, input_height, input_width, feature_map_shapes, strides=None):
         self.input_height = input_height
         self.input_width = input_width
         self.feature_map_shapes = list(feature_map_shapes)
-        self.strides = [8, 16, 32, 64, 128]
+        self.strides = list(strides) if strides is not None else [8, 16, 32, 64, 128]
         if len(self.feature_map_shapes) != len(self.strides):
-            raise ValueError("Expected five feature levels")
+            raise ValueError("Expected one feature map per stride")
         references, points, strides = [], [], []
         for (height, width), stride in zip(self.feature_map_shapes, self.strides):
             for row in range(height):

@@ -92,6 +92,7 @@ def build_release_manifest(
         "anchors": optimization_report.get("anchors"),
         "modelVariant": optimization_report.get("modelVariant", "anchor"),
         "backbone": optimization_report.get("backbone", "mobilenetv3_small"),
+        "use_stride4": optimization_report.get("use_stride4", False),
         "boxEncoding": optimization_report.get("boxEncoding", "anchor_offsets"),
         "accuracyControl": accuracy_control,
         "topKValidation": optimization_report.get("topKValidation"),

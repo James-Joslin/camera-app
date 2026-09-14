@@ -427,12 +427,19 @@ class OpenVINOPredictor(DetectionBackend):
 
         self.box_encoding = "xyxy_pixels" if has_decoded_boxes(self.output_layers) else "anchor_offsets"
         if self.box_encoding == "xyxy_pixels":
-            shapes = [((config.input_height + stride - 1) // stride,
-                       (config.input_width + stride - 1) // stride)
-                      for stride in (8, 16, 32, 64, 128)]
-            self.anchors = PointReferenceGenerator(
-                config.input_height, config.input_width, shapes
-            ).get_anchors().numpy()
+            # Old IRs have five levels; new stride-4 IRs have six. The fixed
+            # output count identifies the geometry without requiring a sidecar.
+            for strides in ([8, 16, 32, 64, 128], [4, 8, 16, 32, 64, 128]):
+                shapes = [((config.input_height + stride - 1) // stride,
+                           (config.input_width + stride - 1) // stride)
+                          for stride in strides]
+                if sum(h * w for h, w in shapes) == int(self.box_output.shape[1]):
+                    self.anchors = PointReferenceGenerator(
+                        config.input_height, config.input_width, shapes, strides=strides
+                    ).get_anchors().numpy()
+                    break
+            else:
+                raise ValueError("Unsupported anchor-free OpenVINO pyramid geometry")
         if int(self.box_output.shape[1]) != len(self.anchors):
             raise ValueError("OpenVINO output count does not match its prediction contract")
 
@@ -832,6 +839,7 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
     variant = (checkpoint.get("config", {}).get("model_variant", "anchor") if checkpoint
                else ("anchor" if model_type == "openvino" else DEFAULT_MODEL_VARIANT))
     base_model = SSDPersonDetector(
+        use_stride4=(checkpoint.get("config", {}).get("use_stride4", False) if checkpoint else False),
         backbone=(checkpoint.get("config", {}).get("backbone", "mobilenetv3_small")
                   if checkpoint else "mobilenetv3_small"),
         model_variant=variant,
