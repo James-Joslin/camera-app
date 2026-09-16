@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 DEFAULT_MODEL_VARIANT = "clean_ltrb"
@@ -141,7 +142,7 @@ class CleanDetectionHead(nn.Module):
         cls = cls.permute(0, 2, 3, 1).reshape(batch, -1, 1)
         boxes = boxes.permute(0, 2, 3, 1).reshape(batch, -1, 4)
         if self.ltrb:
-            boxes = torch.relu(boxes) + 1e-3
+            boxes = F.softplus(boxes) + 1e-3
         if visible is not None:
             visible = visible.permute(0, 2, 3, 1).reshape(batch, -1, 4)
             return cls, boxes, visible
