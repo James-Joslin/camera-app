@@ -10,7 +10,7 @@ RUN cmake -S /native -B /native/build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /native/build -j2 && cmake --install /native/build \
     && cp /usr/local/lib/python3.12/site-packages/openvino/libs/*.so* /native/out/lib/
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY cameraApi.csproj .
 RUN dotnet restore
