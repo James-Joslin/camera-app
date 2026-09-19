@@ -64,6 +64,10 @@ services:
       CAMERA_CREDENTIAL_KEY: ${CAMERA_CREDENTIAL_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
       MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
       MODEL_DIR: /models
+      MODEL_CACHE_DIR: /app/model-cache
+      MODEL_VARIANT: ${MODEL_VARIANT:-int8}
+      AZURITE_MODEL_CONTAINER: ${AZURITE_MODEL_CONTAINER:-computer-vision-models}
+      AZURITE_MODEL_CURRENT_POINTER: ${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/current.json}
       OPENVINO_THREADS: ${OPENVINO_THREADS:-1}
       INFERENCE_REQUESTS: ${INFERENCE_REQUESTS:-1}
       INFERENCE_QUEUE_LIMIT: ${INFERENCE_QUEUE_LIMIT:-2}
@@ -81,6 +85,7 @@ services:
       - ./api:/src
       - dotnet-nuget:/root/.nuget/packages
       - camera-streams:/app/streams
+      - model-cache:/app/model-cache
     depends_on:
       migrations:
         condition: service_completed_successfully
@@ -151,3 +156,4 @@ volumes:
   frontend-node-modules:
   frontend-next:
   camera-streams:
+  model-cache:

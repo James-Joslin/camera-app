@@ -9,6 +9,8 @@ using CameraSoftware.Api.Inference;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<InferenceService>();
+builder.Services.AddSingleton<ModelReleaseRefreshService>();
+builder.Services.AddHostedService<ModelReleaseRefreshService>(provider => provider.GetRequiredService<ModelReleaseRefreshService>());
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 

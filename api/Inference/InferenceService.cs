@@ -24,12 +24,17 @@ public sealed class InferenceService : IDisposable
     private int admitted;
     private string? error;
     public string ModelDirectory { get; }
-    public string ModelPath { get; }
+    public string ModelPath { get; private set; }
+    public string? ReleaseId { get; private set; }
+    public string? ReleaseStatus { get; private set; }
+    private readonly IConfiguration config;
+    public ModelRefreshStatus Refresh { get; set; } = new(null, null, null);
     public int MaxUploadBytes { get; }
 
     public InferenceService(IConfiguration config, ILogger<InferenceService> logger)
     {
         this.logger = logger;
+        this.config = config;
         ModelDirectory = config["MODEL_DIR"] ?? "/models";
         ModelPath = config["MODEL_PATH"] ?? Path.Combine(ModelDirectory, "person_detector_int8.xml");
         capacity = ReadInt(config, "INFERENCE_REQUESTS", 1, 1, 32);
@@ -44,11 +49,52 @@ public sealed class InferenceService : IDisposable
         var value = config.GetValue<int?>(key) ?? fallback;
         return value >= min && value <= max ? value : throw new ArgumentOutOfRangeException(key);
     }
-    public object Status() => new {
-        ready = File.Exists(ModelPath) && File.Exists(Path.ChangeExtension(ModelPath,".bin")) && error is null,
-        loaded = engine != IntPtr.Zero, model = Path.GetFileName(ModelPath), device = "CPU", error,
-        backend = "csharp-openvino", requests = capacity, queueLimit
-    };
+    public object Status()
+    {
+        lock (initialization) return new {
+            ready = (engine != IntPtr.Zero || (File.Exists(ModelPath) && File.Exists(Path.ChangeExtension(ModelPath,".bin")))) && error is null,
+            loaded = engine != IntPtr.Zero, model = Path.GetFileName(ModelPath), device = "CPU", error,
+            backend = "csharp-openvino", requests = capacity, queueLimit,
+            releaseId = ReleaseId, releaseStatus = ReleaseStatus, refresh = Refresh
+        };
+    }
+
+    // Compile separately while the old model keeps serving. Drain all worker slots
+    // before transferring ownership so no in-flight native handle can be destroyed.
+    public async Task ReplaceModelAsync(string path, string releaseId, string releaseStatus, CancellationToken token)
+    {
+        var candidateConfig = new ConfigurationBuilder().AddConfiguration(config)
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["MODEL_PATH"] = path }).Build();
+        using var candidate = new InferenceService(candidateConfig, logger);
+        await Task.Run(() => {
+            candidate.EnsureLoaded();
+            if (!candidate.workers.TryPeek(out var probe)) throw new InvalidOperationException("Candidate has no worker");
+            // A tiny PPM exercises decode, preprocessing, inference and postprocessing
+            // before the candidate is allowed to replace the working release.
+            byte[] image = [.. Encoding.ASCII.GetBytes("P6\n1 1\n255\n"), 0, 0, 0];
+            if (NativeDetector.detector_predict(probe.Handle, image, image.Length, .5f, .45f, topK,
+                    probe.Boxes, 100, probe.Dimensions, probe.Stages, probe.Error, probe.Error.Capacity) < 0)
+                throw new InvalidOperationException("Candidate inference validation failed: " + probe.Error);
+        }, token);
+        int acquired = 0;
+        try
+        {
+            for (; acquired < capacity; acquired++) await slots.WaitAsync(token);
+            token.ThrowIfCancellationRequested();
+            lock (initialization)
+            {
+                ReleaseNative();
+                engine = candidate.engine;
+                candidate.engine = IntPtr.Zero;
+                while (candidate.workers.TryDequeue(out var worker)) workers.Enqueue(worker);
+                ModelPath = path;
+                ReleaseId = releaseId;
+                ReleaseStatus = releaseStatus;
+                error = null;
+            }
+        }
+        finally { if (acquired > 0) slots.Release(acquired); }
+    }
     private void EnsureLoaded()
     {
         lock (initialization)
@@ -128,7 +174,7 @@ public sealed class InferenceService : IDisposable
                               (int)worker.Boxes[5*i+2], (int)worker.Boxes[5*i+3] }
             }).ToArray();
             return Results.Ok(new {
-                model = Path.GetFileName(ModelPath), image = new { width = worker.Dimensions[0], height = worker.Dimensions[1] },
+                model = Path.GetFileName(ModelPath), releaseId = ReleaseId, image = new { width = worker.Dimensions[0], height = worker.Dimensions[1] },
                 inferenceMs = Math.Round(worker.Stages[2],2), detections,
                 timings = new { queueMs, initializationMs, readMs, decodeMs = worker.Stages[0],
                     preprocessMs = worker.Stages[1], inferenceMs = worker.Stages[2],

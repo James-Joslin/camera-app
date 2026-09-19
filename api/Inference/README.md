@@ -65,8 +65,37 @@ worker is returned. ASP.NET's multipart and server request-size limits also appl
 
 `/api/inference/status` retains ready/loaded/model/device/error and adds backend
 and concurrency information. Readiness before first use reports file availability;
-first inference compiles and validates the graph. Model changes still require an
-API restart: automatic Azurite model discovery/hot replacement is not introduced.
+first inference compiles and validates the graph. Model updates are manual: use **Settings → Refresh model** while signed in.
+The frontend calls authenticated `POST /api/inference/refresh`. There is no
+periodic polling or startup check against Azurite.
+It downloads the selected XML/BIN pair, checks manifest sizes and SHA-256 hashes,
+and compiles and runs a test image through a separate candidate before draining active requests and switching
+workers. Failed updates leave the existing model serving. Inference responses
+include `releaseId`; status includes `releaseId`, `releaseStatus`, and `refresh`.
+
+Compose mounts a persistent `model-cache` volume at `/app/model-cache`. The last
+successfully activated release is checksum-checked and restored locally on startup
+without contacting Azurite. The read-only `/models` mount remains the initial
+fallback. Cache cleanup retains the active release. Publication should upload
+all artifacts and the manifest before updating `current.json`.
+
+| Environment | Default | Meaning |
+| --- | --- | --- |
+| `MODEL_VARIANT` | `int8` | Published variant: int8, fp16, or fp32 |
+| `MODEL_CACHE_DIR` | `/app/model-cache` | Writable release cache |
+| `AZURITE_MODEL_CONTAINER` | `computer-vision-models` | Release blob container |
+| `AZURITE_MODEL_CURRENT_POINTER` | `person_detector_ssd/current.json` | Published release pointer |
+| `AZURITE_CONNECTION_STRING` | none | Blob storage connection |
+
+Accepted experimental releases remain supported; the release status is displayed
+in the frontend Settings and Activity views. "Latest" means the release selected by the pointer,
+so publishing a previous accepted release also supports rollback. Refresh errors
+are separate from inference readiness. Storage credentials stay in the API.
+
+Deploy this feature once by rebuilding/recreating the API with the usual Compose
+configuration; subsequent model updates use the Settings button and require no API/container restart.
+Concurrent refresh attempts return HTTP 409. Refresh status reports manual mode,
+progress, the last check, the last activation, and any error.
 
 ## Timings and verification
 

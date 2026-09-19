@@ -23,7 +23,8 @@ struct Engine {
     ov::CompiledModel model;
     int height, width, logits_port = -1, boxes_port = -1;
     explicit Engine(const char* path, int threads) {
-        cv::setNumThreads(1);
+        static const bool configured = [] { cv::setNumThreads(1); return true; }();
+        (void)configured;
         ov::Core core;
         auto graph = core.read_model(path);
         if (graph->inputs().size() != 1 || graph->outputs().size() != 2)

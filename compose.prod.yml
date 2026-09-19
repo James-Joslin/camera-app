@@ -57,6 +57,10 @@ services:
       CAMERA_CREDENTIAL_KEY: ${CAMERA_CREDENTIAL_KEY:?set CAMERA_CREDENTIAL_KEY}
       MODEL_PATH: ${MODEL_PATH:-/models/person_detector_int8.xml}
       MODEL_DIR: /models
+      MODEL_CACHE_DIR: /app/model-cache
+      MODEL_VARIANT: ${MODEL_VARIANT:-int8}
+      AZURITE_MODEL_CONTAINER: ${AZURITE_MODEL_CONTAINER:-computer-vision-models}
+      AZURITE_MODEL_CURRENT_POINTER: ${AZURITE_MODEL_CURRENT_POINTER:-person_detector_ssd/current.json}
       OPENVINO_THREADS: ${OPENVINO_THREADS:-1}
       INFERENCE_REQUESTS: ${INFERENCE_REQUESTS:-1}
       INFERENCE_QUEUE_LIMIT: ${INFERENCE_QUEUE_LIMIT:-2}
@@ -76,6 +80,7 @@ services:
     volumes:
       - ${MODEL_OUTPUT_DIR:-./model_training/output}/active-models:/models:ro
       - camera-streams:/app/streams
+      - model-cache:/app/model-cache
 
   frontend:
     image: ${CAMERA_IMAGE_PREFIX:-camera-software}-frontend:${CAMERA_IMAGE_TAG:-latest}
@@ -121,3 +126,4 @@ volumes:
   postgres-data:
   azurite-data:
   camera-streams:
+  model-cache:

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import HlsPlayer from "./HlsPlayer";
 
-const views = ["cameras", "activity", "system"];
+const views = ["cameras", "activity", "settings"];
 
 const emptyCamera = {
   name: "",
@@ -54,6 +54,32 @@ export default function CameraDashboard() {
   });
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState("");
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [refreshMessage, setRefreshMessage] = useState("");
+
+  async function refreshModel() {
+    if (!token) {
+      openDialog("auth");
+      return;
+    }
+    setRefreshBusy(true);
+    setRefreshMessage("");
+    try {
+      const result = await jsonRequest(
+        "/api/inference/refresh",
+        { method: "POST" },
+        token,
+      );
+      setInference(result.status);
+      setRefreshMessage(result.message);
+    } catch (error) {
+      setRefreshMessage(error.message);
+      if (error.status === 401) handleRequestError(error);
+      await load();
+    } finally {
+      setRefreshBusy(false);
+    }
+  }
 
   const load = useCallback(async () => {
     const [cameraResult, streamResult, inferenceResult] =
@@ -104,7 +130,8 @@ export default function CameraDashboard() {
     }
 
     const syncViewFromHash = () => {
-      const hash = window.location.hash.slice(1);
+      const rawHash = window.location.hash.slice(1);
+      const hash = rawHash === "system" ? "settings" : rawHash;
       if (views.includes(hash)) setActiveView(hash);
     };
     syncViewFromHash();
@@ -534,6 +561,15 @@ export default function CameraDashboard() {
                 <strong>{inference.model || "Awaiting optimized model"}</strong>
                 <span>{inference.device || "CPU"}</span>
               </div>
+              <p className="muted-copy" aria-live="polite">
+                {inference.releaseId
+                  ? `Release ${inference.releaseId} · ${inference.releaseStatus}`
+                  : "Using the locally mounted model"}
+                {" · Updates are manual"}
+              </p>
+              {inference.refresh?.error && (
+                <p role="status">{inference.refresh.error}</p>
+              )}
               <div className="activity-list" aria-live="polite">
                 <h3>Current stream activity</h3>
                 {streams.length ? (
@@ -558,12 +594,12 @@ export default function CameraDashboard() {
           </section>
         )}
 
-        {activeView === "system" && (
+        {activeView === "settings" && (
           <section
             className="section system-panel workspace-panel"
-            id="panel-system"
+            id="panel-settings"
             role="tabpanel"
-            aria-labelledby="tab-system"
+            aria-labelledby="tab-settings"
           >
             <div className="section-heading">
               <div>
@@ -574,6 +610,39 @@ export default function CameraDashboard() {
                 Check now ↗
               </button>
             </div>
+            <article className="service-item">
+              <span className="service-label">Model settings</span>
+              <h3>{inference.model || "No model loaded"}</h3>
+              <p>
+                {inference.releaseId
+                  ? `Release ${inference.releaseId} · ${inference.releaseStatus}`
+                  : "Using the locally mounted model"}
+              </p>
+              <p>
+                Model updates are manual. Refresh to check for and load the
+                latest published release without restarting the app.
+              </p>
+              <button
+                type="button"
+                className="primary"
+                onClick={refreshModel}
+                disabled={refreshBusy || inference.refresh?.inProgress}
+              >
+                {refreshBusy || inference.refresh?.inProgress
+                  ? "Refreshing model…"
+                  : "Refresh model"}
+              </button>
+              {!token && <p>Sign in to refresh the model.</p>}
+              <p role="status" aria-live="polite">
+                {refreshMessage || inference.refresh?.error}
+              </p>
+              {inference.refresh?.lastCheckedAt && (
+                <p className="last-checked">
+                  Last model check{" "}
+                  {new Date(inference.refresh.lastCheckedAt).toLocaleString()}
+                </p>
+              )}
+            </article>
             <div className="service-grid">
               <article className="service-item">
                 <span className="service-label">Camera API</span>

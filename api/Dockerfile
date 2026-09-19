@@ -25,7 +25,7 @@ ENV LD_LIBRARY_PATH=/opt/camera-inference
 WORKDIR /app
 ENV ASPNETCORE_URLS=http://+:8080
 COPY --from=build /out .
-RUN mkdir -p /app/streams && chown -R $APP_UID:$APP_UID /app
+RUN mkdir -p /app/streams /app/model-cache && chown -R $APP_UID:$APP_UID /app
 USER $APP_UID
 EXPOSE 8080
 ENTRYPOINT ["dotnet", "cameraApi.dll"]
