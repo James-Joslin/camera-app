@@ -17,7 +17,7 @@ RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Release -o /out --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl libopencv-core406 libopencv-imgproc406 libopencv-imgcodecs406 libtbb12 && rm -rf /var/lib/apt/lists/*
 COPY --from=native /native/out/lib/ /opt/camera-inference/
