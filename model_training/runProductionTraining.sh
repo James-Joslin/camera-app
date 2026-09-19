@@ -45,6 +45,8 @@ One-shot production job:
 
 Configuration is supplied through environment variables. Common settings:
   TRAINING_BACKBONE           mobilenetv3_small (default) or mobilenetv4_conv_small
+  TRAINING_USE_PAN            true (default); lightweight bottom-up neck
+  TRAINING_REGRESSION_DEPTH   2 (default); 1 restores the original clean regression tower
   TRAINING_USE_STRIDE4        false (default); true opts into stride-4 clean_ltrb
   TRAINING_MODEL_VARIANT      clean_ltrb (shared-head, anchor-free; default), clean_anchor, or anchor
   TRAINING_VISIBLE_LOSS_WEIGHT  Training-only visible boxes (default: 0.25; set 0 to disable)
@@ -123,6 +125,8 @@ fi
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export ENABLE_QUANTIZATION=false
 # Visibility supervision and crowd repulsion are enabled in normal production training.
+export TRAINING_USE_PAN="${TRAINING_USE_PAN:-true}"
+export TRAINING_REGRESSION_DEPTH="${TRAINING_REGRESSION_DEPTH:-2}"
 export TRAINING_EPOCHS="$EPOCHS"
 export TRAINING_BATCH_SIZE="$BATCH_SIZE"
 export TRAINING_NUM_WORKERS="$NUM_WORKERS"

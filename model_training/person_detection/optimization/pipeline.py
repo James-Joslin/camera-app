@@ -161,6 +161,8 @@ def load_checkpoint_model(
     model = SSDPersonDetector(
         backbone=config.get("backbone", "mobilenetv3_small"),
         use_stride4=config.get("use_stride4", False),
+        use_pan=config.get("use_pan", False),
+        regression_depth=config.get("regression_depth", 1),
         model_variant=checkpoint_variant(checkpoint),
         num_classes=1,
         input_height=input_height,
@@ -901,6 +903,8 @@ class ManifestDrivenOpenVINOOptimizer(ModelOptimizationPipeline):
             "modelVariant": model.model_variant,
             "backbone": model.backbone_name,
             "use_stride4": model.use_stride4,
+            "use_pan": model.use_pan,
+            "regression_depth": model.regression_depth,
             "boxEncoding": model.box_encoding,
             "anchors": anchor_specification,
             "accuracyControl": {

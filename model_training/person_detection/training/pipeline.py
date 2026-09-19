@@ -77,7 +77,7 @@ class TrainingConfig(OcclusionConfig):
     model_variant: str = DEFAULT_MODEL_VARIANT
     backbone: str = "mobilenetv3_small"
     use_stride4: bool = False
-    use_pan: bool = True
+    use_pan: bool = False
     regression_depth: int = 1
 
     # Training

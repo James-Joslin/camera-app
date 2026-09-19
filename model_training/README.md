@@ -795,3 +795,26 @@ exhausting open-file limits when transmitting the multiple annotation tensors pe
 image. This fixes the observed worker `Too many open files` failure that surfaced
 as `EOFError` in the parent process. `TRAINING_NUM_WORKERS=0` remains available
 for synchronous loading and diagnosing unrelated dataset errors.
+
+
+### Lightweight PAN and deeper regression head
+
+New environment-driven training runs enable `TRAINING_USE_PAN=true` and
+`TRAINING_REGRESSION_DEPTH=2`. The 128-channel neck adds a bottom-up path across
+all existing levels, using stride-2 depthwise-separable convolutions, additive
+fusion, and depthwise-separable refinement. Resolution and feature strides are
+unchanged. The clean head adds a second depthwise-separable regression block;
+classification depth is unchanged. Every shared head block retains independent
+BatchNorm parameters and running statistics per feature level. PAN transitions
+also have their own BatchNorm modules.
+
+Use a **new TRAINING_RUN_ID** for this architecture. Older checkpoints still load
+for inference/export with the original FPN and one regression block; resuming
+with different architecture settings is rejected. To resume an older run or run
+an ablation, set `TRAINING_USE_PAN=false TRAINING_REGRESSION_DEPTH=1`.
+For the legacy `anchor` variant, regression depth must remain 1.
+Programmatic model/config constructors retain legacy defaults; pass
+`use_pan=True, regression_depth=2` explicitly to select the upgraded architecture.
+
+No new accuracy or target-CPU latency result is implied by this change. Compare
+against the baseline at identical training and inference settings.
