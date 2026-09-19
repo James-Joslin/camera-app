@@ -111,12 +111,16 @@ class SharedSeparableBlock(nn.Module):
 class CleanDetectionHead(nn.Module):
     """Separate cls/box towers shared across levels, without attention or double norm."""
 
-    def __init__(self, channels, anchors_per_location, ltrb=False):
+    def __init__(self, channels, anchors_per_location, ltrb=False, regression_depth=1):
         super().__init__()
         levels = len(anchors_per_location)
         self.shared = SharedSeparableBlock(channels, levels)
         self.classification = SharedSeparableBlock(channels, levels)
         self.regression = SharedSeparableBlock(channels, levels)
+        if regression_depth not in (1, 2):
+            raise ValueError("regression_depth must be 1 or 2")
+        self.regression_extra = (SharedSeparableBlock(channels, levels)
+                                 if regression_depth == 2 else None)
         self.dropout = nn.Dropout2d(0.1)
         # Anchor projections retain level-specific template semantics. LTRB shares
         # its final projection too, since every level has the same representation.
@@ -137,7 +141,10 @@ class CleanDetectionHead(nn.Module):
         x = self.dropout(shared)
         index = 0 if self.ltrb else level
         cls = self.cls_outputs[index](self.classification(x, level))
-        boxes = self.box_outputs[index](self.regression(x, level))
+        regression = self.regression(x, level)
+        if self.regression_extra is not None:
+            regression = self.regression_extra(regression, level)
+        boxes = self.box_outputs[index](regression)
         batch = x.shape[0]
         cls = cls.permute(0, 2, 3, 1).reshape(batch, -1, 1)
         boxes = boxes.permute(0, 2, 3, 1).reshape(batch, -1, 4)
