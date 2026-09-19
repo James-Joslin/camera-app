@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Webtop has no login PAM session to unlock a keyring. Keep the local account
+# connection in the persistent /config volume using a dedicated secrets bus.
+exec dbus-run-session -- bash -c '
+  printf "\n" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+  exec /opt/storage-explorer/StorageExplorer --no-sandbox "$@"
+' storage-explorer "$@"

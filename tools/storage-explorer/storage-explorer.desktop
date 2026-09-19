@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Azure Storage Explorer
+Exec=/usr/local/bin/start-storage-explorer
+Icon=folder
+Terminal=false
+Categories=Development;

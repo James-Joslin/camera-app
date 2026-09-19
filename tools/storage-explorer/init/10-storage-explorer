@@ -1,0 +1,11 @@
+#!/usr/bin/with-contenv bash
+set -eu
+install -d -o abc -g abc /config/.config/autostart
+cp /usr/share/applications/storage-explorer.desktop /config/.config/autostart/
+chown abc:abc /config/.config/autostart/storage-explorer.desktop
+# A local-only helper for attaching the configured Azurite account in the UI.
+umask 077
+printf 'DefaultEndpointsProtocol=http;AccountName=%s;AccountKey=%s;BlobEndpoint=http://azurite:10000/%s;\n' \
+  "$AZURITE_ACCOUNT_NAME" "$AZURITE_ACCOUNT_KEY" "$AZURITE_ACCOUNT_NAME" \
+  > /config/azurite-connection.txt
+chown abc:abc /config/azurite-connection.txt
