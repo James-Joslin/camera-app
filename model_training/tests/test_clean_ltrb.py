@@ -44,7 +44,7 @@ class CleanModelTests(unittest.TestCase):
             torch.nn.init.constant_(layer.bias, 1.0)
         with torch.no_grad():
             _, boxes = model(torch.zeros(1, 3, 360, 640))
-        expected_distances = model.distance_scales * 1.001
+        expected_distances = model.distance_scales * (torch.nn.functional.softplus(torch.tensor(1.0)) + 1e-3)
         torch.testing.assert_close(boxes[0, :, :2], model.point_centers - expected_distances)
         torch.testing.assert_close(boxes[0, :, 2:], model.point_centers + expected_distances)
         # Odd-sized stride-16 map uses 360/23 grid spacing, not 16.

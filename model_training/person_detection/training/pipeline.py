@@ -77,6 +77,8 @@ class TrainingConfig(OcclusionConfig):
     model_variant: str = DEFAULT_MODEL_VARIANT
     backbone: str = "mobilenetv3_small"
     use_stride4: bool = False
+    use_pan: bool = True
+    regression_depth: int = 1
 
     # Training
     num_epochs: int = 100
@@ -486,11 +488,11 @@ class PersonAnchorGenerator:
 class SeparableConv2d(nn.Module):
     """Depthwise separable convolution for efficiency"""
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, stride=1):
         super().__init__()
         self.depthwise = nn.Conv2d(
             in_channels, in_channels, kernel_size,
-            padding=padding, groups=in_channels, bias=False
+            padding=padding, stride=stride, groups=in_channels, bias=False
         )
         self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=True)
         self.bn = nn.BatchNorm2d(out_channels)
@@ -506,7 +508,7 @@ class SeparableConv2d(nn.Module):
 class FPN(nn.Module):
     """Feature Pyramid Network for multi-scale feature fusion"""
 
-    def __init__(self, in_channels_list: List[int], out_channels: int = 256, separable=False):
+    def __init__(self, in_channels_list: List[int], out_channels: int = 256, separable=False, use_pan=False):
         super().__init__()
         self.out_channels = out_channels
 
@@ -525,14 +527,15 @@ class FPN(nn.Module):
             )
             for _ in in_channels_list
         ])
-        # self.p2_refine = nn.Sequential(
-        #     nn.Conv2d(out_channels, out_channels, 3, padding=1),
-        #     nn.BatchNorm2d(out_channels),
-        #     nn.ReLU(inplace=True),
-        #     nn.Conv2d(out_channels, out_channels, 3, padding=1),
-        #     nn.BatchNorm2d(out_channels),
-        #     nn.ReLU(inplace=True),
-        # )
+        # Independent modules provide independent BatchNorm per transition.
+        self.pan_downsamples = nn.ModuleList([
+            SeparableConv2d(out_channels, out_channels, stride=2)
+            for _ in range(len(in_channels_list) - 1)
+        ]) if use_pan else nn.ModuleList()
+        self.pan_fusions = nn.ModuleList([
+            SeparableConv2d(out_channels, out_channels)
+            for _ in range(len(in_channels_list) - 1)
+        ]) if use_pan else nn.ModuleList()
 
     def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
         # features: [C3, C4, C5] from low to high level (small to large stride)
@@ -551,7 +554,13 @@ class FPN(nn.Module):
 
         # Apply output convolutions
         outputs = [conv(lat) for conv, lat in zip(self.output_convs, laterals)]
-        # outputs[0] = self.p2_refine(outputs[0])  # Extra processing for highest res
+        if self.pan_downsamples:
+            bottom_up = [outputs[0]]
+            for index, (downsample, fusion) in enumerate(zip(self.pan_downsamples, self.pan_fusions)):
+                down = downsample(bottom_up[-1])
+                # Stride-2 padding gives ceil(H/2), including odd feature maps.
+                bottom_up.append(fusion(outputs[index + 1] + down))
+            outputs = bottom_up
         return outputs
 
 class ChannelAttention(nn.Module):
@@ -665,6 +674,8 @@ class SSDPersonDetector(nn.Module):
         visible_auxiliary: bool = False,
         backbone: str = "mobilenetv3_small",
         use_stride4: bool = False,
+        use_pan: bool = False,
+        regression_depth: int = 1,
     ):
         super().__init__()
         if input_width <= input_height:
@@ -683,6 +694,12 @@ class SSDPersonDetector(nn.Module):
         if backbone not in ("mobilenetv3_small", "mobilenetv4_conv_small"):
             raise ValueError(f"Unknown backbone: {backbone!r}")
         self.use_stride4 = use_stride4 and model_variant == "clean_ltrb"
+        if regression_depth not in (1, 2):
+            raise ValueError("regression_depth must be 1 or 2")
+        self.use_pan = use_pan
+        self.regression_depth = regression_depth
+        if model_variant == "anchor" and regression_depth != 1:
+            raise ValueError("The second regression block requires a clean head")
         self.backbone_name = backbone
         if backbone == "mobilenetv3_small":
             network = mobilenet_v3_small(
@@ -723,7 +740,7 @@ class SSDPersonDetector(nn.Module):
         backbone_channels = channels + [256, 128]
         fpn_channels = 128
         self.fpn = FPN(backbone_channels, out_channels=fpn_channels,
-                       separable=model_variant != "anchor")
+                       separable=model_variant != "anchor", use_pan=use_pan)
         feature_map_shapes = self._infer_feature_map_shapes()
         generator_type = PointReferenceGenerator if model_variant == "clean_ltrb" else PersonAnchorGenerator
         self.anchor_generator = generator_type(
@@ -735,6 +752,7 @@ class SSDPersonDetector(nn.Module):
                 fpn_channels,
                 [self.anchor_generator.get_num_anchors_per_location(level) for level in range(len(feature_map_shapes))],
                 ltrb=model_variant == "clean_ltrb",
+                regression_depth=regression_depth,
             )
             if model_variant == "clean_ltrb":
                 self.register_buffer("point_centers", self.anchor_generator.points, persistent=False)
@@ -1482,6 +1500,8 @@ def checkpoint_resume_mismatches(
         compare("numClasses", checkpoint_config.get("num_classes"), config.num_classes)
         compare("modelVariant", checkpoint_config.get("model_variant", "anchor"), config.model_variant)
         compare("backbone", checkpoint_config.get("backbone", "mobilenetv3_small"), config.backbone)
+        compare("use_pan", checkpoint_config.get("use_pan", False), config.use_pan)
+        compare("regression_depth", checkpoint_config.get("regression_depth", 1), config.regression_depth)
         compare("use_stride4", checkpoint_config.get("use_stride4", False) and checkpoint_config.get("model_variant") == "clean_ltrb",
                 config.use_stride4 and config.model_variant == "clean_ltrb")
 
@@ -1609,6 +1629,10 @@ class DetectorTrainingPipeline:
 
     def __init__(self, config: TrainingConfig):
         config.validate_occlusion()
+        if config.regression_depth not in (1, 2):
+            raise ValueError("TRAINING_REGRESSION_DEPTH must be 1 or 2")
+        if config.model_variant == "anchor" and config.regression_depth != 1:
+            raise ValueError("The anchor variant requires TRAINING_REGRESSION_DEPTH=1")
         self.config = config
 
     @classmethod
@@ -1617,6 +1641,8 @@ class DetectorTrainingPipeline:
             export_openvino_after_training=os.getenv("TRAINING_EXPORT_OPENVINO", "true").lower() == "true",
             backbone=os.getenv("TRAINING_BACKBONE", "mobilenetv3_small"),
             use_stride4=os.getenv("TRAINING_USE_STRIDE4", "false").lower() == "true",
+            use_pan=os.getenv("TRAINING_USE_PAN", "true").lower() == "true",
+            regression_depth=int(os.getenv("TRAINING_REGRESSION_DEPTH", "2")),
             model_variant=os.getenv("TRAINING_MODEL_VARIANT", DEFAULT_MODEL_VARIANT),
             visible_loss_weight=float(os.getenv("TRAINING_VISIBLE_LOSS_WEIGHT", "0.0")),
             repgt_loss_weight=float(os.getenv("TRAINING_REPGT_LOSS_WEIGHT", "0.0")),
@@ -1803,6 +1829,7 @@ class DetectorTrainingPipeline:
         print("\nInitializing model...")
         model = SSDPersonDetector(
             backbone=config.backbone, use_stride4=config.use_stride4,
+            use_pan=config.use_pan, regression_depth=config.regression_depth,
             model_variant=config.model_variant,
             visible_auxiliary=config.visible_loss_weight > 0,
             num_classes=config.num_classes,
@@ -2062,7 +2089,8 @@ class DetectorTrainingPipeline:
         )
         if mismatches:
             raise RuntimeError(f"Best checkpoint is incompatible with this run: {mismatches}")
-        model = SSDPersonDetector(backbone=config.backbone, use_stride4=config.use_stride4, model_variant=config.model_variant, num_classes=config.num_classes,
+        model = SSDPersonDetector(backbone=config.backbone, use_stride4=config.use_stride4,
+                                  use_pan=config.use_pan, regression_depth=config.regression_depth, model_variant=config.model_variant, num_classes=config.num_classes,
                                   input_height=config.input_height, input_width=config.input_width,
                                   pretrained=False).to(config.device).eval()
         load_detector_state_dict(model, checkpoint["model_state_dict"])

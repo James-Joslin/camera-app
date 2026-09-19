@@ -839,6 +839,8 @@ def load_model(config: InferenceConfig) -> Tuple[Union[nn.Module, 'OpenVINOPredi
     variant = (checkpoint.get("config", {}).get("model_variant", "anchor") if checkpoint
                else ("anchor" if model_type == "openvino" else DEFAULT_MODEL_VARIANT))
     base_model = SSDPersonDetector(
+        use_pan=(checkpoint.get("config", {}).get("use_pan", False) if checkpoint else False),
+        regression_depth=(checkpoint.get("config", {}).get("regression_depth", 1) if checkpoint else 1),
         use_stride4=(checkpoint.get("config", {}).get("use_stride4", False) if checkpoint else False),
         backbone=(checkpoint.get("config", {}).get("backbone", "mobilenetv3_small")
                   if checkpoint else "mobilenetv3_small"),
