@@ -14,6 +14,7 @@ export async function proxy(
       `${baseUrl}${path}${new URL(request.url).search}`,
       {
         method: request.method,
+        signal: request.signal,
         headers,
         body: hasBody ? request.body : undefined,
         ...(hasBody ? { duplex: "half" } : {}),

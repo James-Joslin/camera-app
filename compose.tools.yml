@@ -1,0 +1,28 @@
+# Combine with compose.dev.yml or compose.prod.yml on the same project network.
+services:
+  storage-explorer:
+    platform: linux/amd64
+    build: ./tools/storage-explorer
+    shm_size: 1gb
+    environment:
+      PUID: ${TOOLS_UID:-1000}
+      PGID: ${TOOLS_GID:-1000}
+      TZ: Etc/UTC
+      TITLE: Camera Storage Explorer
+      AZURITE_ACCOUNT_NAME: ${AZURITE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURITE_ACCOUNT_KEY: ${AZURITE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+    ports:
+      - "127.0.0.1:${STORAGE_EXPLORER_PORT:-3300}:3000"
+    volumes:
+      - storage-explorer-config:/config
+    depends_on:
+      azurite:
+        condition: service_healthy
+  netron:
+    build: ./tools/netron
+    ports:
+      - "127.0.0.1:${NETRON_PORT:-8088}:8080"
+    volumes:
+      - ${MODEL_OUTPUT_DIR:-./model_training/output}/active-models:/models:ro
+volumes:
+  storage-explorer-config:

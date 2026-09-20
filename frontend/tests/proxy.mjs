@@ -22,6 +22,7 @@ const request = new Request(
 globalThis.fetch = async (url, options) => {
   assert.equal(url, "http://api:8080/api/inference/detect?threshold=0.7");
   assert.equal(options.body, request.body);
+  assert.equal(options.signal, request.signal);
   assert.equal(options.duplex, "half");
   assert.equal(options.headers.get("authorization"), "Bearer test");
   return Response.json({ detections: [] });
