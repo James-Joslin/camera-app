@@ -28,7 +28,7 @@ else
     echo benchmark >> "$CALL_LOG"
 fi
 ''')
-            bootstrap = root / 'getCityPersons.sh'
+            bootstrap = root / 'getdata.sh'
             bootstrap.write_text('''#!/usr/bin/env bash
 set -eu
 [[ "$CITYPERSONS_DATASET_VERSION" =~ ^v[0-9]{4}-[0-9]{2}-[0-9]{2}([._-][A-Za-z0-9]+)*$ ]] || exit 2

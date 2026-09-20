@@ -183,7 +183,7 @@ else
     CITYPERSONS_PREVIEW_DIR="$DATASET_VALIDATION_DIR/bootstrap" \
     CITYPERSONS_PREVIEW_COUNT="$PREVIEW_COUNT" \
     CITYPERSONS_VERIFY_REMOTE_CHECKSUMS=true \
-        "$SCRIPT_DIR/getCityPersons.sh" 2>&1 | tee "$LOG_DIR/dataset-bootstrap.log"
+        "$SCRIPT_DIR/getdata.sh" 2>&1 | tee "$LOG_DIR/dataset-bootstrap.log"
 
     echo "Re-validating the newly published CityPersons version..."
     validate_current_dataset 2>&1 | tee "$LOG_DIR/dataset-revalidation.log"

@@ -26,7 +26,7 @@ if ! validate_data; then
     CITYPERSONS_WORK_DIR="$STATE_ROOT/dataset-bootstrap/$DATASET_VERSION" \
     CITYPERSONS_PREVIEW_DIR="$YOLO_RUN_DIR/dataset-validation/bootstrap" \
     CITYPERSONS_PREVIEW_COUNT=1 CITYPERSONS_VERIFY_REMOTE_CHECKSUMS=true \
-        "$ROOT/getCityPersons.sh"
+        "$ROOT/getdata.sh"
     validate_data
 fi
 echo "Benchmarking pretrained $YOLO_MODEL; no training or model publication."

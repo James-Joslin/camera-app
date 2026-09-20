@@ -170,7 +170,7 @@ class CanonicalPersonDetectionDataset(Dataset):
         self.version_prefix = resolve_citypersons_prefix(read_blob)
         manifest, manifest_checksum = load_citypersons_manifest(read_blob, self.version_prefix)
         self.dataset_metadata = {
-            "dataset": "citypersons",
+            "dataset": manifest.get("dataset", "citypersons"),
             "versionPrefix": self.version_prefix,
             "manifestSha256": manifest_checksum,
             "schemaVersion": manifest.get("schemaVersion"),

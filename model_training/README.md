@@ -164,7 +164,7 @@ model_training/
 │   └── data/
 ├── tests/
 ├── tools/
-└── getCityPersons.sh
+└── getdata.sh
 ```
 
 | Path | Responsibility |
@@ -249,10 +249,12 @@ The training image mounts `model_training/` at `/workspace`. It contains the com
 Place a valid `kaggle.json` at the repository root, then run:
 
 ```bash
-docker compose -f docker-compose.yml -f compose.training.yml exec training ./getCityPersons.sh
+docker compose -f docker-compose.yml -f compose.training.yml exec training ./getdata.sh
 ```
 
-The script downloads the source images and checksum-pinned official annotations, builds a version such as `datasets/citypersons/vYYYY-MM-DD`, uploads it to Azurite, validates every manifest relation and checksum, renders a preview, and publishes `datasets/citypersons/current.json` last.
+The script downloads CityPersons and CrowdHuman training images, the pinned CityPersons annotations, and CrowdHuman body annotations; it builds a version such as `datasets/citypersons/vYYYY-MM-DD`, uploads it to Azurite, validates every manifest relation and checksum, renders a preview, and publishes `datasets/citypersons/current.json` last.
+
+Before downloading, it validates the current Azurite pointer and reuses a complete pooled version when one is already published. Set `DATASET_REUSE_EXISTING=false` to force a rebuild. Both sources produce class-0 labels in the same normalized YOLO `cx cy width height` format; CrowdHuman uses full-body boxes (`fbox`) and does not emit head labels.
 
 Useful controlled overrides are:
 
@@ -260,7 +262,7 @@ Useful controlled overrides are:
 docker compose -f docker-compose.yml -f compose.training.yml exec \
   -e CITYPERSONS_DATASET_VERSION=v2026-09-08.release1 \
   -e CITYPERSONS_WORK_DIR=/workspace/.citypersons-work \
-  training ./getCityPersons.sh
+  training ./getdata.sh
 ```
 
 Keep a work directory when an upload must be resumed. Set `CITYPERSONS_RESUME_UPLOAD=true` on the resume invocation; immutable-prefix protection otherwise rejects accidental replacement.
@@ -325,8 +327,8 @@ docker compose -f docker-compose.yml -f compose.training.yml \
 
 The entrypoint performs these gated stages in order:
 
-1. It validates the published CityPersons manifest, exact artifact set, sizes, SHA-256 checksums, split counts, canonical annotations, YOLO labels, and a rendered sample.
-2. If that check fails, it runs `getCityPersons.sh` to download, build, upload, validate, and publish a new immutable dataset version, then validates it again.
+1. It validates the published pooled CityPersons + CrowdHuman manifest, exact artifact set, sizes, SHA-256 checksums, split counts, canonical annotations, YOLO labels, and a rendered sample.
+2. If that check fails, it runs `getdata.sh` to download, build, upload, validate, and publish a new immutable CityPersons + CrowdHuman dataset version, then validates it again.
 3. It trains the detector and exports the FP32 OpenVINO XML/BIN pair.
 4. It exports FP16, calibrates INT8, evaluates FP32/FP16/INT8 on the same records, and rejects INT8 when its AP50:95 drop exceeds `MAX_ACCURACY_DROP`.
 5. It validates that the pre-NMS top-K cap does not materially reduce mAP or recall and records candidate counts entering NMS.
@@ -518,7 +520,7 @@ The preferred correction is to define degenerate source-visible boxes explicitly
 2. Permit zero—but never negative—visible width or height.
 3. Retain the valid full person target, record visibility as zero/heavily occluded, and omit the degenerate visible box from geometry augmentation.
 4. Run the strict canonical parser across every train and validation sidecar during dataset build and remote validation.
-5. Build and publish a new immutable dataset version; do not edit `v2026-09-07` in place because its manifests and checksums identify exact blob contents.
+5. Build and publish a new immutable CityPersons + CrowdHuman dataset version; do not edit `v2026-09-07` in place because its manifests and checksums identify exact blob contents.
 
 Do not fabricate a one-pixel visible box or discard the valid full pedestrian target. Validation failed before the checkpoint-save block, so this run did not save epoch 1 as a new best checkpoint.
 

@@ -5,7 +5,7 @@
 !person_detection/**
 !scripts/
 !scripts/**
-!getCityPersons.sh
+!getdata.sh
 !yolo_benchmark/
 !yolo_benchmark/**
 **/__pycache__/

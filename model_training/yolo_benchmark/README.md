@@ -24,7 +24,7 @@ existing run directories are never overwritten. The default combines the model n
 
 The launcher starts Azurite, builds the pinned CPU container, verifies the
 canonical CityPersons manifest and blob checksums, and reuses the existing
-`getCityPersons.sh` download/build/upload workflow if validation fails. That
+`getdata.sh` download/build/upload workflow if validation fails. That
 bootstrap needs Kaggle credentials (`KAGGLE_JSON_PATH`, default `./kaggle.json`)
 and publishes a canonical dataset version just as the production training job
 does. Existing valid data needs no download. The benchmark downloads and caches

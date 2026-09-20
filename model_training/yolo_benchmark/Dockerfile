@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir \
 COPY yolo_benchmark/requirements.txt /tmp/yolo-requirements.txt
 RUN pip install --no-cache-dir -c /tmp/requirements.txt -r /tmp/yolo-requirements.txt
 COPY . /opt/model_training
-RUN chmod +x /opt/model_training/getCityPersons.sh /opt/model_training/yolo_benchmark/entrypoint.sh && mkdir -p /state
+RUN chmod +x /opt/model_training/getdata.sh /opt/model_training/yolo_benchmark/entrypoint.sh && mkdir -p /state
 ENV YOLO_CONFIG_DIR=/state NO_ALBUMENTATIONS_UPDATE=1
 WORKDIR /state
 ENTRYPOINT ["/opt/model_training/yolo_benchmark/entrypoint.sh"]

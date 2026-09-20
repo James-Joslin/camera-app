@@ -11,6 +11,7 @@ from typing import Any
 LOADER_VERSION = 1
 CITYPERSONS_CURRENT_POINTER = "datasets/citypersons/current.json"
 TRAINABLE_LABEL_STATUSES = {"positive", "verified_negative"}
+SUPPORTED_DATASETS = {"citypersons", "citypersons-crowdhuman"}
 
 
 def _load_json(read_blob: Callable[[str], bytes | None], name: str) -> dict[str, Any]:
@@ -28,7 +29,7 @@ def _load_json(read_blob: Callable[[str], bytes | None], name: str) -> dict[str,
 
 def resolve_citypersons_prefix(read_blob: Callable[[str], bytes | None]) -> str:
     pointer = _load_json(read_blob, CITYPERSONS_CURRENT_POINTER)
-    if pointer.get("dataset") != "citypersons":
+    if pointer.get("dataset") not in SUPPORTED_DATASETS:
         raise RuntimeError(f"Invalid dataset pointer: {CITYPERSONS_CURRENT_POINTER}")
     prefix = pointer.get("versionPrefix")
     if not isinstance(prefix, str) or not prefix:
@@ -55,7 +56,7 @@ def load_citypersons_manifest(
     if content is None:
         raise RuntimeError(f"Required dataset blob is missing: {name}")
     manifest = _load_json(read_blob, name)
-    if manifest.get("dataset") != "citypersons" or manifest.get("versionPrefix") != prefix:
+    if manifest.get("dataset") not in SUPPORTED_DATASETS or manifest.get("versionPrefix") != prefix:
         raise RuntimeError(f"Invalid CityPersons dataset manifest: {name}")
     return manifest, hashlib.sha256(content).hexdigest()
 

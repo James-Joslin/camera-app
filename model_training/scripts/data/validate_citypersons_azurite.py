@@ -29,7 +29,6 @@ from person_detection.data.annotations import parse_canonical_annotation
 
 
 LOADER_VERSION = 1
-EXPECTED_SPLIT_COUNTS = {"train": 2975, "val": 500, "test": 1525}
 TRAINABLE_STATUSES = {"positive", "verified_negative"}
 
 
@@ -182,7 +181,12 @@ def validate_records(
     status_counts: Counter[str] = Counter()
     seen_images: set[str] = set()
 
-    for split, expected_count in EXPECTED_SPLIT_COUNTS.items():
+    manifest_split_counts = manifest.get("counts", {}).get("splits")
+    if not isinstance(manifest_split_counts, dict):
+        raise ValueError("manifest.json has no counts.splits mapping")
+    for split, expected_count in manifest_split_counts.items():
+        if not isinstance(split, str) or not isinstance(expected_count, int) or expected_count < 0:
+            raise ValueError("manifest.json has invalid split counts")
         relative_manifest = manifest.get("splitManifests", {}).get(split)
         if not isinstance(relative_manifest, str):
             raise ValueError(f"manifest.json has no split manifest for {split}")
@@ -343,7 +347,7 @@ def publish_pointer(
 ) -> None:
     pointer = {
         "schemaVersion": 1,
-        "dataset": "citypersons",
+        "dataset": manifest.get("dataset", "citypersons"),
         "version": manifest["version"],
         "versionPrefix": prefix,
         "manifest": version_blob(prefix, "manifest.json"),
@@ -369,6 +373,15 @@ def main() -> None:
     parser.add_argument("--preview-count", type=int, default=12)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--require-dataset",
+        help="Fail unless the resolved manifest has this dataset name",
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate remote artifacts and records without rendering or publishing",
+    )
+    parser.add_argument(
         "--verify-checksums",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -379,9 +392,19 @@ def main() -> None:
         parser.error("preview-count must be at least 1")
 
     connection_string = os.environ.get("AZURITE_CONNECTION_STRING")
-    if not connection_string:
-        parser.error("AZURITE_CONNECTION_STRING is required")
-    service = BlobServiceClient.from_connection_string(connection_string)
+    if connection_string:
+        service = BlobServiceClient.from_connection_string(connection_string)
+    else:
+        service = BlobServiceClient(
+            account_url=os.environ.get(
+                "AZURITE_BLOB_ENDPOINT",
+                "http://127.0.0.1:10000/devstoreaccount1",
+            ),
+            credential={
+                "account_name": os.environ.get("AZURITE_ACCOUNT_NAME", "devstoreaccount1"),
+                "account_key": os.environ.get("AZURITE_ACCOUNT_KEY", ""),
+            },
+        )
     container = service.get_container_client(args.container)
 
     try:
@@ -390,6 +413,11 @@ def main() -> None:
         manifest = load_json_blob(container, manifest_name)
         if manifest.get("versionPrefix") != prefix:
             raise ValueError(f"{manifest_name} versionPrefix does not match {prefix}")
+        if args.require_dataset and manifest.get("dataset") != args.require_dataset:
+            raise ValueError(
+                f"{manifest_name} has dataset {manifest.get('dataset')!r}; "
+                f"expected {args.require_dataset!r}"
+            )
         if manifest.get("minimumLoaderVersion", 0) > LOADER_VERSION:
             raise ValueError(
                 f"Dataset requires loader {manifest['minimumLoaderVersion']}; "
@@ -397,16 +425,17 @@ def main() -> None:
             )
         validate_artifacts(container, prefix, manifest, args.verify_checksums)
         records, boxes = validate_records(container, prefix, manifest)
-        render_previews(
-            container,
-            prefix,
-            records["val"],
-            boxes,
-            args.preview_dir,
-            args.preview_count,
-            args.seed,
-        )
-        if args.publish_current:
+        if not args.check_only:
+            render_previews(
+                container,
+                prefix,
+                records["val"],
+                boxes,
+                args.preview_dir,
+                args.preview_count,
+                args.seed,
+            )
+        if args.publish_current and not args.check_only:
             publish_pointer(container, prefix, manifest)
     except (RuntimeError, ValueError) as exc:
         parser.exit(1, f"Validation failed: {exc}\n")

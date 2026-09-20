@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir \
 
 COPY . /opt/model_training
 RUN chmod +x \
-        /opt/model_training/getCityPersons.sh \
+        /opt/model_training/getdata.sh \
         /opt/model_training/releasePersonDetector.sh \
         /opt/model_training/runProductionTraining.sh \
     && mkdir -p /state

@@ -27,12 +27,32 @@ cleanup() {
 trap cleanup EXIT
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+EXPLICIT_DATASET_VERSION="${DATASET_VERSION:-${CITYPERSONS_DATASET_VERSION:-}}"
 DATASET_VERSION="${DATASET_VERSION:-${CITYPERSONS_DATASET_VERSION:-v$(date -u +%F)}}"
 if [[ ! "$DATASET_VERSION" =~ ^v[0-9]{4}-[0-9]{2}-[0-9]{2}([._-][A-Za-z0-9]+)*$ ]]; then
     echo "Invalid DATASET_VERSION: $DATASET_VERSION" >&2
     exit 1
 fi
 VERSION_PREFIX="datasets/citypersons/$DATASET_VERSION"
+
+PREVIEW_COUNT="${CITYPERSONS_PREVIEW_COUNT:-${DATASET_PREVIEW_COUNT:-12}}"
+CHECKSUM_ARGS=(--verify-checksums)
+if [[ "${CITYPERSONS_VERIFY_REMOTE_CHECKSUMS:-${DATASET_VERIFY_REMOTE_CHECKSUMS:-true}}" != true ]]; then
+    CHECKSUM_ARGS=(--no-verify-checksums)
+fi
+
+# Reuse a complete pooled version already published in Azurite.  An explicit
+# version requests a new immutable build; the default invocation reuses the
+# current valid version and avoids downloading the multi-gigabyte archives.
+if [[ -z "$EXPLICIT_DATASET_VERSION" && "${DATASET_REUSE_EXISTING:-true}" == true ]]; then
+    if python3 "$SCRIPT_DIR/scripts/data/validate_citypersons_azurite.py" \
+        --container "$AZURITE_CONTAINER" --check-only \
+        --require-dataset citypersons-crowdhuman "${CHECKSUM_ARGS[@]}"; then
+        echo "A complete pooled CityPersons + CrowdHuman dataset already exists in Azurite; skipping downloads."
+        exit 0
+    fi
+    echo "No complete pooled dataset is currently published; starting download/build."
+fi
 
 CITYPERSONS_ARCHIVE="$TEMP_DIR/citypersons.zip"
 if [[ ! -f "$CITYPERSONS_ARCHIVE" ]]; then
@@ -93,7 +113,12 @@ mkdir -p "$CROWDHUMAN_UPLOAD_DIR"
 while IFS= read -r -d '' image_path; do
     image_name="${image_path##*/}"
     if [[ -e "$CROWDHUMAN_UPLOAD_DIR/$image_name" ]]; then
-        echo "Duplicate CrowdHuman image filename: $image_name" >&2
+        # A failed/resumed run may already have created this hard link. Reuse
+        # it when the bytes match; reject a real filename collision.
+        if cmp -s "$image_path" "$CROWDHUMAN_UPLOAD_DIR/$image_name"; then
+            continue
+        fi
+        echo "Conflicting CrowdHuman image filename: $image_name" >&2
         exit 1
     fi
     ln "$image_path" "$CROWDHUMAN_UPLOAD_DIR/$image_name"
@@ -136,11 +161,6 @@ python3 "$SCRIPT_DIR/scripts/data/upload_to_azurite.py" \
     --source "$BUILD_DIR" --container "$AZURITE_CONTAINER" --prefix "$VERSION_PREFIX"
 
 PREVIEW_DIR="${CITYPERSONS_PREVIEW_DIR:-${DATASET_PREVIEW_DIR:-$SCRIPT_DIR/validation_preview/$DATASET_VERSION}}"
-PREVIEW_COUNT="${CITYPERSONS_PREVIEW_COUNT:-${DATASET_PREVIEW_COUNT:-12}}"
-CHECKSUM_ARGS=(--verify-checksums)
-if [[ "${CITYPERSONS_VERIFY_REMOTE_CHECKSUMS:-${DATASET_VERIFY_REMOTE_CHECKSUMS:-true}}" != true ]]; then
-    CHECKSUM_ARGS=(--no-verify-checksums)
-fi
 python3 "$SCRIPT_DIR/scripts/data/validate_citypersons_azurite.py" \
     --container "$AZURITE_CONTAINER" --dataset-prefix "$VERSION_PREFIX" \
     --preview-dir "$PREVIEW_DIR" --preview-count "$PREVIEW_COUNT" \
