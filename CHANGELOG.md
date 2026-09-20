@@ -6,6 +6,10 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- Bounded browser camera detection with confidence controls, scaled overlays, and stale-frame dropping.
+- Persistent Webtop Storage Explorer and read-only Netron inspection services.
+- Paced multi-camera HTTP and browser capture benchmarks with latency percentiles and dropped-frame reporting.
+
 - Modern responsive camera wall with HLS playback, expandable feeds, account flows, camera setup, and inference status.
 - Structured ASP.NET repositories and endpoint groups for users, sessions, cameras, and stream lifecycle.
 - AES-GCM camera credential encryption, PBKDF2 password hashing, hashed bearer sessions, and argument-safe FFmpeg process management.

@@ -119,7 +119,9 @@ python api/tests/generate_inference_fixtures.py /tmp/inference-fixtures api/test
 python api/tests/verify_inference.py /tmp/inference-fixtures http://localhost:8080 fp32
 python api/tests/benchmark_inference.py \
   --url csharp=http://localhost:8080 \
-  --images frame1.jpg frame2.png --output /tmp/inference-benchmark.json
+  --images frame1.jpg frame2.png --cameras 4 --fps 2 \
+  --hardware-notes "CPU model; idle; OpenVINO threads/requests settings" \
+  --output /tmp/inference-benchmark.json
 ```
 
 When comparing against another HTTP implementation, use the same exported model

@@ -1,6 +1,6 @@
 # Sentinel Camera Software
 
-High — multi-camera inference is not implemented yet. C# currently produces stream-copy HLS only ([StreamManager.cs (line 80)](/home/james/dockerfiles/camera-software/api/Streaming/StreamManager.cs:80)); it does not extract or forward inference frames. Uploaded-image inference now runs in the C# API with a bounded pool of OpenVINO requests; continuous RTSP frame extraction remains separate work.
+Live detection runs in the browser for each playing camera: enable **Start detection** in its player. Each player submits one JPEG at a time to the bounded C# inference endpoint, discards busy or stale frames, and overlays person boxes at the selected confidence. Detection stops when the player is closed and pauses capture while playback or the tab is inactive. This requires an open dashboard; unattended server-side RTSP inference is separate work.
 
 A local-first multi-camera platform with a modern Next.js operations console, an ASP.NET Core control and OpenVINO inference API, PostgreSQL, Alembic, and Azurite Blob Storage.
 
@@ -93,3 +93,33 @@ Never commit `.env`, `kaggle.json`, credentials, raw datasets, generated test ou
 ## Contributing and security
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). See [`CHANGELOG.md`](CHANGELOG.md) for release notes.
+
+## Model inspection tools
+
+Start the optional tools alongside the existing development stack:
+
+```bash
+docker compose --env-file .env.dev.example -f compose.dev.yml -f compose.tools.yml \
+  up -d --build --no-deps storage-explorer netron
+```
+
+Use your deployment's environment file if its Azurite account differs from the
+example. For production, substitute `compose.prod.yml` and the production env
+file. Both tools bind to host loopback. From another computer, tunnel them with
+`ssh -L 3300:127.0.0.1:3300 -L 8088:127.0.0.1:8088 HOST`.
+
+- **Storage Explorer (x86-64):** open <http://localhost:3300>. Its Webtop desktop launches
+  Azure Storage Explorer. Choose Connect → Storage account or service → Connection
+  string, and paste `/config/azurite-connection.txt` from the desktop's file manager.
+  The endpoint uses `azurite:10000` on the Compose network. Connections and desktop
+  settings persist in `storage-explorer-config`; do not delete that volume to restart.
+- **Netron:** open <http://localhost:8088> to inspect the locally exported INT8
+  graph. XML and BIN are mounted read-only from `active-models`. This is the local
+  export, which can differ from the API's manually refreshed model cache. Restart
+  Netron after replacing exported files.
+
+The Webtop container uses the [LinuxServer Webtop image](https://docs.linuxserver.io/images/docker-webtop/)
+and the [Microsoft Storage Explorer release](https://github.com/microsoft/AzureStorageExplorer/releases/tag/v1.45.0).
+The graph viewer uses [Netron](https://github.com/lutzroeder/netron).
+See [camera validation and load measurements](docs/camera-validation.md) for the
+remaining production evidence and benchmark commands.
