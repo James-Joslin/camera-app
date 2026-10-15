@@ -10,7 +10,7 @@ RUN cmake -S /native -B /native/build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /native/build -j2 && cmake --install /native/build \
     && cp /usr/local/lib/python3.12/site-packages/openvino/libs/*.so* /native/out/lib/
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0
+FROM mcr.microsoft.com/dotnet/sdk:10.0
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl libopencv-core406 libopencv-imgproc406 libopencv-imgcodecs406 libtbb12 && rm -rf /var/lib/apt/lists/*
 COPY --from=native /native/out/lib/ /opt/camera-inference/
 ENV LD_LIBRARY_PATH=/opt/camera-inference
